@@ -14,10 +14,13 @@ const lerpColor = mathx.lerpColor;
 // Layered back in one testable step at a time on top of the verified CHUNK 1 base
 // (ground + WASD player + torch + follow camera):
 //   LAYER 1: the real arena floor + boundary walls, sized/colored to area 0.
-//   LAYER 2 (this step): boulders — the SHORT casters (top ~2.7u, well under the
-//     torch at 6u), so their cast shadows stay short and sane. Drawn in plain tint;
-//     torchlight lights + shadows them. No collision yet (player passes through).
-//   Next layers: gravestones → trees → obstacle collision → spawn point.
+//   LAYER 2: boulders — the SHORT casters, drawn in plain tint; torchlight lights
+//     + shadows them. (Also fixed the real bug behind every earlier "break": a busy
+//     scene overflows raylib's render batch, whose auto-flush drops the shadow map
+//     on slot 10 — see keepShadowBound.)
+//   LAYER 3 (this step): gravestones (also short). Obstacle drawing generalized so
+//     trees drop in next. No collision yet (player passes through).
+//   Next layers: trees → obstacle collision → spawn point.
 
 // Follow camera: the demo's iso angle (offset 0,26,24 from the look-at point), but
 // tracking the player instead of the origin. Feeds viewPos to the shader exactly as
@@ -43,6 +46,22 @@ fn drawBoulder(o: world.Obstacle) void {
     rl.drawSphere(v3(o.Pos.x + o.Radius * 0.4, o.Height * 0.22, o.Pos.z + o.Radius * 0.3), o.Radius * 0.6, lerpColor(o.Tint, rl.Color.black, 0.15));
 }
 
+// Gravestone: a thin slab with a rounded top (ported from render.zig, plain tint).
+fn drawGravestone(o: world.Obstacle) void {
+    const c = o.Tint;
+    rl.drawCubeV(v3(o.Pos.x, o.Height / 2, o.Pos.z), v3(o.Radius * 2, o.Height, 0.35), c);
+    rl.drawSphere(v3(o.Pos.x, o.Height, o.Pos.z), o.Radius, c);
+}
+
+// Dispatch an obstacle to its shape. Trees arrive in the next layer.
+fn drawObstacleShape(o: world.Obstacle) void {
+    switch (o.Kind) {
+        .rock => drawBoulder(o),
+        .gravestone => drawGravestone(o),
+        .tree => {}, // LAYER 4
+    }
+}
+
 // Draw only the .rock obstacles for now; other kinds arrive in later layers.
 // raylib's immediate-mode render batch auto-flushes when it fills; that flush drops
 // the shadow-map texture we bound on slot 10, after which the scene shader samples
@@ -59,19 +78,20 @@ fn keepShadowBound(torch: *tl.Torch) void {
 }
 
 // Depth-pass draw (no shadow sampling here, so no rebind needed).
-fn drawBoulders(w: *const world.World) void {
+fn drawObstaclesCast(w: *const world.World) void {
     for (w.obs()) |o| {
-        if (o.Kind == .rock) drawBoulder(o);
+        if (o.Kind == .tree) continue; // LAYER 4
+        drawObstacleShape(o);
     }
 }
 
-// Main-pass draw: rebind the shadow map between boulders so a mid-scene batch
+// Main-pass draw: rebind the shadow map between obstacles so a mid-scene batch
 // overflow can never orphan it.
-fn drawBouldersLit(torch: *tl.Torch, w: *const world.World) void {
+fn drawObstaclesLit(torch: *tl.Torch, w: *const world.World) void {
     for (w.obs()) |o| {
-        if (o.Kind != .rock) continue;
+        if (o.Kind == .tree) continue; // LAYER 4
         keepShadowBound(torch);
-        drawBoulder(o);
+        drawObstacleShape(o);
     }
 }
 
@@ -131,7 +151,7 @@ pub fn run(shot: bool) void {
 
         // --- depth pass (player + boulders cast) ---
         torch.beginShadowPass(lp);
-        drawBoulders(&w);
+        drawObstaclesCast(&w);
         drawPlayer(player);
         torch.endShadowPass();
 
@@ -150,7 +170,7 @@ pub fn run(shot: bool) void {
         rl.gl.rlActiveTextureSlot(0);
         rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(w.Half * 2, w.Half * 2), w.Ground);
         drawWalls(&w);
-        drawBouldersLit(&torch, &w);
+        drawObstaclesLit(&torch, &w);
         keepShadowBound(&torch);
         drawPlayer(player);
         torch.endScene();
