@@ -34,26 +34,92 @@ fn fi(v: i32) f32 {
     return @floatFromInt(v);
 }
 
-// Text with a 2px drop shadow for legibility over the 3D scene.
+// ---- UI font ----
+// IM Fell English (assets/, OFL license alongside) — antique book type for every
+// string the game draws. TWO rasterizations so neither end of the size range goes
+// mushy: a big display cut for titles/banners (>= 40 px) and a text cut for HUD
+// chrome. Falls back to raylib's default font if the asset can't be found (the
+// path is CWD-relative — run from the repo root).
+var fontsLoaded = false;
+var haveFont = false;
+var fontDisplay: rl.Font = undefined;
+var fontText: rl.Font = undefined;
+
+const FONT_PATH = "assets/IMFellEnglish-Regular.ttf";
+
+fn ensureFonts() void {
+    if (fontsLoaded) return;
+    fontsLoaded = true;
+    if (rl.loadFontEx(FONT_PATH, 96, null)) |big| {
+        fontDisplay = big;
+        rl.setTextureFilter(fontDisplay.texture, .bilinear);
+        if (rl.loadFontEx(FONT_PATH, 26, null)) |small| {
+            fontText = small;
+            rl.setTextureFilter(fontText.texture, .bilinear);
+            haveFont = true;
+        } else |_| {
+            rl.unloadFont(fontDisplay);
+        }
+    } else |_| {}
+}
+
+// Free the font atlases with the GL context still live (called from Game.deinit).
+fn unloadFonts() void {
+    if (haveFont) {
+        rl.unloadFont(fontDisplay);
+        rl.unloadFont(fontText);
+    }
+    haveFont = false;
+}
+
+fn uiFont(size: i32) rl.Font {
+    return if (size >= 40) fontDisplay else fontText;
+}
+
+// IM Fell's x-height is far smaller than the old pixel font's, so at equal point
+// size it reads ~20% smaller. Drawing at 1.18x restores the intended presence;
+// textW uses the SAME factor, so every measured layout stays glyph-accurate.
+fn fsize(size: i32) f32 {
+    return fi(size) * 1.18;
+}
+
+// Width of s at the given size in the UI font. ALL layout must measure through
+// this (never rl.measureText) or centering drifts off the drawn glyphs.
+fn textW(s: [:0]const u8, size: i32) i32 {
+    if (!haveFont) return rl.measureText(s, size);
+    return @intFromFloat(rl.measureTextEx(uiFont(size), s, fsize(size), 0).x);
+}
+
+// Bare string draw in the UI font (no shadow) — the primitive under text().
+fn drawStr(s: [:0]const u8, x: i32, y: i32, size: i32, col: rl.Color) void {
+    if (!haveFont) {
+        rl.drawText(s, x, y, size, col);
+        return;
+    }
+    rl.drawTextEx(uiFont(size), s, .{ .x = fi(x), .y = fi(y) }, fsize(size), 0, col);
+}
+
+// Text with a drop shadow for legibility over the 3D scene (1 px under 22, else 2).
 fn text(s: [:0]const u8, x: i32, y: i32, size: i32, col: rl.Color) void {
-    rl.drawText(s, x + 2, y + 2, size, rgba(0, 0, 0, 200));
-    rl.drawText(s, x, y, size, col);
+    const off: i32 = if (size < 22) 1 else 2;
+    drawStr(s, x + off, y + off, size, rgba(0, 0, 0, 200));
+    drawStr(s, x, y, size, col);
 }
 fn centered(s: [:0]const u8, cy: i32, size: i32, col: rl.Color) void {
-    const w = rl.measureText(s, size);
+    const w = textW(s, size);
     text(s, @divTrunc(sw(), 2) - @divTrunc(w, 2), cy, size, col);
 }
 
-// Big display text with a warm halo behind it — the closest a bitmap font gets to a
-// glow. The halo is the text redrawn at the four diagonals in a low-alpha ember tone.
+// Big display text with a warm halo behind it: the text redrawn at the four
+// diagonals in a low-alpha ember tone, under a hard shadow, under the face.
 fn glowCentered(s: [:0]const u8, cy: i32, size: i32, col: rl.Color, halo: rl.Color) void {
-    const w = rl.measureText(s, size);
+    const w = textW(s, size);
     const x = @divTrunc(sw(), 2) - @divTrunc(w, 2);
     for ([_][2]i32{ .{ -3, -3 }, .{ 3, -3 }, .{ -3, 3 }, .{ 3, 3 } }) |off| {
-        rl.drawText(s, x + off[0], cy + off[1], size, halo);
+        drawStr(s, x + off[0], cy + off[1], size, halo);
     }
-    rl.drawText(s, x + 3, cy + 4, size, rgba(0, 0, 0, 220));
-    rl.drawText(s, x, cy, size, col);
+    drawStr(s, x + 3, cy + 4, size, rgba(0, 0, 0, 220));
+    drawStr(s, x, cy, size, col);
 }
 
 // A soft rounded backing pill behind free-floating text.
@@ -63,6 +129,7 @@ fn pill(x: i32, y: i32, w: i32, h: i32, col: rl.Color) void {
 
 // Top-level dispatcher: called once per frame after the 3D pass.
 pub fn draw(g: *Game, cam: rl.Camera3D) void {
+    ensureFonts();
     switch (g.scene) {
         .menu => {
             vignette();
@@ -154,9 +221,9 @@ fn drawWorldOverlays(g: *Game, cam: rl.Camera3D) void {
         const a = mathx.u8f(clampF(pp.Life / pp.maxLife * 255, 0, 255));
         var tbuf: [gamemod.POPUP_TEXT_CAP + 1]u8 = undefined; // +1 for bufPrintZ's sentinel
         const txt = std.fmt.bufPrintZ(&tbuf, "{s}", .{pp.text()}) catch "";
-        const w = rl.measureText(txt, 20);
-        rl.drawText(txt, @as(i32, @intFromFloat(sp.x)) - @divTrunc(w, 2) + 1, @as(i32, @intFromFloat(sp.y)) + 1, 20, rgba(0, 0, 0, a));
-        rl.drawText(txt, @as(i32, @intFromFloat(sp.x)) - @divTrunc(w, 2), @as(i32, @intFromFloat(sp.y)), 20, withAlpha(pp.Color, a));
+        const w = textW(txt, 20);
+        drawStr(txt, @as(i32, @intFromFloat(sp.x)) - @divTrunc(w, 2) + 1, @as(i32, @intFromFloat(sp.y)) + 1, 20, rgba(0, 0, 0, a));
+        drawStr(txt, @as(i32, @intFromFloat(sp.x)) - @divTrunc(w, 2), @as(i32, @intFromFloat(sp.y)), 20, withAlpha(pp.Color, a));
     }
 }
 
@@ -254,9 +321,10 @@ fn ensureOrbAssets() ?rl.RenderTexture2D {
     return orbRT;
 }
 
-// Called from Game.deinit so the GPU assets don't outlive the GL context. The
-// material only wraps orbShader (freed here); its tiny default-map array is left to
-// the OS rather than risk a double-free — same policy as SceneMesh.
+// Called from Game.deinit so the GPU assets (orb RT/shader/mesh + font atlases)
+// don't outlive the GL context. The orb material only wraps orbShader (freed
+// here); its tiny default-map array is left to the OS rather than risk a
+// double-free — same policy as SceneMesh.
 pub fn unloadOrbRT() void {
     if (orbRT) |rt| {
         rl.unloadRenderTexture(rt);
@@ -264,6 +332,7 @@ pub fn unloadOrbRT() void {
         rl.unloadMesh(orbMesh);
     }
     orbRT = null;
+    unloadFonts();
 }
 
 fn setOrbLiquid(c: rl.Color) void {
@@ -411,12 +480,12 @@ fn drawHUD(g: *Game) void {
     drawOrb(healthCX, orbY, orbR, p.HP / p.MaxHP, theme.healthColor, theme.healthSocket, t);
     var b1: [64]u8 = undefined;
     const hp = std.fmt.bufPrintZ(&b1, "{d}/{d}", .{ @as(i32, @intFromFloat(p.HP)), @as(i32, @intFromFloat(p.MaxHP)) }) catch "";
-    text(hp, healthCX - @divTrunc(rl.measureText(hp, 16), 2), orbY - 8, 16, rl.Color.white);
+    text(hp, healthCX - @divTrunc(textW(hp, 16), 2), orbY - 8, 16, rl.Color.white);
 
     drawOrb(manaCX, orbY, orbR, p.Mana / p.MaxMana, theme.manaColor, theme.manaSocket, t);
     var b2: [64]u8 = undefined;
     const mp = std.fmt.bufPrintZ(&b2, "{d}/{d}", .{ @as(i32, @intFromFloat(p.Mana)), @as(i32, @intFromFloat(p.MaxMana)) }) catch "";
-    text(mp, manaCX - @divTrunc(rl.measureText(mp, 16), 2), orbY - 8, 16, rl.Color.white);
+    text(mp, manaCX - @divTrunc(textW(mp, 16), 2), orbY - 8, 16, rl.Color.white);
 
     // XP: a burnished-gold channel spanning orb to orb, notched at each tenth, with
     // a slow light sweep over the fill.
@@ -445,7 +514,7 @@ fn drawHUD(g: *Game) void {
 
     var b3: [32]u8 = undefined;
     const lvl = std.fmt.bufPrintZ(&b3, "Level {d}", .{p.Level}) catch "";
-    text(lvl, @divTrunc(W, 2) - @divTrunc(rl.measureText(lvl, 14), 2), H - 42, 14, rgba(235, 210, 150, 220));
+    text(lvl, @divTrunc(W, 2) - @divTrunc(textW(lvl, 14), 2), H - 42, 14, rgba(235, 210, 150, 220));
 
     drawBelt(p, @divTrunc(W, 2), H - 58);
 
@@ -467,8 +536,8 @@ fn drawHUD(g: *Game) void {
     // Transient status toast (top-center pill, tucked under the enemy plate zone).
     if (g.toast.active()) {
         const a = mathx.u8f(clampF(g.toast.time / gamemod.TOAST_DUR * 255, 0, 255));
-        const tw = rl.measureText(g.toast.text(), 22);
-        pill(@divTrunc(W, 2) - @divTrunc(tw, 2) - 16, 78, tw + 32, 36, rgba(8, 6, 5, @intFromFloat(fi(a) * 0.55)));
+        const toastW = textW(g.toast.text(), 22);
+        pill(@divTrunc(W, 2) - @divTrunc(toastW, 2) - 16, 78, toastW + 32, 36, rgba(8, 6, 5, @intFromFloat(fi(a) * 0.55)));
         centered(g.toast.text(), 84, 22, withAlpha(rgba(255, 245, 210, 255), a));
     }
 
@@ -477,7 +546,7 @@ fn drawHUD(g: *Game) void {
         const a = clampF(g.banner.time, 0, 1);
         const a8 = mathx.u8f(a * 255);
         const by = @divTrunc(H, 3);
-        const bw = rl.measureText(g.banner.text(), 56);
+        const bw = textW(g.banner.text(), 56);
         const ruleY = by + 30;
         const ruleW: i32 = 150;
         const gapL = @divTrunc(W, 2) - @divTrunc(bw, 2) - 24;
@@ -507,11 +576,11 @@ fn flaskSlot(x: i32, y: i32, col: rl.Color, count: i32, key: [:0]const u8) void 
     // Count badge, bottom-right of the well.
     var cb: [8]u8 = undefined;
     const ct = std.fmt.bufPrintZ(&cb, "{d}", .{count}) catch "";
-    text(ct, x + 28 - rl.measureText(ct, 14), y + 22, 14, if (have) rl.Color.white else rgba(140, 130, 125, 200));
+    text(ct, x + 28 - textW(ct, 14), y + 22, 14, if (have) rl.Color.white else rgba(140, 130, 125, 200));
     // Hotkey chip.
     rl.drawRectangleRounded(.{ .x = fi(x + 8), .y = fi(y - 16), .width = 14, .height = 14 }, 0.3, 4, rgba(14, 11, 9, 220));
     rl.drawRectangleRoundedLinesEx(.{ .x = fi(x + 8), .y = fi(y - 16), .width = 14, .height = 14 }, 0.3, 4, 1, withAlpha(theme.trimColor, 140));
-    rl.drawText(key, x + 12, y - 14, 10, rgba(215, 195, 160, 235));
+    drawStr(key, x + 12, y - 14, 10, rgba(215, 195, 160, 235));
 }
 
 // The centered belt cluster: two flask slots flanking the gold purse readout.
@@ -520,7 +589,7 @@ fn drawBelt(p: *const Player, cx: i32, y: i32) void {
     const goldTxt = std.fmt.bufPrintZ(&b3, "{d} g", .{p.Gold}) catch "";
     flaskSlot(cx - 76, y - 18, theme.healthColor, p.HealthPots, "1");
     flaskSlot(cx + 46, y - 18, theme.manaColor, p.ManaPots, "2");
-    text(goldTxt, cx - @divTrunc(rl.measureText(goldTxt, 16), 2), y, 16, theme.goldColor);
+    text(goldTxt, cx - @divTrunc(textW(goldTxt, 16), 2), y, 16, theme.goldColor);
 }
 
 // Top-right iron plaque: the enemy count behind a little skull pip, with the
@@ -532,7 +601,7 @@ fn drawTopRight(g: *Game) void {
     const en = std.fmt.bufPrintZ(&b1, "{d}", .{g.remainingMonsters()}) catch "";
     var b2: [64]u8 = undefined;
     const perf = std.fmt.bufPrintZ(&b2, "FPS {d}  {d:.1} ms  {d} obj", .{ rl.getFPS(), rl.getFrameTime() * 1000, g.objectCount() }) catch "";
-    const w = @max(rl.measureText(en, 22) + 46, rl.measureText(perf, 12) + 24);
+    const w = @max(textW(en, 22) + 46, textW(perf, 12) + 24);
     const x = W - w - 10;
     pill(x, 8, w, 50, rgba(8, 6, 5, 175));
     rl.drawRectangleRoundedLinesEx(.{ .x = fi(x), .y = 8, .width = fi(w), .height = 50 }, 0.9, 8, 1, withAlpha(theme.trimColor, 110));

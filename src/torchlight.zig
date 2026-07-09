@@ -104,17 +104,27 @@ const sceneFS =
     \\// Fraction of this fragment in shadow (0 = lit, 1 = shadowed), from a wide 5x5
     \\// PCF tap. `spread` scales the kernel footprint past one texel so the penumbra
     \\// reads as a soft gradient rather than a hard stair-step. Shared by both lights.
+    \\// The kernel is rotated per-fragment (hash of the pixel coord) so LARGE spreads
+    \\// dissolve into grain instead of banding into 25 ghost images — that grain is
+    \\// what lets the distance-blur below stay at 25 taps instead of needing more.
     \\float shadowFrac(sampler2D map, mat4 vp, float res, float ndl, float spread) {
     \\    vec4 p = vp*vec4(fragPosition, 1.0);
     \\    p.xyz /= p.w;
     \\    p.xyz = p.xyz*0.5 + 0.5;
     \\    if (p.z > 1.0 || p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) return 0.0;
-    \\    float bias = max(0.0025*(1.0 - ndl), 0.0007);
+    \\    // Wider kernels sample depth farther from the fragment, so the acne bias
+    \\    // must grow with the footprint (tuned so spread 1.7 keeps its old bias).
+    \\    float bias = max(0.0025*(1.0 - ndl), 0.0007)*(0.4 + 0.35*spread);
     \\    float texel = 1.0/res;
+    \\    float ra = hash21(gl_FragCoord.xy)*6.2831853;
+    \\    vec2 rot = vec2(cos(ra), sin(ra));
     \\    float sc = 0.0;
     \\    for (int x = -2; x <= 2; x++)
-    \\        for (int y = -2; y <= 2; y++)
-    \\            if (p.z - bias > texture(map, p.xy + vec2(x, y)*texel*spread).r) sc += 1.0;
+    \\        for (int y = -2; y <= 2; y++) {
+    \\            vec2 o = vec2(x, y);
+    \\            o = vec2(o.x*rot.x - o.y*rot.y, o.x*rot.y + o.y*rot.x);
+    \\            if (p.z - bias > texture(map, p.xy + o*texel*spread).r) sc += 1.0;
+    \\        }
     \\    // Fade the shadow out RADIALLY toward the edge of the map's footprint so it
     \\    // dissolves into the dark instead of ending on a hard circular cutoff at the
     \\    // coverage boundary. length(p.xy - 0.5) is the map-UV distance from the light
@@ -153,14 +163,19 @@ const sceneFS =
     \\    // Purely diffuse (Lambert): the specular term is gone so the flat ground no
     \\    // longer flares a bright hot-spot under the overhead torch. Matte surfaces.
     \\    finalColor = vec4(albedo*lightDot, 1.0);
-    \\    float sTorch = shadowFrac(shadowMap, lightVP, float(shadowMapResolution), dot(normal, l), 1.7);
+    \\    // PENUMBRA GROWTH: a torch is a fat flame, not a point — shadows stand crisp
+    \\    // at the carrier's feet and diffuse toward the rim of the light. Scaling the
+    \\    // PCF footprint with distance from the light axis fakes PCSS at zero extra
+    \\    // taps (the per-fragment kernel rotation above hides the undersampling).
+    \\    float lightDist = length(fragPosition.xz - lightPos.xz);
+    \\    float torchSpread = mix(1.0, 7.0, smoothstep(0.0, lightRadius, lightDist));
+    \\    float sTorch = shadowFrac(shadowMap, lightVP, float(shadowMapResolution), dot(normal, l), torchSpread);
     \\    finalColor = mix(finalColor, vec4(0, 0, 0, 1), sTorch);
     \\    finalColor.rgb += albedo*(ambient.rgb/10.0);
     \\    // ACTIVE DISC: your torch only reaches so far. `active` is 1 at the hero and
     \\    // fades to 0 at the torch radius (horizontal distance from the torch axis = you),
     \\    // so it reads as a disc of light. Everything above is the fully lit "active"
     \\    // look; past the disc we fall back to the fog-of-war memory below.
-    \\    float lightDist = length(fragPosition.xz - lightPos.xz);
     \\    float active = 1.0 - smoothstep(lightRadius*0.65, lightRadius, lightDist);
     \\    // COLOR TEMPERATURE: firelight is warmest at its heart and cools as it thins
     \\    // out, so the disc grades from golden center to blue-grey rim instead of one
@@ -188,7 +203,9 @@ const sceneFS =
     \\        float fd = length(firePos - fragPosition);
     \\        float atten = clamp(1.0 - fd/fireRadius, 0.0, 1.0);
     \\        atten *= atten;
-    \\        float fs = shadowFrac(fireMap, fireVP, float(fireMapResolution), fNdotL, 1.7);
+    \\        // The bolt's shadows blur with distance too, on its smaller radius.
+    \\        float fireSpread = mix(1.2, 5.5, clamp(fd/fireRadius, 0.0, 1.0));
+    \\        float fs = shadowFrac(fireMap, fireVP, float(fireMapResolution), fNdotL, fireSpread);
     \\        finalColor.rgb += albedo*fireColor*(fNdotL*0.85 + 0.15)*atten*fireIntensity*(1.0 - fs);
     \\    }
     \\    finalColor = pow(finalColor, vec4(1.0/2.2));
