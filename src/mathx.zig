@@ -43,6 +43,14 @@ pub fn distXZ(a: rl.Vector3, b: rl.Vector3) f32 {
     return @sqrt(dx * dx + dz * dz);
 }
 
+/// Squared horizontal distance (Y ignored). For threshold tests, compare against a
+/// squared radius to skip the per-check @sqrt on hot collision scans.
+pub fn dist2XZ(a: rl.Vector3, b: rl.Vector3) f32 {
+    const dx = a.x - b.x;
+    const dz = a.z - b.z;
+    return dx * dx + dz * dz;
+}
+
 /// Unit direction from a to b in the XZ plane (zero if coincident).
 pub fn dirXZ(from: rl.Vector3, to: rl.Vector3) rl.Vector3 {
     const dx = to.x - from.x;

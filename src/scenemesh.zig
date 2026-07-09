@@ -1,0 +1,303 @@
+const std = @import("std");
+const rl = @import("raylib");
+const mathx = @import("mathx.zig");
+const world = @import("world.zig");
+
+const v3 = mathx.v3;
+const rgba = mathx.rgba;
+const lerpColor = mathx.lerpColor;
+const sinf = mathx.sinf;
+const cosf = mathx.cosf;
+
+// SCENE MESH — the arena's static obstacles (boulders, gravestones, trees) baked
+// into ONE GPU mesh at area load, instead of regenerating ~hundreds of thousands of
+// primitive vertices on the CPU every frame (twice: shadow pass + main pass). That
+// per-frame regen was the FPS bottleneck. Once uploaded, drawing is a single GPU call
+// per pass with zero CPU geometry work.
+//
+// Lighting is unchanged: the mesh carries per-vertex colors (the obstacle tints) and
+// normals, exactly what torchlight's scene shader reads (fragColor + fragNormal).
+// Drawn with backface culling disabled so a winding mistake can't hide a face; the
+// normals (which drive shading) are computed outward explicitly.
+
+// raylib UnloadMesh frees these arrays with libc free(); the c_allocator is malloc,
+// so ownership transfers cleanly to raylib after uploadMesh.
+const alloc = std.heap.c_allocator;
+
+const Builder = struct {
+    pos: std.ArrayList(f32),
+    nrm: std.ArrayList(f32),
+    uv: std.ArrayList(f32),
+    col: std.ArrayList(u8),
+
+    fn init() Builder {
+        return .{
+            .pos = std.ArrayList(f32).init(alloc),
+            .nrm = std.ArrayList(f32).init(alloc),
+            .uv = std.ArrayList(f32).init(alloc),
+            .col = std.ArrayList(u8).init(alloc),
+        };
+    }
+
+    fn vert(self: *Builder, p: rl.Vector3, n: rl.Vector3, c: rl.Color) void {
+        self.pos.appendSlice(&.{ p.x, p.y, p.z }) catch @panic("oom");
+        self.nrm.appendSlice(&.{ n.x, n.y, n.z }) catch @panic("oom");
+        self.uv.appendSlice(&.{ 0, 0 }) catch @panic("oom");
+        self.col.appendSlice(&.{ c.r, c.g, c.b, c.a }) catch @panic("oom");
+    }
+
+    // A quad a→b→c→d with one shared (flat) normal, as two triangles.
+    fn quad(self: *Builder, a: rl.Vector3, b: rl.Vector3, c: rl.Vector3, d: rl.Vector3, n: rl.Vector3, col: rl.Color) void {
+        self.vert(a, n, col);
+        self.vert(b, n, col);
+        self.vert(c, n, col);
+        self.vert(a, n, col);
+        self.vert(c, n, col);
+        self.vert(d, n, col);
+    }
+
+    fn addSphere(self: *Builder, center: rl.Vector3, radius: f32, rings: i32, slices: i32, col: rl.Color) void {
+        const rf: f32 = @floatFromInt(rings);
+        const sf: f32 = @floatFromInt(slices);
+        var i: i32 = 0;
+        while (i < rings) : (i += 1) {
+            const lat0 = std.math.pi * (@as(f32, @floatFromInt(i)) / rf - 0.5);
+            const lat1 = std.math.pi * (@as(f32, @floatFromInt(i + 1)) / rf - 0.5);
+            var j: i32 = 0;
+            while (j < slices) : (j += 1) {
+                const lon0 = 2 * std.math.pi * @as(f32, @floatFromInt(j)) / sf;
+                const lon1 = 2 * std.math.pi * @as(f32, @floatFromInt(j + 1)) / sf;
+                const n00 = spherePt(lat0, lon0);
+                const n01 = spherePt(lat0, lon1);
+                const n10 = spherePt(lat1, lon0);
+                const n11 = spherePt(lat1, lon1);
+                // Smooth normals = radial direction; positions = center + n*radius.
+                self.vert(scaleAdd(center, n00, radius), n00, col);
+                self.vert(scaleAdd(center, n10, radius), n10, col);
+                self.vert(scaleAdd(center, n11, radius), n11, col);
+                self.vert(scaleAdd(center, n00, radius), n00, col);
+                self.vert(scaleAdd(center, n11, radius), n11, col);
+                self.vert(scaleAdd(center, n01, radius), n01, col);
+            }
+        }
+    }
+
+    fn addCube(self: *Builder, center: rl.Vector3, size: rl.Vector3, col: rl.Color) void {
+        const hx = size.x / 2;
+        const hy = size.y / 2;
+        const hz = size.z / 2;
+        const cx = center.x;
+        const cy = center.y;
+        const cz = center.z;
+        // +X / -X
+        self.quad(v3(cx + hx, cy - hy, cz - hz), v3(cx + hx, cy - hy, cz + hz), v3(cx + hx, cy + hy, cz + hz), v3(cx + hx, cy + hy, cz - hz), v3(1, 0, 0), col);
+        self.quad(v3(cx - hx, cy - hy, cz + hz), v3(cx - hx, cy - hy, cz - hz), v3(cx - hx, cy + hy, cz - hz), v3(cx - hx, cy + hy, cz + hz), v3(-1, 0, 0), col);
+        // +Y / -Y
+        self.quad(v3(cx - hx, cy + hy, cz - hz), v3(cx + hx, cy + hy, cz - hz), v3(cx + hx, cy + hy, cz + hz), v3(cx - hx, cy + hy, cz + hz), v3(0, 1, 0), col);
+        self.quad(v3(cx - hx, cy - hy, cz + hz), v3(cx + hx, cy - hy, cz + hz), v3(cx + hx, cy - hy, cz - hz), v3(cx - hx, cy - hy, cz - hz), v3(0, -1, 0), col);
+        // +Z / -Z
+        self.quad(v3(cx - hx, cy - hy, cz + hz), v3(cx - hx, cy + hy, cz + hz), v3(cx + hx, cy + hy, cz + hz), v3(cx + hx, cy - hy, cz + hz), v3(0, 0, 1), col);
+        self.quad(v3(cx + hx, cy - hy, cz - hz), v3(cx + hx, cy + hy, cz - hz), v3(cx - hx, cy + hy, cz - hz), v3(cx - hx, cy - hy, cz - hz), v3(0, 0, -1), col);
+    }
+
+    // Tapered cylinder wall (no caps) from `a` (radius ra) to `b` (radius rb).
+    fn addCylinder(self: *Builder, a: rl.Vector3, b: rl.Vector3, ra: f32, rb: f32, sides: i32, col: rl.Color) void {
+        const axis = norm(v3(b.x - a.x, b.y - a.y, b.z - a.z));
+        // An arbitrary vector not parallel to axis, to build a perpendicular basis.
+        const seed = if (@abs(axis.y) < 0.99) v3(0, 1, 0) else v3(1, 0, 0);
+        const u = norm(cross(axis, seed));
+        const w = norm(cross(axis, u));
+        const sf: f32 = @floatFromInt(sides);
+        var s: i32 = 0;
+        while (s < sides) : (s += 1) {
+            const a0 = 2 * std.math.pi * @as(f32, @floatFromInt(s)) / sf;
+            const a1 = 2 * std.math.pi * @as(f32, @floatFromInt(s + 1)) / sf;
+            const d0 = dirOn(u, w, a0);
+            const d1 = dirOn(u, w, a1);
+            const p0 = scaleAdd(a, d0, ra);
+            const p1 = scaleAdd(a, d1, ra);
+            const p2 = scaleAdd(b, d1, rb);
+            const p3 = scaleAdd(b, d0, rb);
+            const nmid = norm(v3(d0.x + d1.x, d0.y + d1.y, d0.z + d1.z));
+            self.quad(p0, p1, p2, p3, nmid, col);
+        }
+    }
+
+};
+
+fn spherePt(lat: f32, lon: f32) rl.Vector3 {
+    const cl = cosf(lat);
+    return v3(cl * cosf(lon), sinf(lat), cl * sinf(lon));
+}
+fn scaleAdd(base: rl.Vector3, dir: rl.Vector3, s: f32) rl.Vector3 {
+    return v3(base.x + dir.x * s, base.y + dir.y * s, base.z + dir.z * s);
+}
+fn dirOn(u: rl.Vector3, w: rl.Vector3, ang: f32) rl.Vector3 {
+    const c = cosf(ang);
+    const s = sinf(ang);
+    return v3(u.x * c + w.x * s, u.y * c + w.y * s, u.z * c + w.z * s);
+}
+fn norm(a: rl.Vector3) rl.Vector3 {
+    const l = @sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+    if (l < 1e-6) return v3(0, 1, 0);
+    return v3(a.x / l, a.y / l, a.z / l);
+}
+fn cross(a: rl.Vector3, b: rl.Vector3) rl.Vector3 {
+    return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
+// ---- Obstacle shapes (same geometry as the immediate-mode versions, baked once) ----
+
+fn bakeBoulder(b: *Builder, o: world.Obstacle) void {
+    b.addSphere(v3(o.Pos.x, o.Height * 0.35, o.Pos.z), o.Radius, 8, 8, o.Tint);
+    b.addSphere(v3(o.Pos.x + o.Radius * 0.4, o.Height * 0.22, o.Pos.z + o.Radius * 0.3), o.Radius * 0.6, 8, 8, lerpColor(o.Tint, rl.Color.black, 0.15));
+}
+
+fn bakeGravestone(b: *Builder, o: world.Obstacle) void {
+    b.addCube(v3(o.Pos.x, o.Height / 2, o.Pos.z), v3(o.Radius * 2, o.Height, 0.35), o.Tint);
+    b.addSphere(v3(o.Pos.x, o.Height, o.Pos.z), o.Radius, 8, 8, o.Tint);
+}
+
+fn bakeTree(b: *Builder, o: world.Obstacle) void {
+    const bark = o.Tint;
+    const x = o.Pos.x;
+    const z = o.Pos.z;
+    const segs_n = 4;
+    const lean = v3(0.12, 0, 0.05);
+    var prev = v3(x, 0, z);
+    var i: i32 = 1;
+    while (i <= segs_n) : (i += 1) {
+        const f: f32 = @as(f32, @floatFromInt(i)) / segs_n;
+        const top = v3(x + lean.x * o.Height * f * f, o.Height * 0.62 * f, z + lean.z * o.Height * f * f);
+        const r0 = 0.38 * (1 - 0.6 * @as(f32, @floatFromInt(i - 1)) / segs_n);
+        const r1 = 0.38 * (1 - 0.6 * f);
+        b.addCylinder(prev, top, r0, r1, 8, bark);
+        prev = top;
+    }
+    const crown = prev;
+
+    const branchCol = lerpColor(bark, rl.Color.black, 0.2);
+    var j: i32 = 0;
+    while (j < 5) : (j += 1) {
+        const jf: f32 = @floatFromInt(j);
+        const ang = jf * (2.0 * std.math.pi / 5.0) + 0.5;
+        const out = 0.35 + 0.2 * sinf(o.Height + jf);
+        const tip = v3(crown.x + cosf(ang) * out, crown.y + 0.35 + 0.25 * sinf(jf), crown.z + sinf(ang) * out);
+        b.addCylinder(crown, tip, 0.16, 0.05, 5, branchCol);
+    }
+
+    const canopy = lerpColor(o.Tint, rgba(20, 32, 22, 255), 0.7);
+    const cr = o.Radius * 1.15;
+    b.addSphere(v3(crown.x, crown.y + 0.5, crown.z), cr, 8, 8, canopy);
+    var k: i32 = 0;
+    while (k < 6) : (k += 1) {
+        const kf: f32 = @floatFromInt(k);
+        const ang = kf * (std.math.pi / 3.0) + o.Height;
+        const cp = v3(crown.x + cosf(ang) * cr * 0.7, crown.y + 0.35 + 0.18 * sinf(kf + o.Height), crown.z + sinf(ang) * cr * 0.7);
+        b.addSphere(cp, cr * 0.72, 8, 8, canopy);
+    }
+}
+
+// The baked mesh plus the CPU arrays backing it. After uploadMesh copies the data to
+// GPU buffers we detach the CPU pointers from the mesh (raylib's unloadMesh frees with
+// libc free, which would corrupt the heap on our Zig-allocated memory) and free them
+// ourselves in deinit/rebuild.
+const Baked = struct {
+    mesh: rl.Mesh,
+    pos: []f32,
+    nrm: []f32,
+    uv: []f32,
+    col: []u8,
+};
+
+fn bakeMesh(w: *const world.World) Baked {
+    var b = Builder.init();
+    for (w.obs()) |o| {
+        switch (o.Kind) {
+            .rock => bakeBoulder(&b, o),
+            .gravestone => bakeGravestone(&b, o),
+            .tree => bakeTree(&b, o),
+        }
+    }
+    const pos = b.pos.toOwnedSlice() catch @panic("oom");
+    const nrm = b.nrm.toOwnedSlice() catch @panic("oom");
+    const uv = b.uv.toOwnedSlice() catch @panic("oom");
+    const col = b.col.toOwnedSlice() catch @panic("oom");
+
+    var mesh = std.mem.zeroes(rl.Mesh);
+    mesh.vertexCount = @intCast(pos.len / 3);
+    mesh.triangleCount = @intCast(pos.len / 9);
+    mesh.vertices = pos.ptr;
+    mesh.normals = nrm.ptr;
+    mesh.texcoords = uv.ptr;
+    mesh.colors = col.ptr;
+    rl.uploadMesh(&mesh, false);
+    // GPU owns a copy now; detach CPU pointers so unloadMesh only frees GPU buffers.
+    mesh.vertices = null;
+    mesh.normals = null;
+    mesh.texcoords = null;
+    mesh.colors = null;
+    return .{ .mesh = mesh, .pos = pos, .nrm = nrm, .uv = uv, .col = col };
+}
+
+// SceneMesh owns the baked obstacle mesh and the two materials it draws with.
+pub const SceneMesh = struct {
+    mesh: rl.Mesh,
+    sceneMat: rl.Material,
+    depthMat: rl.Material,
+    pos: []f32,
+    nrm: []f32,
+    uv: []f32,
+    col: []u8,
+
+    pub fn init(w: *const world.World, sceneShader: rl.Shader, depthShader: rl.Shader) SceneMesh {
+        const baked = bakeMesh(w);
+        var sceneMat = rl.loadMaterialDefault() catch @panic("loadMaterialDefault");
+        sceneMat.shader = sceneShader;
+        var depthMat = rl.loadMaterialDefault() catch @panic("loadMaterialDefault");
+        depthMat.shader = depthShader;
+        return .{ .mesh = baked.mesh, .sceneMat = sceneMat, .depthMat = depthMat, .pos = baked.pos, .nrm = baked.nrm, .uv = baked.uv, .col = baked.col };
+    }
+
+    // Swap in a new area's obstacle mesh, freeing the old one but KEEPING the shared
+    // materials — so per-area transitions don't leak a default material each time.
+    pub fn rebuild(self: *SceneMesh, w: *const world.World) void {
+        self.freeMesh();
+        const baked = bakeMesh(w);
+        self.mesh = baked.mesh;
+        self.pos = baked.pos;
+        self.nrm = baked.nrm;
+        self.uv = baked.uv;
+        self.col = baked.col;
+    }
+
+    fn freeMesh(self: *SceneMesh) void {
+        rl.unloadMesh(self.mesh); // frees GPU VAO/VBO only (CPU pointers were nulled)
+        alloc.free(self.pos);
+        alloc.free(self.nrm);
+        alloc.free(self.uv);
+        alloc.free(self.col);
+    }
+
+    pub fn deinit(self: *SceneMesh) void {
+        self.freeMesh();
+        // Materials only wrap torchlight's shaders (freed by the Torch); their tiny
+        // default-map array is left to the OS at exit rather than risk a shader double-free.
+    }
+
+    // Draw with backface culling off (winding-safe). Caller sets up the pass + shadow
+    // map binding; identity transform since positions are already in world space.
+    pub fn drawScene(self: *const SceneMesh) void {
+        if (self.mesh.vertexCount == 0) return; // an obstacle-less area bakes nothing
+        rl.gl.rlDisableBackfaceCulling();
+        rl.drawMesh(self.mesh, self.sceneMat, rl.math.matrixIdentity());
+        rl.gl.rlEnableBackfaceCulling();
+    }
+
+    pub fn drawDepth(self: *const SceneMesh) void {
+        if (self.mesh.vertexCount == 0) return;
+        rl.gl.rlDisableBackfaceCulling();
+        rl.drawMesh(self.mesh, self.depthMat, rl.math.matrixIdentity());
+        rl.gl.rlEnableBackfaceCulling();
+    }
+};

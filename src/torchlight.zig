@@ -7,7 +7,10 @@ const rl = @import("raylib");
 // game feeds this its torch position, light radius, camera, and casters — nothing
 // about the lighting itself changes between the demo and the game.
 
-pub const SHADOWMAP_RESOLUTION = 6144;
+// Lowered from the demo's 6144: the torch only lights a small disc, so 2048 keeps
+// shadows crisp at this coverage while cutting the per-frame depth-pass fill and
+// shadow-map VRAM ~9x (the single biggest frame win). Lighting math is unchanged.
+pub const SHADOWMAP_RESOLUTION = 2048;
 pub const SHADOW_COVER_MARGIN = 1.3;
 
 const depthVS =

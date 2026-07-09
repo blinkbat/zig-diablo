@@ -7,6 +7,7 @@ const v3 = mathx.v3;
 const rgba = mathx.rgba;
 const ground = mathx.ground;
 const distXZ = mathx.distXZ;
+const dist2XZ = mathx.dist2XZ;
 const lerpColor = mathx.lerpColor;
 const Rng = mathx.Rng;
 
@@ -45,7 +46,8 @@ pub const World = struct {
     pub fn blocked(self: *const World, p: rl.Vector3, radius: f32) bool {
         if (@abs(p.x) > self.Half - radius or @abs(p.z) > self.Half - radius) return true;
         for (self.obs()) |o| {
-            if (distXZ(o.Pos, p) < o.Radius + radius) return true;
+            const rr = o.Radius + radius;
+            if (dist2XZ(o.Pos, p) < rr * rr) return true;
         }
         return false;
     }
@@ -66,7 +68,8 @@ pub const World = struct {
         if (@abs(p.x) > self.Half or @abs(p.z) > self.Half) return true;
         for (self.obs()) |o| {
             if (o.Height < 1.0) continue;
-            if (distXZ(o.Pos, p) < o.Radius + radius) return true;
+            const rr = o.Radius + radius;
+            if (dist2XZ(o.Pos, p) < rr * rr) return true;
         }
         return false;
     }
