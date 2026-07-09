@@ -151,11 +151,20 @@ fn cross(a: rl.Vector3, b: rl.Vector3) rl.Vector3 {
 fn bakeBoulder(b: *Builder, o: world.Obstacle) void {
     b.addSphere(v3(o.Pos.x, o.Height * 0.35, o.Pos.z), o.Radius, 8, 8, o.Tint);
     b.addSphere(v3(o.Pos.x + o.Radius * 0.4, o.Height * 0.22, o.Pos.z + o.Radius * 0.3), o.Radius * 0.6, 8, 8, lerpColor(o.Tint, rl.Color.black, 0.15));
+    // A shed chip resting against the parent stone: boulders come in families.
+    b.addSphere(v3(o.Pos.x - o.Radius * 0.85, o.Radius * 0.16, o.Pos.z - o.Radius * 0.45), o.Radius * 0.28, 6, 6, lerpColor(o.Tint, rl.Color.white, 0.08));
 }
 
 fn bakeGravestone(b: *Builder, o: world.Obstacle) void {
+    // Slab + a rounded RIDGE along its top (a horizontal cylinder as wide as the
+    // slab, matching its thickness) — the old full sphere ballooned out past the
+    // slab's faces and read as a stone lollipop. Plus a settled plinth at the foot.
+    const dark = lerpColor(o.Tint, rl.Color.black, 0.3);
     b.addCube(v3(o.Pos.x, o.Height / 2, o.Pos.z), v3(o.Radius * 2, o.Height, 0.35), o.Tint);
-    b.addSphere(v3(o.Pos.x, o.Height, o.Pos.z), o.Radius, 8, 8, o.Tint);
+    b.addCylinder(v3(o.Pos.x - o.Radius, o.Height, o.Pos.z), v3(o.Pos.x + o.Radius, o.Height, o.Pos.z), 0.19, 0.19, 8, o.Tint);
+    b.addSphere(v3(o.Pos.x - o.Radius, o.Height, o.Pos.z), 0.19, 6, 6, o.Tint);
+    b.addSphere(v3(o.Pos.x + o.Radius, o.Height, o.Pos.z), 0.19, 6, 6, o.Tint);
+    b.addCube(v3(o.Pos.x, 0.14, o.Pos.z), v3(o.Radius * 2 + 0.3, 0.28, 0.62), dark);
 }
 
 fn bakeTree(b: *Builder, o: world.Obstacle) void {
@@ -164,6 +173,15 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
     const z = o.Pos.z;
     const segs_n = 4;
     const lean = v3(0.12, 0, 0.05);
+    // Root flares gripping the ground: old trees don't rise out of a clean socket.
+    const rootCol = lerpColor(bark, rl.Color.black, 0.25);
+    var r: i32 = 0;
+    while (r < 4) : (r += 1) {
+        const rf: f32 = @floatFromInt(r);
+        const ang = rf * (std.math.tau / 4.0) + o.Height * 1.7;
+        const reach = 0.5 + 0.18 * sinf(o.Height * 3 + rf * 2.1);
+        b.addCylinder(v3(x, 0.32, z), v3(x + cosf(ang) * reach, 0.02, z + sinf(ang) * reach), 0.15, 0.045, 5, rootCol);
+    }
     var prev = v3(x, 0, z);
     var i: i32 = 1;
     while (i <= segs_n) : (i += 1) {
@@ -186,7 +204,10 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
         b.addCylinder(crown, tip, 0.16, 0.05, 5, branchCol);
     }
 
-    const canopy = lerpColor(o.Tint, rgba(20, 32, 22, 255), 0.7);
+    // Deep forest green. NOTE: the scene shader's output gamma (pow 1/2.2) lifts
+    // dark albedos hard, so the canopy must start near-black to read as rich green
+    // under the torch instead of washed-out sage.
+    const canopy = lerpColor(o.Tint, rgba(12, 24, 14, 255), 0.9);
     const cr = o.Radius * 1.15;
     b.addSphere(v3(crown.x, crown.y + 0.5, crown.z), cr, 8, 8, canopy);
     var k: i32 = 0;
@@ -195,6 +216,60 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
         const ang = kf * (std.math.pi / 3.0) + o.Height;
         const cp = v3(crown.x + cosf(ang) * cr * 0.7, crown.y + 0.35 + 0.18 * sinf(kf + o.Height), crown.z + sinf(ang) * cr * 0.7);
         b.addSphere(cp, cr * 0.72, 8, 8, canopy);
+    }
+}
+
+// ---- Ground decor (non-blocking dressing; see world.Decor) ----
+
+fn bakePebble(b: *Builder, d: world.Decor) void {
+    // Sunk to ~40% so it reads as half-buried in the dirt.
+    b.addSphere(v3(d.Pos.x, d.Size * 0.4, d.Pos.z), d.Size, 6, 6, d.Tint);
+}
+
+fn bakeTuft(b: *Builder, d: world.Decor) void {
+    // A clump of grass blades arcing outward from a common root: each blade is TWO
+    // segments (stiff below, drooping above) so it curves like grass instead of
+    // spiking like a caltrop, dark at the root and sun-bleached toward the tip.
+    // Deterministic per-tuft variation comes from its own position (no bake-time rng).
+    const seed = d.Pos.x * 3.7 + d.Pos.z * 5.3;
+    var i: i32 = 0;
+    while (i < 5) : (i += 1) {
+        const iff: f32 = @floatFromInt(i);
+        const ang = iff * (std.math.tau / 5.0) + seed;
+        const lean = 0.35 + 0.25 * sinf(seed * 2 + iff * 1.7);
+        const h = d.Size * (0.85 + 0.4 * sinf(seed + iff));
+        const dx = cosf(ang);
+        const dz = sinf(ang);
+        const root = v3(d.Pos.x, 0, d.Pos.z);
+        const mid = v3(d.Pos.x + dx * lean * d.Size * 0.4, h * 0.62, d.Pos.z + dz * lean * d.Size * 0.4);
+        const tip = v3(d.Pos.x + dx * lean * d.Size * 1.15, h * 0.94, d.Pos.z + dz * lean * d.Size * 1.15);
+        const rootCol = lerpColor(d.Tint, rl.Color.black, 0.3);
+        const tipCol = lerpColor(d.Tint, rgba(172, 195, 100, 255), 0.5 + 0.12 * @mod(iff, 2.0));
+        b.addCylinder(root, mid, 0.055 * (0.8 + d.Size), 0.03, 3, rootCol);
+        b.addCylinder(mid, tip, 0.03, 0.0, 3, tipCol);
+    }
+}
+
+fn bakeShroom(b: *Builder, d: world.Decor) void {
+    const stemH = d.Size * 1.1;
+    b.addCylinder(v3(d.Pos.x, 0, d.Pos.z), v3(d.Pos.x, stemH, d.Pos.z), d.Size * 0.22, d.Size * 0.16, 5, rgba(216, 206, 186, 255));
+    b.addSphere(v3(d.Pos.x, stemH, d.Pos.z), d.Size * 0.55, 6, 6, d.Tint);
+}
+
+fn bakeBone(b: *Builder, d: world.Decor) void {
+    // A scatter of old bones: two crossed shafts, each with knobbed ends, lying
+    // just proud of the dirt. Deterministic per-scatter variation from position.
+    const seed = d.Pos.x * 7.1 + d.Pos.z * 3.3;
+    var i: i32 = 0;
+    while (i < 2) : (i += 1) {
+        const iff: f32 = @floatFromInt(i);
+        const ang = seed + iff * 2.1;
+        const half = d.Size * (0.7 + 0.25 * sinf(seed + iff * 1.7));
+        const a = v3(d.Pos.x - cosf(ang) * half, 0.05, d.Pos.z - sinf(ang) * half);
+        const c = v3(d.Pos.x + cosf(ang) * half, 0.07 + iff * 0.04, d.Pos.z + sinf(ang) * half);
+        b.addCylinder(a, c, 0.04, 0.04, 4, d.Tint);
+        b.addSphere(a, 0.06, 5, 5, d.Tint);
+        b.addSphere(c, 0.06, 5, 5, d.Tint);
     }
 }
 
@@ -217,6 +292,14 @@ fn bakeMesh(w: *const world.World) Baked {
             .rock => bakeBoulder(&b, o),
             .gravestone => bakeGravestone(&b, o),
             .tree => bakeTree(&b, o),
+        }
+    }
+    for (w.dec()) |d| {
+        switch (d.Kind) {
+            .pebble => bakePebble(&b, d),
+            .tuft => bakeTuft(&b, d),
+            .shroom => bakeShroom(&b, d),
+            .bone => bakeBone(&b, d),
         }
     }
     const pos = b.pos.toOwnedSlice() catch @panic("oom");

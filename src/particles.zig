@@ -1,0 +1,106 @@
+const std = @import("std");
+const rl = @import("raylib");
+const mathx = @import("mathx.zig");
+
+const v3 = mathx.v3;
+const rgba = mathx.rgba;
+const sinf = mathx.sinf;
+const cosf = mathx.cosf;
+
+// PARTICLES — one fixed-capacity pool of emissive motes for every transient effect:
+// impact sparks, death bursts, the firebolt's trail, portal motes, level-up rings.
+// Drawn AFTER endScene with the default shader (like the torch flame and monster
+// eyes), so they glow in the dark and never touch the lighting pipeline.
+//
+// The pool deliberately overwrites its oldest slot when full: a dropped year-old
+// spark is invisible, a skipped death burst is not.
+
+pub const MAX_PARTICLES = 768;
+
+pub const Particle = struct {
+    Pos: rl.Vector3 = mathx.zero3,
+    Vel: rl.Vector3 = mathx.zero3,
+    Life: f32 = 0,
+    maxLife: f32 = 1,
+    Size: f32 = 0.1,
+    Color: rl.Color = rgba(255, 255, 255, 255),
+    grav: f32 = 0, // downward pull; negative floats the mote upward
+    drag: f32 = 0, // fraction of velocity shed per second
+};
+
+pub const Particles = struct {
+    buf: [MAX_PARTICLES]Particle = undefined,
+    count: usize = 0,
+    next: usize = 0, // overwrite cursor once the pool is saturated
+
+    pub fn spawn(self: *Particles, p: Particle) void {
+        if (self.count < self.buf.len) {
+            self.buf[self.count] = p;
+            self.count += 1;
+        } else {
+            self.buf[self.next] = p;
+            self.next = (self.next + 1) % self.buf.len;
+        }
+    }
+
+    pub fn clear(self: *Particles) void {
+        self.count = 0;
+        self.next = 0;
+    }
+
+    /// A radial burst of `n` motes at `pos`: random directions, speeds in
+    /// [speed*0.35, speed], slight upward bias so bursts bloom rather than pancake.
+    pub fn burst(self: *Particles, rng: *mathx.Rng, pos: rl.Vector3, n: usize, speed: f32, size: f32, life: f32, col: rl.Color, grav: f32) void {
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const ang = rng.float() * std.math.tau;
+            const pitch = (rng.float() - 0.25) * 1.6; // biased above the horizon
+            const sp = speed * (0.35 + 0.65 * rng.float());
+            const cp = cosf(pitch);
+            self.spawn(.{
+                .Pos = pos,
+                .Vel = v3(cosf(ang) * cp * sp, sinf(pitch) * sp + speed * 0.2, sinf(ang) * cp * sp),
+                .Life = life * (0.6 + 0.4 * rng.float()),
+                .maxLife = life,
+                .Size = size * (0.7 + 0.6 * rng.float()),
+                .Color = col,
+                .grav = grav,
+                .drag = 2.5,
+            });
+        }
+    }
+
+    pub fn update(self: *Particles, dt: f32) void {
+        var i: usize = 0;
+        while (i < self.count) {
+            const p = &self.buf[i];
+            p.Life -= dt;
+            if (p.Life <= 0) {
+                self.count -= 1;
+                self.buf[i] = self.buf[self.count];
+                if (self.next > self.count) self.next = 0;
+                continue;
+            }
+            p.Vel.y -= p.grav * dt;
+            const k = 1.0 - mathx.clampF(p.drag * dt, 0, 0.9);
+            p.Vel.x *= k;
+            p.Vel.y *= k;
+            p.Vel.z *= k;
+            p.Pos.x += p.Vel.x * dt;
+            p.Pos.y += p.Vel.y * dt;
+            p.Pos.z += p.Vel.z * dt;
+            if (p.Pos.y < 0.02) p.Pos.y = 0.02; // rest on the floor, don't sink through
+            i += 1;
+        }
+    }
+
+    /// Emissive pass: call between endScene and endMode3D. Motes shrink and fade
+    /// out over their lifetime. 4x4 spheres: at mote sizes they read as round glow.
+    pub fn draw(self: *const Particles) void {
+        for (self.buf[0..self.count]) |*p| {
+            const f = mathx.clampF(p.Life / p.maxLife, 0, 1);
+            const a: f32 = @floatFromInt(p.Color.a);
+            rl.drawSphereEx(p.Pos, p.Size * (0.35 + 0.65 * f), 4, 4, mathx.withAlpha(p.Color, mathx.u8f(a * f)));
+        }
+    }
+};

@@ -18,8 +18,12 @@ pub const SHADOWMAP_RESOLUTION = 4096;
 pub const SHADOW_COVER_MARGIN = 1.3;
 
 // Depth-pass clip planes for the overhead shadow cameras (torch + fireball). Shared
-// so both passes frame the same near/far slab around the light.
-pub const SHADOW_CLIP_NEAR = 1.0;
+// so both passes frame the same near/far slab around the light. NEAR bounds which
+// casters exist to the map: anything above (light height - NEAR) is clipped out of
+// the depth pass, so it must stay small enough that monster heads clear it under
+// the lowered torch (0.4 leaves ~4.1 of caster headroom under a 4.5 light; the
+// 32-bit depth target keeps precision fine at this ratio).
+pub const SHADOW_CLIP_NEAR = 0.4;
 pub const SHADOW_CLIP_FAR = 45.0;
 
 // The fireball's shadow pool is a fraction of the torch's, so a small map keeps its
@@ -83,6 +87,20 @@ const sceneFS =
     \\uniform float fireRadius;
     \\uniform float fireIntensity;
     \\out vec4 finalColor;
+    \\// Cheap hash / value noise over world XZ: mottles the flat vertex colors into
+    \\// dirt, stone grain, and moss so broad surfaces don't read as untextured plastic.
+    \\float hash21(vec2 p) {
+    \\    p = fract(p*vec2(123.34, 456.21));
+    \\    p += dot(p, p + 45.32);
+    \\    return fract(p.x*p.y);
+    \\}
+    \\float vnoise(vec2 p) {
+    \\    vec2 i = floor(p);
+    \\    vec2 f = fract(p);
+    \\    f = f*f*(3.0 - 2.0*f);
+    \\    return mix(mix(hash21(i), hash21(i + vec2(1, 0)), f.x),
+    \\               mix(hash21(i + vec2(0, 1)), hash21(i + vec2(1, 1)), f.x), f.y);
+    \\}
     \\// Fraction of this fragment in shadow (0 = lit, 1 = shadowed), from a wide 5x5
     \\// PCF tap. `spread` scales the kernel footprint past one texel so the penumbra
     \\// reads as a soft gradient rather than a hard stair-step. Shared by both lights.
@@ -108,21 +126,47 @@ const sceneFS =
     \\void main() {
     \\    vec4 texelColor = texture(texture0, fragTexCoord);
     \\    vec3 normal = normalize(fragNormal);
+    \\    // GROUND GRAIN: two octaves of world-space value noise break the flat vertex
+    \\    // colors into mottled dirt/stone. Strongest on upward faces (the floor, boulder
+    \\    // tops), gentler on walls and bodies so verticals keep their clean silhouette.
+    \\    float upMask = smoothstep(0.25, 0.95, normal.y);
+    \\    float grain = vnoise(fragPosition.xz*0.85)*0.55 + vnoise(fragPosition.xz*3.9)*0.45;
+    \\    float gstr = mix(0.12, 0.30, upMask);
+    \\    vec3 albedo = texelColor.rgb*fragColor.rgb*(1.0 - gstr + 2.0*gstr*grain);
+    \\    // DIRT PATCHES: one very low-frequency octave drifts the floor hue between
+    \\    // mossy-cool and dry-warm across meters, so the arena floor reads as ground
+    \\    // that weathered differently place to place, not one uniform carpet. Ground
+    \\    // only (up-faces) so walls and bodies keep their true tints.
+    \\    float patch = vnoise(fragPosition.xz*0.11);
+    \\    vec3 patchTint = mix(vec3(0.90, 1.03, 0.90), vec3(1.08, 0.99, 0.90), patch);
+    \\    albedo *= mix(vec3(1.0), patchTint, upMask);
+    \\    // CRACKED EARTH: a ridged octave etches thin dark fissure lines into the
+    \\    // floor, gated to the DRY patches (the mask keys off its own low-frequency
+    \\    // field) — parched ground splits into a vein network, mossy ground doesn't.
+    \\    float ridge = abs(vnoise(fragPosition.xz*0.9 + 17.3) - 0.5)*2.0;
+    \\    float crackMask = smoothstep(0.45, 0.8, vnoise(fragPosition.xz*0.13 + 5.1));
+    \\    float crack = (1.0 - smoothstep(0.0, 0.10, ridge))*crackMask;
+    \\    albedo *= 1.0 - 0.34*crack*upMask;
     \\    vec3 l = normalize(lightPos - fragPosition);
     \\    float NdotL = max(dot(normal, l), 0.0);
     \\    vec3 lightDot = lightColor.rgb*NdotL;
     \\    // Purely diffuse (Lambert): the specular term is gone so the flat ground no
     \\    // longer flares a bright hot-spot under the overhead torch. Matte surfaces.
-    \\    finalColor = texelColor*fragColor*vec4(lightDot, 1.0);
+    \\    finalColor = vec4(albedo*lightDot, 1.0);
     \\    float sTorch = shadowFrac(shadowMap, lightVP, float(shadowMapResolution), dot(normal, l), 1.7);
     \\    finalColor = mix(finalColor, vec4(0, 0, 0, 1), sTorch);
-    \\    finalColor += texelColor*(ambient/10.0)*fragColor;
+    \\    finalColor.rgb += albedo*(ambient.rgb/10.0);
     \\    // ACTIVE DISC: your torch only reaches so far. `active` is 1 at the hero and
     \\    // fades to 0 at the torch radius (horizontal distance from the torch axis = you),
     \\    // so it reads as a disc of light. Everything above is the fully lit "active"
     \\    // look; past the disc we fall back to the fog-of-war memory below.
     \\    float lightDist = length(fragPosition.xz - lightPos.xz);
     \\    float active = 1.0 - smoothstep(lightRadius*0.65, lightRadius, lightDist);
+    \\    // COLOR TEMPERATURE: firelight is warmest at its heart and cools as it thins
+    \\    // out, so the disc grades from golden center to blue-grey rim instead of one
+    \\    // flat tone. Cheap, but it sells "torch" more than anything else here.
+    \\    float core = 1.0 - smoothstep(0.0, lightRadius*0.95, lightDist);
+    \\    finalColor.rgb *= mix(vec3(0.74, 0.82, 1.10), vec3(1.10, 1.00, 0.86), core);
     \\    // FOG OF WAR: persistent exploration at this ground point (0 unseen .. 1 seen).
     \\    // The arena spans [-fogHalf, fogHalf] on X/Z; map that onto the [0,1] fog map.
     \\    vec2 fogUV = fragPosition.xz/(2.0*fogHalf) + 0.5;
@@ -145,9 +189,13 @@ const sceneFS =
     \\        float atten = clamp(1.0 - fd/fireRadius, 0.0, 1.0);
     \\        atten *= atten;
     \\        float fs = shadowFrac(fireMap, fireVP, float(fireMapResolution), fNdotL, 1.7);
-    \\        finalColor.rgb += texelColor.rgb*fireColor*(fNdotL*0.85 + 0.15)*atten*fireIntensity*(1.0 - fs);
+    \\        finalColor.rgb += albedo*fireColor*(fNdotL*0.85 + 0.15)*atten*fireIntensity*(1.0 - fs);
     \\    }
     \\    finalColor = pow(finalColor, vec4(1.0/2.2));
+    \\    // DITHER: +-1 LSB of screen-space noise after gamma. The torch falloff spans
+    \\    // many near-black gradients that band visibly on an 8-bit target; this breaks
+    \\    // the bands up into imperceptible grain.
+    \\    finalColor.rgb += (hash21(gl_FragCoord.xy) - 0.5)*(2.0/255.0);
     \\}
 ;
 
@@ -347,6 +395,14 @@ pub const Torch = struct {
         const i = fp.intensity;
         rl.setShaderValue(self.scene, self.loc_fireIntensity, &i, .float);
         rl.setShaderValueMatrix(self.scene, self.loc_fireVP, self.fireVP);
+    }
+
+    // Per-area torch personality: each area re-tints the light itself (a touch warmer,
+    // paler, sicklier...) so the SAME torch pipeline gives every floor its own night.
+    // Called once per area transition, not per frame.
+    pub fn setLightColor(self: *Torch, rgb: [3]f32) void {
+        const lc = [4]f32{ rgb[0], rgb[1], rgb[2], 1.0 };
+        rl.setShaderValue(self.scene, rl.getShaderLocation(self.scene, "lightColor"), &lc, .vec4);
     }
 
     // Fog-of-war uniforms. Stash the map's GPU id for beginScene to bind on slot 12,
