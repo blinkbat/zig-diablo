@@ -15,6 +15,10 @@ pub const MonsterKind = enum(u8) {
 // How long (seconds) a slain monster takes to fade out.
 pub const monster_death_fade = 0.55;
 
+// How long (seconds) a struck monster flashes white. Owned here (like the death
+// fade) rather than as a bare literal in game.zig's combat code.
+pub const monster_hitflash = 0.12;
+
 // Monster is a hostile entity. AI is a simple wander/aggro/chase/attack loop.
 pub const Monster = struct {
     id: i32 = 0,
@@ -129,11 +133,13 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
     return m;
 }
 
-// makeBoss promotes a brute into the area's champion.
-pub fn makeBoss(tier: i32, rng: *Rng, pos: rl.Vector3) Monster {
+// makeBoss promotes a brute into the area's champion. The name is supplied by the
+// area definition (world.areaDef.boss), so there's no parallel tier->name table to
+// keep in lockstep with the area list.
+pub fn makeBoss(tier: i32, name: []const u8, rng: *Rng, pos: rl.Vector3) Monster {
     var m = makeMonster(.brute, tier, rng, pos);
     m.boss = true;
-    m.Name = bossName(tier);
+    m.Name = name;
     m.MaxHP = m.MaxHP * 2.4 + 120;
     m.HP = m.MaxHP;
     m.MinDmg *= 1.4;
@@ -145,10 +151,4 @@ pub fn makeBoss(tier: i32, rng: *Rng, pos: rl.Vector3) Monster {
     m.Color = rgba(190, 50, 60, 255);
     m.sightRange = 26;
     return m;
-}
-
-pub fn bossName(tier: i32) []const u8 {
-    const names = [_][]const u8{ "Bishibosh", "Rakanishu", "Treehead Woodfist", "Pitspawn Fouldog", "Coldcrow" };
-    if (tier >= 0 and tier < names.len) return names[@intCast(tier)];
-    return "Champion";
 }

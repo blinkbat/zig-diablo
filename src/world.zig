@@ -84,19 +84,25 @@ pub const areaDef = struct {
     packs: i32,
     tier: i32,
     kinds: []const monster.MonsterKind,
+    boss: []const u8, // the area champion's name (co-located so it can't drift from the area)
 };
 
 pub const areas = [_]areaDef{
-    .{ .name = "The Blood Moor", .ground = rgba(92, 80, 62, 255), .accent = rgba(72, 62, 50, 255), .half = 38, .packs = 4, .tier = 0, .kinds = &.{ .fallen, .fallen, .zombie } },
-    .{ .name = "Cold Plains", .ground = rgba(108, 120, 138, 255), .accent = rgba(86, 96, 112, 255), .half = 44, .packs = 5, .tier = 1, .kinds = &.{ .fallen, .zombie, .skeleton } },
-    .{ .name = "The Stony Field", .ground = rgba(96, 92, 80, 255), .accent = rgba(74, 70, 60, 255), .half = 46, .packs = 6, .tier = 2, .kinds = &.{ .zombie, .skeleton, .fallen } },
-    .{ .name = "The Dark Wood", .ground = rgba(62, 58, 48, 255), .accent = rgba(48, 46, 38, 255), .half = 48, .packs = 7, .tier = 3, .kinds = &.{ .skeleton, .zombie, .brute } },
-    .{ .name = "The Catacombs", .ground = rgba(54, 46, 60, 255), .accent = rgba(40, 34, 46, 255), .half = 48, .packs = 8, .tier = 4, .kinds = &.{ .skeleton, .brute, .zombie } },
+    .{ .name = "The Blood Moor", .ground = rgba(92, 80, 62, 255), .accent = rgba(72, 62, 50, 255), .half = 38, .packs = 4, .tier = 0, .kinds = &.{ .fallen, .fallen, .zombie }, .boss = "Bishibosh" },
+    .{ .name = "Cold Plains", .ground = rgba(108, 120, 138, 255), .accent = rgba(86, 96, 112, 255), .half = 44, .packs = 5, .tier = 1, .kinds = &.{ .fallen, .zombie, .skeleton }, .boss = "Rakanishu" },
+    .{ .name = "The Stony Field", .ground = rgba(96, 92, 80, 255), .accent = rgba(74, 70, 60, 255), .half = 46, .packs = 6, .tier = 2, .kinds = &.{ .zombie, .skeleton, .fallen }, .boss = "Treehead Woodfist" },
+    .{ .name = "The Dark Wood", .ground = rgba(62, 58, 48, 255), .accent = rgba(48, 46, 38, 255), .half = 48, .packs = 7, .tier = 3, .kinds = &.{ .skeleton, .zombie, .brute }, .boss = "Pitspawn Fouldog" },
+    .{ .name = "The Catacombs", .ground = rgba(54, 46, 60, 255), .accent = rgba(40, 34, 46, 255), .half = 48, .packs = 8, .tier = 4, .kinds = &.{ .skeleton, .brute, .zombie }, .boss = "Coldcrow" },
 };
+
+// How far the spawn and the exit portal sit in from their (opposite) arena walls.
+// Shared so buildWorld places them exactly where startPos/PortalPos report them.
+const SPAWN_INSET = 6;
+const PORTAL_INSET = 7;
 
 // startPos is where the player spawns in each area.
 pub fn startPos(w: World) rl.Vector3 {
-    return ground(0, w.Half - 6);
+    return ground(0, w.Half - SPAWN_INSET);
 }
 
 // buildWorld generates static scenery and places the portal opposite the spawn.
@@ -106,11 +112,11 @@ pub fn buildWorld(def: areaDef, rng: *Rng, isLast: bool) World {
         .Ground = def.ground,
         .Accent = def.accent,
         .Name = def.name,
-        .PortalPos = ground(0, -(def.half - 7)),
+        .PortalPos = ground(0, -(def.half - PORTAL_INSET)),
         .IsLast = isLast,
     };
 
-    const spawn = ground(0, def.half - 6);
+    const spawn = startPos(w);
     const count: i32 = @intFromFloat(def.half * 0.9);
     var i: i32 = 0;
     while (i < count) : (i += 1) {
@@ -133,11 +139,14 @@ pub fn buildWorld(def: areaDef, rng: *Rng, isLast: bool) World {
 }
 
 fn randomObstacle(def: areaDef, rng: *Rng, p: rl.Vector3) Obstacle {
-    const kind = rng.intn(3);
+    // Pick a kind from the enum's own value list (not a bare int) so reordering
+    // ObstacleKind can't silently remap what spawns.
+    const kinds = comptime std.enums.values(ObstacleKind);
+    const kind = kinds[@intCast(rng.intn(kinds.len))];
     return switch (kind) {
-        1 => Obstacle{ .Pos = p, .Radius = 0.9 + rng.float() * 0.5, .Height = 4 + rng.float() * 3, .Kind = .tree, .Tint = lerpColor(def.accent, rgba(40, 70, 36, 255), 0.6) },
-        2 => Obstacle{ .Pos = p, .Radius = 0.7, .Height = 1.6 + rng.float(), .Kind = .gravestone, .Tint = rgba(120, 120, 128, 255) },
-        else => Obstacle{ .Pos = p, .Radius = 1.0 + rng.float() * 0.8, .Height = 1.2 + rng.float() * 1.5, .Kind = .rock, .Tint = lerpColor(def.accent, rgba(90, 90, 96, 255), 0.5) },
+        .tree => Obstacle{ .Pos = p, .Radius = 0.9 + rng.float() * 0.5, .Height = 4 + rng.float() * 3, .Kind = .tree, .Tint = lerpColor(def.accent, rgba(40, 70, 36, 255), 0.6) },
+        .gravestone => Obstacle{ .Pos = p, .Radius = 0.7, .Height = 1.6 + rng.float(), .Kind = .gravestone, .Tint = rgba(120, 120, 128, 255) },
+        .rock => Obstacle{ .Pos = p, .Radius = 1.0 + rng.float() * 0.8, .Height = 1.2 + rng.float() * 1.5, .Kind = .rock, .Tint = lerpColor(def.accent, rgba(90, 90, 96, 255), 0.5) },
     };
 }
 

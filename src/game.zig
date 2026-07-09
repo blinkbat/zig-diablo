@@ -6,10 +6,13 @@ const world = @import("world.zig");
 const monster = @import("monster.zig");
 const projectile = @import("projectile.zig");
 const scenemesh = @import("scenemesh.zig");
+const fogmod = @import("fog.zig");
 const playermod = @import("player.zig");
 const loot = @import("loot.zig");
 const cameramod = @import("camera.zig");
 const hudx = @import("hudx.zig");
+const theme = @import("theme.zig");
+const rumble = @import("rumble.zig");
 
 const Monster = monster.Monster;
 const Projectile = projectile.Projectile;
@@ -40,12 +43,30 @@ const CRIT_MULT = 2.0;
 // zoom and Q/E are gone. The torch sits straight above the hero (point light).
 const TORCH_HEIGHT = 6.0;
 const TORCH_RADIUS = 12.0;
-// Bodies past this fade to black in the shader, so we skip drawing them; it also
-// doubles as the vision radius that gates targeting / health bars / popups.
+// A live player fireball is its own moving light: a warm pool that follows the bolt
+// and lights (+ shadows) whatever it flies past, even out beyond the torch radius.
+// Modeled overhead like the torch so its downward shadow map stays well-oriented.
+const FIRE_HEIGHT = 3.5;
+const FIRE_RADIUS = 7.0;
+// The vision radius that gates targeting / health bars / popups — a little past the
+// torch's lit disc so a foe right at the edge can still be hovered and engaged. Body
+// DRAWING is gated tighter, at TORCH_RADIUS itself (see bodyVisible), so nothing dynamic
+// bleeds into the fog-of-war "seen" band beyond the light.
 const CULL = TORCH_RADIUS + 3;
 
-const DAMAGE_FLASH_DUR = 0.4;
-const TOAST_DUR = 2.5;
+pub const DAMAGE_FLASH_DUR = 0.4;
+pub const TOAST_DUR = 2.5;
+
+// Floating combat text: the inline buffer capacity (shared by the Popup store, the
+// formatter, and the HUD that renders it) and the default lift above an entity's
+// ground position so numbers float over the body rather than at its feet.
+pub const POPUP_TEXT_CAP = 32;
+const POPUP_HEIGHT = 1.6;
+
+// How long the area-name banner holds before fading (seconds). Level-up reuses the
+// banner with its own shorter hold.
+const AREA_BANNER_DUR = 3.5;
+const LEVELUP_BANNER_DUR = 2.2;
 
 // Fixed-capacity projectile pool (arrows + firebolts); no allocator needed.
 const ProjList = struct {
@@ -62,11 +83,42 @@ const ProjList = struct {
     }
 };
 
+// A fixed-capacity, self-contained transient text field: format into an inline buffer
+// with a countdown timer. The toast and the area banner share this so neither re-rolls
+// the overflow-safe bufPrintZ + buffer/len bookkeeping.
+fn TextField(comptime cap: usize) type {
+    return struct {
+        buf: [cap]u8 = [_]u8{0} ** cap,
+        len: usize = 0,
+        time: f32 = 0,
+
+        const Self = @This();
+
+        fn set(self: *Self, dur: f32, comptime fmt: []const u8, args: anytype) void {
+            const s = std.fmt.bufPrintZ(&self.buf, fmt, args) catch blk: {
+                self.buf[0] = 0; // keep the sentinel valid if the format overflowed
+                break :blk self.buf[0..0 :0];
+            };
+            self.len = s.len;
+            self.time = dur;
+        }
+        fn tick(self: *Self, dt: f32) void {
+            if (self.time > 0) self.time -= dt;
+        }
+        pub fn active(self: *const Self) bool {
+            return self.time > 0 and self.len > 0;
+        }
+        pub fn text(self: *const Self) [:0]const u8 {
+            return self.buf[0..self.len :0];
+        }
+    };
+}
+
 // Popup is floating combat text anchored in the world. Its text lives inline in a
 // fixed buffer so the popup is self-contained inside the ArrayList (no dangling slice).
 pub const Popup = struct {
     Pos: rl.Vector3 = mathx.zero3,
-    text_buf: [32]u8 = undefined,
+    text_buf: [POPUP_TEXT_CAP]u8 = undefined,
     text_len: usize = 0,
     Color: rl.Color = rgba(255, 255, 255, 255),
     Life: f32 = 0,
@@ -87,6 +139,12 @@ fn meleeReach(atkRange: f32, targetRadius: f32) f32 {
     return atkRange + targetRadius + MELEE_LUNGE;
 }
 
+// The hero's own strike reach against a target: attack range plus the target's radius.
+// One helper so the chase-stop distance and the hit check can't drift apart.
+fn playerReach(atkRange: f32, targetRadius: f32) f32 {
+    return atkRange + targetRadius;
+}
+
 // Low-poly sphere. raylib's drawSphere defaults to 16x16 and regenerates on the CPU
 // with per-vertex trig on every call — the scene is drawn twice a frame (shadow depth
 // pass + main pass). Under a dark torch an 8x8 ball is indistinguishable at ~1/4 cost.
@@ -101,6 +159,7 @@ pub const Game = struct {
     rng: mathx.Rng,
     torch: tl.Torch,
     sceneMesh: scenemesh.SceneMesh,
+    fog: fogmod.Fog,
     w: world.World,
     areaIndex: usize = 0,
     lastArea: usize,
@@ -118,21 +177,20 @@ pub const Game = struct {
     // Per-frame input cache.
     mouseGround: rl.Vector3 = mathx.zero3,
     kbMove: rl.Vector3 = mathx.zero3,
-    hoverMonster: i32 = -1,
+    hoverMonster: i32 = -1, // monster id (NOT an array index): stays valid across the
+    // same-frame corpse compaction in updateDeaths, so the highlight can't slip onto the
+    // wrong monster between updateAim setting it and the HUD reading it.
 
     // Presentation timers + transient text.
     damageFlash: f32 = 0,
     shake: f32 = 0,
-    banner_buf: [96]u8 = [_]u8{0} ** 96,
-    banner_len: usize = 0,
-    bannerTime: f32 = 0,
-    toast_buf: [96]u8 = [_]u8{0} ** 96,
-    toast_len: usize = 0,
-    toastTime: f32 = 0,
+    banner: TextField(96) = .{},
+    toast: TextField(96) = .{},
 
     paused: bool = false,
     elapsed: f32 = 0,
     kills: i32 = 0,
+    rumble: rumble.Rumble = .{},
 
     pub fn init(seed: u64) !Game {
         var torch = try tl.Torch.init();
@@ -141,11 +199,14 @@ pub const Game = struct {
         const lastArea = world.areas.len - 1;
         const w = world.buildWorld(world.areas[0], &rng, lastArea == 0);
         const sceneMesh = scenemesh.SceneMesh.init(&w, torch.scene, torch.depthShader);
+        var fog = fogmod.Fog.init();
+        fog.reset(w.Half);
 
         var g = Game{
             .rng = rng,
             .torch = torch,
             .sceneMesh = sceneMesh,
+            .fog = fog,
             .w = w,
             .lastArea = lastArea,
             .p = playermod.newPlayer(world.startPos(w)),
@@ -156,13 +217,13 @@ pub const Game = struct {
         g.areaIndex = 0;
         g.spawnPacks();
         g.rig.snap(g.p.Pos);
-        g.setBanner("{s}", .{g.w.Name});
-        g.bannerTime = 3.5;
+        g.setBanner(AREA_BANNER_DUR, "{s}", .{g.w.Name});
         return g;
     }
 
     pub fn deinit(g: *Game) void {
         g.sceneMesh.deinit();
+        g.fog.deinit();
         g.torch.deinit();
         g.lootList.deinit();
         g.popups.deinit();
@@ -182,6 +243,10 @@ pub const Game = struct {
         g.areaIndex = if (idx > g.lastArea) g.lastArea else idx;
         g.w = world.buildWorld(world.areas[g.areaIndex], &g.rng, g.areaIndex == g.lastArea);
         g.sceneMesh.rebuild(&g.w);
+        g.fog.reset(g.w.Half); // each area is a fresh layout: forget the old exploration
+        g.fog.sync(); // upload the cleared grid now: a restart from dead/victory draws
+        // this frame WITHOUT running updatePlaying, so it would otherwise render the new
+        // area against the previous area's still-resident fog mask for one frame.
         g.monsterCount = 0;
         g.projs.count = 0;
         g.lootList.clearRetainingCapacity();
@@ -193,8 +258,7 @@ pub const Game = struct {
         g.p.HP = g.p.MaxHP;
         g.p.Mana = g.p.MaxMana;
         g.rig.snap(g.p.Pos);
-        g.setBanner("{s}", .{g.w.Name});
-        g.bannerTime = 3.5;
+        g.setBanner(AREA_BANNER_DUR, "{s}", .{g.w.Name});
         g.setToast("", .{});
     }
 
@@ -212,7 +276,7 @@ pub const Game = struct {
                 g.spawn(monster.makeMonster(kind, def.tier, &g.rng, g.randomOpenTileNear(center, 5)));
             }
         }
-        g.spawn(monster.makeBoss(def.tier, &g.rng, g.randomOpenTileNear(g.w.PortalPos, 8)));
+        g.spawn(monster.makeBoss(def.tier, def.boss, &g.rng, g.randomOpenTileNear(g.w.PortalPos, 8)));
     }
 
     fn spawn(g: *Game, m_in: Monster) void {
@@ -276,27 +340,26 @@ pub const Game = struct {
     }
 
     pub fn setToast(g: *Game, comptime fmt: []const u8, args: anytype) void {
-        const s = std.fmt.bufPrintZ(&g.toast_buf, fmt, args) catch "";
-        g.toast_len = s.len;
-        g.toastTime = TOAST_DUR;
+        g.toast.set(TOAST_DUR, fmt, args);
     }
-    pub fn toastText(g: *const Game) [:0]const u8 {
-        return g.toast_buf[0..g.toast_len :0];
-    }
-    pub fn setBanner(g: *Game, comptime fmt: []const u8, args: anytype) void {
-        const s = std.fmt.bufPrintZ(&g.banner_buf, fmt, args) catch "";
-        g.banner_len = s.len;
-    }
-    pub fn bannerText(g: *const Game) [:0]const u8 {
-        return g.banner_buf[0..g.banner_len :0];
+    pub fn setBanner(g: *Game, dur: f32, comptime fmt: []const u8, args: anytype) void {
+        g.banner.set(dur, fmt, args);
     }
 
     pub fn addPopup(g: *Game, pos: rl.Vector3, txt: []const u8, col: rl.Color) void {
-        var pp = Popup{ .Pos = v3(pos.x, 1.6, pos.z), .Color = col, .Life = 1.0, .maxLife = 1.0 };
+        var pp = Popup{ .Pos = pos, .Color = col, .Life = 1.0, .maxLife = 1.0 };
         const n = @min(txt.len, pp.text_buf.len);
         @memcpy(pp.text_buf[0..n], txt[0..n]);
         pp.text_len = n;
         g.popups.append(pp) catch @panic("oom");
+    }
+
+    // Format a floating combat-text popup in one step (damage/XP/gold numbers all
+    // share this instead of each hand-rolling a stack buffer + bufPrint).
+    pub fn addPopupFmt(g: *Game, pos: rl.Vector3, col: rl.Color, comptime fmt: []const u8, args: anytype) void {
+        var buf: [POPUP_TEXT_CAP]u8 = undefined;
+        const txt = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        g.addPopup(pos, txt, col);
     }
 };
 
@@ -313,6 +376,7 @@ fn updatePlaying(g: *Game, dt_in: f32) void {
 
     updateAim(g);
     handleInput(g);
+    handleGamepad(g);
     updateTimers(g, dt);
 
     updatePlayerMovement(g, dt);
@@ -330,6 +394,11 @@ fn updatePlaying(g: *Game, dt_in: f32) void {
     updatePortal(g);
 
     g.rig.follow(g.p.Pos, dt);
+
+    // Fog of war: the torch reveals the ground it sweeps (kept as a monotonic memory),
+    // then upload the mask if it changed this frame, before drawWorld samples it.
+    g.fog.reveal(g.p.Pos, TORCH_RADIUS);
+    g.fog.sync();
 }
 
 fn updateTimers(g: *Game, dt: f32) void {
@@ -343,15 +412,16 @@ fn updateTimers(g: *Game, dt: f32) void {
     if (p.hitFlash > 0) p.hitFlash -= dt;
     if (g.damageFlash > 0) g.damageFlash -= dt;
     if (g.shake > 0) g.shake -= dt;
-    if (g.bannerTime > 0) g.bannerTime -= dt;
-    if (g.toastTime > 0) g.toastTime -= dt;
+    g.banner.tick(dt);
+    g.toast.tick(dt);
     p.regen(dt);
 }
 
 // ---- Input ----
 
 // The screen-bottom band occupied by the HUD; clicks there don't move the hero.
-const hudReserve = 130;
+// Owned by hudx (which draws the HUD) so the reserve tracks the real layout height.
+const hudReserve = hudx.bottomBandHeight;
 
 fn handleInput(g: *Game) void {
     const p = &g.p;
@@ -361,12 +431,8 @@ fn handleInput(g: *Game) void {
     if (wheel != 0) g.rig.addZoom(wheel);
 
     // Potions.
-    if (rl.isKeyPressed(.one)) {
-        if (p.drinkHealth()) g.setToast("Drank a Health Potion", .{});
-    }
-    if (rl.isKeyPressed(.two)) {
-        if (p.drinkMana()) g.setToast("Drank a Mana Potion", .{});
-    }
+    if (rl.isKeyPressed(.one)) useHealthPotion(g);
+    if (rl.isKeyPressed(.two)) useManaPotion(g);
 
     // Keyboard movement (WASD / arrows) takes precedence over click-to-move.
     var kb = mathx.zero3;
@@ -387,9 +453,7 @@ fn handleInput(g: *Game) void {
     if (rl.isKeyPressed(.space)) {
         var dir = g.kbMove;
         if (lenXZ(dir) < 1e-3) dir = dirXZ(p.Pos, g.mouseGround);
-        if (p.startRoll(dir)) {
-            g.addPopup(v3(p.Pos.x, 2.1, p.Pos.z), "Dodge!", rgba(180, 220, 255, 255));
-        }
+        doDodge(g, dir);
     }
 
     const mouse = rl.getMousePosition();
@@ -397,9 +461,9 @@ fn handleInput(g: *Game) void {
 
     // Left mouse: walk to point, or chase+attack the hovered monster.
     if (rl.isMouseButtonDown(.left) and !overHUD and lenXZ(g.kbMove) == 0 and !p.rolling()) {
-        const ms = g.liveMonsters();
-        if (g.hoverMonster >= 0 and g.hoverMonster < @as(i32, @intCast(ms.len)) and ms[@intCast(g.hoverMonster)].alive()) {
-            p.targetMonster = ms[@intCast(g.hoverMonster)].id;
+        const hm = g.monsterByID(g.hoverMonster);
+        if (hm != null and hm.?.alive()) {
+            p.targetMonster = hm.?.id;
             p.hasMoveTarget = false;
         } else {
             p.targetMonster = -1;
@@ -427,6 +491,118 @@ fn castFirebolt(g: *Game) void {
     p.castCD = CAST_RATE;
     const dmg = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(8)));
     g.projs.add(projectile.newFirebolt(p.Pos, dir, dmg));
+    g.rumble.play(rumble.cast);
+}
+
+// Attempt a dodge roll in dir, playing the shared feedback (rumble + popup) on
+// success. The keyboard and gamepad paths only differ in how they pick dir, so the
+// roll + feedback lives here once.
+fn doDodge(g: *Game, dir: rl.Vector3) void {
+    if (g.p.startRoll(dir)) {
+        g.rumble.play(rumble.dodge);
+        g.addPopup(v3(g.p.Pos.x, 2.1, g.p.Pos.z), "Dodge!", rgba(180, 220, 255, 255));
+    }
+}
+
+// Drink a belt potion and toast the result. Shared by the keyboard (1/2) and gamepad
+// (L1/R1) bindings so the two input paths can't drift.
+fn useHealthPotion(g: *Game) void {
+    if (g.p.drinkHealth()) g.setToast("Drank a Health Potion", .{});
+}
+fn useManaPotion(g: *Game) void {
+    if (g.p.drinkMana()) g.setToast("Drank a Mana Potion", .{});
+}
+
+// ---- Gamepad ----
+// Left stick moves; right stick aims (and targets a nearby foe); X attacks, Y casts
+// Firebolt, B dodges, L1/R1 drink potions, Start opens the menu (handled in run()).
+const PAD = 0; // first connected controller
+const STICK_DEADZONE = 0.25; // ignore small stick drift
+const AIM_REACH = 6.0; // how far ahead the right stick projects the aim point
+
+// Read a stick as a unit XZ direction (stick up = -Z = "forward", matching the camera
+// and the WASD mapping). Returns zero inside the deadzone; otherwise a unit vector, so
+// movement is full-speed and facing stays unit-length like the keyboard path.
+fn stickXZ(axisX: rl.GamepadAxis, axisY: rl.GamepadAxis) rl.Vector3 {
+    const v = v3(rl.getGamepadAxisMovement(PAD, axisX), 0, rl.getGamepadAxisMovement(PAD, axisY));
+    if (lenXZ(v) < STICK_DEADZONE) return mathx.zero3;
+    return dirXZ(mathx.zero3, v); // normalize to a unit heading
+}
+
+// Pick a foe to engage with the gamepad: the best-scored live monster in vision —
+// nearest by default, biased toward `aimDir` when the right stick is pushed. Updates
+// hoverMonster so the HUD highlights it; returns the monster id, or null if none.
+fn padAcquireTarget(g: *Game, aimDir: rl.Vector3) ?i32 {
+    var bestID: ?i32 = null;
+    var bestScore: f32 = -std.math.floatMax(f32);
+    const aiming = lenXZ(aimDir) > 0;
+    for (g.liveMonsters()) |*m| {
+        if (!m.alive() or !g.inVision(m.Pos)) continue;
+        const to = dirXZ(g.p.Pos, m.Pos);
+        // Near foes score higher; when aiming, alignment with the stick dominates.
+        var score = -distXZ(g.p.Pos, m.Pos);
+        if (aiming) score += (to.x * aimDir.x + to.z * aimDir.z) * 8.0;
+        if (score > bestScore) {
+            bestScore = score;
+            bestID = m.id;
+        }
+    }
+    if (bestID) |id| g.hoverMonster = id;
+    return bestID;
+}
+
+fn handleGamepad(g: *Game) void {
+    if (!rl.isGamepadAvailable(PAD)) return;
+    const p = &g.p;
+
+    // Left stick: movement (overrides click-to-move, like the keyboard does).
+    const mv = stickXZ(.left_x, .left_y);
+    if (lenXZ(mv) > 0) {
+        g.kbMove = mv;
+        p.hasMoveTarget = false;
+        p.targetMonster = -1;
+    }
+
+    // Right stick: aim. Project a ground point ahead of the hero so the existing
+    // Firebolt / dodge / hover logic can all key off g.mouseGround.
+    const aimDir = stickXZ(.right_x, .right_y); // already a unit heading (or zero)
+    const aiming = lenXZ(aimDir) > 0;
+    if (aiming) {
+        g.mouseGround = v3(p.Pos.x + aimDir.x * AIM_REACH, 0, p.Pos.z + aimDir.z * AIM_REACH);
+        _ = padAcquireTarget(g, aimDir); // highlight who we'd hit
+    }
+
+    // X: attack — engage the best foe (nearest, biased to the aim direction). The
+    // auto-attack + chase then drive it, exactly like clicking a monster with the mouse.
+    if (rl.isGamepadButtonDown(PAD, .right_face_left) and !p.rolling()) {
+        if (padAcquireTarget(g, aimDir)) |id| {
+            p.targetMonster = id;
+            p.hasMoveTarget = false;
+        }
+    }
+
+    // Y: cast Firebolt toward the aim point (falls back to facing when not aiming).
+    if (rl.isGamepadButtonDown(PAD, .right_face_up) and !p.rolling()) {
+        if (!aiming) g.mouseGround = v3(p.Pos.x + p.Facing.x * AIM_REACH, 0, p.Pos.z + p.Facing.z * AIM_REACH);
+        castFirebolt(g);
+    }
+
+    // B: dodge roll (movement direction, else aim direction, else facing).
+    if (rl.isGamepadButtonPressed(PAD, .right_face_right)) {
+        var dir = g.kbMove;
+        if (lenXZ(dir) < 1e-3) dir = aimDir;
+        doDodge(g, dir);
+    }
+
+    // L1 / R1: potions.
+    if (rl.isGamepadButtonPressed(PAD, .left_trigger_1)) useHealthPotion(g);
+    if (rl.isGamepadButtonPressed(PAD, .right_trigger_1)) useManaPotion(g);
+}
+
+// The Start button, guarded by controller presence. Used across scenes for
+// menu / confirm, mirroring Enter.
+fn padStartPressed() bool {
+    return rl.isGamepadAvailable(PAD) and rl.isGamepadButtonPressed(PAD, .middle_right);
 }
 
 // updateAim refreshes the ground point under the cursor and the hovered monster.
@@ -436,12 +612,12 @@ fn updateAim(g: *Game) void {
 
     g.hoverMonster = -1;
     var best: f32 = std.math.floatMax(f32);
-    for (g.liveMonsters(), 0..) |*m, i| {
+    for (g.liveMonsters()) |*m| {
         if (!m.alive() or !g.inVision(m.Pos)) continue; // can't target what darkness hides
         const d = distXZ(m.Pos, g.mouseGround);
         if (d < m.Radius + 0.6 and d < best) {
             best = d;
-            g.hoverMonster = @intCast(i);
+            g.hoverMonster = m.id;
         }
     }
 }
@@ -468,7 +644,9 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
         if (g.monsterByID(p.targetMonster)) |m| {
             if (m.alive()) {
                 p.Facing = dirXZ(p.Pos, m.Pos);
-                if (distXZ(p.Pos, m.Pos) > p.atkRange + m.Radius * 0.5) {
+                // Close to half a body-radius inside reach so the hero settles into
+                // solid striking range instead of hovering at the exact edge.
+                if (distXZ(p.Pos, m.Pos) > playerReach(p.atkRange, m.Radius) - m.Radius * 0.5) {
                     dir = p.Facing;
                     moving = true;
                 }
@@ -500,29 +678,26 @@ fn updatePlayerAttack(g: *Game) void {
         p.targetMonster = -1;
         return;
     }
-    if (distXZ(p.Pos, m.Pos) <= p.atkRange + m.Radius) {
+    if (distXZ(p.Pos, m.Pos) <= playerReach(p.atkRange, m.Radius)) {
         var dmg = p.MinDmg + g.rng.float() * (p.MaxDmg - p.MinDmg);
         const crit = g.rng.float() < CRIT_CHANCE;
         if (crit) dmg *= CRIT_MULT;
         p.Facing = dirXZ(p.Pos, m.Pos);
         p.swing = playermod.swingDur;
         p.atkCD = p.atkRate;
+        g.rumble.play(if (crit) rumble.crit_hit else rumble.attack_hit);
         damageMonster(g, m, dmg, crit);
     }
 }
 
 fn damageMonster(g: *Game, m: *Monster, dmg: f32, crit: bool) void {
     m.HP -= dmg;
-    m.hitFlash = 0.12;
+    m.hitFlash = monster.monster_hitflash;
     m.aggro = true;
     const col = if (crit) rgba(255, 220, 60, 255) else rl.Color.white;
-    var buf: [16]u8 = undefined;
     const di: i32 = @intFromFloat(dmg);
-    const txt = if (crit)
-        std.fmt.bufPrint(&buf, "{d}!", .{di}) catch ""
-    else
-        std.fmt.bufPrint(&buf, "{d}", .{di}) catch "";
-    g.addPopup(m.Pos, txt, col);
+    const pp = v3(m.Pos.x, m.Pos.y + POPUP_HEIGHT, m.Pos.z);
+    if (crit) g.addPopupFmt(pp, col, "{d}!", .{di}) else g.addPopupFmt(pp, col, "{d}", .{di});
     if (m.HP <= 0 and !m.dying) killMonster(g, m);
 }
 
@@ -531,18 +706,17 @@ fn killMonster(g: *Game, m: *Monster) void {
     m.dying = true;
     m.deathTimer = monster.monster_death_fade;
     g.kills += 1;
+    g.rumble.play(rumble.kill);
     if (g.p.addXP(m.XP)) onLevelUp(g);
-    var buf: [24]u8 = undefined;
-    const txt = std.fmt.bufPrint(&buf, "+{d} XP", .{m.XP}) catch "";
-    g.addPopup(v3(m.Pos.x, m.Pos.y + 0.5, m.Pos.z), txt, rgba(120, 200, 255, 255));
+    g.addPopupFmt(v3(m.Pos.x, m.Pos.y + POPUP_HEIGHT, m.Pos.z), rgba(120, 200, 255, 255), "+{d} XP", .{m.XP});
     loot.rollLoot(m, &g.rng, &g.lootList);
     if (m.boss) g.setToast("{s} has been slain!", .{m.Name});
     if (g.p.targetMonster == m.id) g.p.targetMonster = -1;
 }
 
 fn onLevelUp(g: *Game) void {
-    g.setBanner("Level {d}!", .{g.p.Level});
-    g.bannerTime = 2.2;
+    g.setBanner(LEVELUP_BANNER_DUR, "Level {d}!", .{g.p.Level});
+    g.rumble.play(rumble.level_up);
     g.shake = maxF(g.shake, 0.3);
     g.addPopup(v3(g.p.Pos.x, 2.2, g.p.Pos.z), "LEVEL UP", rgba(255, 230, 120, 255));
 }
@@ -620,7 +794,9 @@ fn resolveMonsterAttack(g: *Game, m: *Monster) void {
         g.projs.add(projectile.newArrow(m.Pos, dirXZ(m.Pos, g.p.Pos), dmg));
         return;
     }
-    if (distXZ(m.Pos, g.p.Pos) <= meleeReach(m.atkRange, g.p.Radius)) hitPlayer(g, dmg);
+    // Use the module radius constant — the SAME source the drawn telegraph ring reads
+    // (drawMonstersFX) — so standing just outside the red ring is genuinely safe.
+    if (distXZ(m.Pos, g.p.Pos) <= meleeReach(m.atkRange, playermod.radius)) hitPlayer(g, dmg);
 }
 
 // Push overlapping monsters apart so a pack doesn't collapse into one point.
@@ -656,68 +832,77 @@ fn hitPlayer(g: *Game, dmg: f32) void {
     g.p.takeDamage(dmg);
     g.damageFlash = DAMAGE_FLASH_DUR;
     g.shake = maxF(g.shake, 0.25);
-    var buf: [16]u8 = undefined;
+    g.rumble.play(rumble.hurt);
     const di: i32 = @intFromFloat(dmg);
-    const txt = std.fmt.bufPrint(&buf, "-{d}", .{di}) catch "";
-    g.addPopup(v3(g.p.Pos.x, 2.0, g.p.Pos.z), txt, rgba(255, 90, 90, 255));
-    if (!g.p.alive()) g.scene = .dead;
+    g.addPopupFmt(v3(g.p.Pos.x, 2.0, g.p.Pos.z), rgba(255, 90, 90, 255), "-{d}", .{di});
+    if (!g.p.alive()) {
+        g.rumble.play(rumble.death); // stronger than `hurt`, so it takes over the fade
+        g.scene = .dead;
+    }
 }
 
-// Advance projectiles: move, expire on lifetime/obstacle, damage what they strike.
-fn updateProjectiles(g: *Game, dt: f32) void {
-    var wI: usize = 0;
-    var i: usize = 0;
-    while (i < g.projs.count) : (i += 1) {
-        var pr = g.projs.buf[i];
-        pr.Pos.x += pr.Vel.x * dt;
-        pr.Pos.z += pr.Vel.z * dt;
-        pr.Life -= dt;
-        if (pr.Life <= 0 or g.w.rayHitsObstacle(pr.Pos, pr.Radius)) continue;
-        var hit = false;
-        if (pr.FromPlayer) {
-            for (g.liveMonsters()) |*m| {
-                if (m.alive() and distXZ(m.Pos, pr.Pos) < m.Radius + pr.Radius) {
-                    damageMonster(g, m, pr.Damage, false);
-                    hit = true;
-                    break;
-                }
+// Retain-in-place: advance every item, keep those for which `keepFn` returns true,
+// compacting survivors to the front. `keepFn` mutates the item it's handed (it aliases
+// the live slot) and may run side effects (damage, pickups). Returns the new length.
+// The per-frame entity sweeps share this instead of each re-rolling a write-index loop.
+fn retain(comptime T: type, items: []T, ctx: anytype, comptime keepFn: fn (@TypeOf(ctx), *T) bool) usize {
+    var w: usize = 0;
+    for (items, 0..) |*it, i| {
+        if (keepFn(ctx, it)) {
+            if (w != i) items[w] = items[i];
+            w += 1;
+        }
+    }
+    return w;
+}
+
+// Shared context for the per-frame sweeps: the game plus this frame's dt.
+const SweepCtx = struct { g: *Game, dt: f32 };
+
+// Advance one projectile: move, expire on lifetime/obstacle, damage what it strikes.
+// Returns false (drop it) when it expires or lands a hit.
+fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
+    const g = c.g;
+    pr.Pos.x += pr.Vel.x * c.dt;
+    pr.Pos.z += pr.Vel.z * c.dt;
+    pr.Life -= c.dt;
+    if (pr.Life <= 0 or g.w.rayHitsObstacle(pr.Pos, pr.Radius)) return false;
+    if (pr.FromPlayer) {
+        for (g.liveMonsters()) |*m| {
+            if (m.alive() and distXZ(m.Pos, pr.Pos) < m.Radius + pr.Radius) {
+                damageMonster(g, m, pr.Damage, false);
+                return false;
             }
-        } else if (g.p.alive() and distXZ(g.p.Pos, pr.Pos) < g.p.Radius + pr.Radius) {
-            hitPlayer(g, pr.Damage);
-            hit = true;
         }
-        if (!hit) {
-            g.projs.buf[wI] = pr;
-            wI += 1;
-        }
+    } else if (g.p.alive() and distXZ(g.p.Pos, pr.Pos) < g.p.Radius + pr.Radius) {
+        hitPlayer(g, pr.Damage);
+        return false;
     }
-    g.projs.count = wI;
+    return true;
+}
+fn updateProjectiles(g: *Game, dt: f32) void {
+    g.projs.count = retain(Projectile, g.projs.items(), SweepCtx{ .g = g, .dt = dt }, keepProjectile);
 }
 
-// Loot: bob in place; collected when the player walks over it.
-fn updateLoot(g: *Game, dt: f32) void {
-    var wI: usize = 0;
-    var i: usize = 0;
-    while (i < g.lootList.items.len) : (i += 1) {
-        var d = g.lootList.items[i];
-        d.bob += dt * 3;
-        if (distXZ(d.Pos, g.p.Pos) < g.p.Radius + 1.3) {
-            collect(g, d);
-            continue;
-        }
-        g.lootList.items[wI] = d;
-        wI += 1;
+// Loot: bob in place; collected (and dropped) when the player walks over it.
+fn keepLoot(c: SweepCtx, d: *LootDrop) bool {
+    d.bob += c.dt * 3;
+    if (distXZ(d.Pos, c.g.p.Pos) < c.g.p.Radius + 1.3) {
+        collect(c.g, d.*);
+        return false;
     }
-    g.lootList.shrinkRetainingCapacity(wI);
+    return true;
+}
+fn updateLoot(g: *Game, dt: f32) void {
+    const n = retain(LootDrop, g.lootList.items, SweepCtx{ .g = g, .dt = dt }, keepLoot);
+    g.lootList.shrinkRetainingCapacity(n);
 }
 
 fn collect(g: *Game, d: LootDrop) void {
     switch (d.Kind) {
         .gold => {
             g.p.Gold += d.Amount;
-            var buf: [24]u8 = undefined;
-            const txt = std.fmt.bufPrint(&buf, "+{d}g", .{d.Amount}) catch "";
-            g.addPopup(g.p.Pos, txt, rgba(255, 215, 80, 255));
+            g.addPopupFmt(v3(g.p.Pos.x, g.p.Pos.y + POPUP_HEIGHT, g.p.Pos.z), theme.goldColor, "+{d}g", .{d.Amount});
         },
         .health_potion => {
             if (g.p.HealthPots < playermod.maxPots) g.p.HealthPots += 1;
@@ -730,34 +915,26 @@ fn collect(g: *Game, d: LootDrop) void {
     }
 }
 
+fn keepPopup(c: SweepCtx, pp: *Popup) bool {
+    pp.Life -= c.dt;
+    pp.Pos.y += c.dt * 1.4;
+    return pp.Life > 0;
+}
 fn updatePopups(g: *Game, dt: f32) void {
-    var wI: usize = 0;
-    var i: usize = 0;
-    while (i < g.popups.items.len) : (i += 1) {
-        var pp = g.popups.items[i];
-        pp.Life -= dt;
-        pp.Pos.y += dt * 1.4;
-        if (pp.Life > 0) {
-            g.popups.items[wI] = pp;
-            wI += 1;
-        }
-    }
-    g.popups.shrinkRetainingCapacity(wI);
+    const n = retain(Popup, g.popups.items, SweepCtx{ .g = g, .dt = dt }, keepPopup);
+    g.popups.shrinkRetainingCapacity(n);
 }
 
 // Drop faded-out corpses, keeping live monsters packed contiguously at the front.
-fn updateDeaths(g: *Game, dt: f32) void {
-    var wI: usize = 0;
-    var i: usize = 0;
-    while (i < g.monsterCount) : (i += 1) {
-        if (g.monsters[i].dying) {
-            g.monsters[i].deathTimer -= dt;
-            if (g.monsters[i].deathTimer <= 0) continue;
-        }
-        if (wI != i) g.monsters[wI] = g.monsters[i];
-        wI += 1;
+fn keepMonster(c: SweepCtx, m: *Monster) bool {
+    if (m.dying) {
+        m.deathTimer -= c.dt;
+        if (m.deathTimer <= 0) return false;
     }
-    g.monsterCount = wI;
+    return true;
+}
+fn updateDeaths(g: *Game, dt: f32) void {
+    g.monsterCount = retain(Monster, g.liveMonsters(), SweepCtx{ .g = g, .dt = dt }, keepMonster);
 }
 
 fn updatePortal(g: *Game) void {
@@ -906,28 +1083,38 @@ fn drawMonsterBody(m: *const Monster) void {
     sphere(v3(m.Pos.x, monsterHeadY(m, shrink), m.Pos.z), m.Radius * 0.7 * shrink, col);
 }
 
-// Depth pass: living bodies within CULL of the player cast. Bodies past the torch
-// radius render black anyway, so there's no point shadowing them either.
-fn drawMonstersCast(ms: []const Monster, player: rl.Vector3) void {
+// A dynamic body is worth drawing when it sits inside the torch's lit disc, or when a
+// live fireball is flying past close enough to light it out in the dark. Gated at the
+// torch radius (not the padded CULL) so bodies never linger as dim silhouettes on
+// explored-but-dark ground: fog of war shows terrain memory in the "seen" band, never
+// monsters or loot. The static scene mesh, by contrast, is always drawn in full.
+fn bodyVisible(pos: rl.Vector3, player: rl.Vector3, fp: tl.FireParams) bool {
+    if (distXZ(pos, player) <= TORCH_RADIUS) return true;
+    return fp.intensity > 0 and distXZ(pos, fp.pos) <= fp.radius;
+}
+
+// Depth pass: living bodies visible this frame cast. Bodies neither near the player
+// nor lit by the fireball render black anyway, so there's no point shadowing them.
+fn drawMonstersCast(ms: []const Monster, player: rl.Vector3, fp: tl.FireParams) void {
     for (ms) |*m| {
         if (m.dying) continue;
-        if (distXZ(m.Pos, player) > CULL) continue;
+        if (!bodyVisible(m.Pos, player, fp)) continue;
         drawMonsterBody(m);
     }
 }
 
-fn drawMonstersLit(ms: []const Monster, player: rl.Vector3) void {
+fn drawMonstersLit(ms: []const Monster, player: rl.Vector3, fp: tl.FireParams) void {
     for (ms) |*m| {
-        if (distXZ(m.Pos, player) > CULL) continue;
+        if (!bodyVisible(m.Pos, player, fp)) continue;
         drawMonsterBody(m);
     }
 }
 
 // Emissive pass (no shadow): glowing eyes + the red attack telegraph + boss ring.
-fn drawMonstersFX(ms: []const Monster, player: rl.Vector3) void {
+fn drawMonstersFX(ms: []const Monster, player: rl.Vector3, fp: tl.FireParams) void {
     for (ms) |*m| {
         if (m.dying or !m.alive()) continue;
-        if (distXZ(m.Pos, player) > CULL) continue;
+        if (!bodyVisible(m.Pos, player, fp)) continue;
         if (m.boss) {
             rl.drawCircle3D(v3(m.Pos.x, 0.06, m.Pos.z), m.Radius + 0.4, v3(1, 0, 0), 90, rgba(255, 60, 60, 200));
         }
@@ -953,6 +1140,23 @@ fn drawMonstersFX(ms: []const Monster, player: rl.Vector3) void {
     }
 }
 
+// Pick the fireball that lights the scene: the first live player bolt. Its light is
+// modeled overhead (FIRE_HEIGHT) so the downward shadow map is well-oriented, with a
+// warm colour and a gentle flame flicker. intensity 0 => no fireball, light disabled.
+fn fireLight(projs: *ProjList, t: f32) tl.FireParams {
+    for (projs.items()) |*pr| {
+        if (!pr.FromPlayer) continue;
+        const flicker = 0.85 + 0.15 * sinf(t * 27);
+        return .{
+            .pos = v3(pr.Pos.x, FIRE_HEIGHT, pr.Pos.z),
+            .radius = FIRE_RADIUS,
+            .color = v3(1.0, 0.55, 0.22),
+            .intensity = 1.7 * flicker,
+        };
+    }
+    return .{ .pos = mathx.zero3, .radius = FIRE_RADIUS, .color = mathx.zero3, .intensity = 0 };
+}
+
 fn drawProjectiles(projs: *ProjList) void {
     for (projs.items()) |*pr| {
         sphere(pr.Pos, pr.Radius, pr.Color);
@@ -961,14 +1165,14 @@ fn drawProjectiles(projs: *ProjList) void {
     }
 }
 
-fn drawLoot(lootList: *std.ArrayList(LootDrop), player: rl.Vector3) void {
+fn drawLoot(lootList: *std.ArrayList(LootDrop), player: rl.Vector3, fp: tl.FireParams) void {
     for (lootList.items) |*d| {
-        if (distXZ(d.Pos, player) > CULL) continue;
+        if (!bodyVisible(d.Pos, player, fp)) continue;
         const y = 0.4 + 0.12 * sinf(d.bob);
         switch (d.Kind) {
-            .gold => sphere(v3(d.Pos.x, y * 0.6, d.Pos.z), 0.26, rgba(255, 205, 60, 255)),
-            .health_potion => rl.drawCubeV(v3(d.Pos.x, y, d.Pos.z), v3(0.4, 0.6, 0.4), rgba(220, 40, 50, 255)),
-            .mana_potion => rl.drawCubeV(v3(d.Pos.x, y, d.Pos.z), v3(0.4, 0.6, 0.4), rgba(60, 110, 235, 255)),
+            .gold => sphere(v3(d.Pos.x, y * 0.6, d.Pos.z), 0.26, theme.goldColor),
+            .health_potion => rl.drawCubeV(v3(d.Pos.x, y, d.Pos.z), v3(0.4, 0.6, 0.4), theme.healthColor),
+            .mana_potion => rl.drawCubeV(v3(d.Pos.x, y, d.Pos.z), v3(0.4, 0.6, 0.4), theme.manaColor),
         }
     }
 }
@@ -1000,20 +1204,32 @@ fn drawWorld(g: *Game) rl.Camera3D {
 
     const t = g.elapsed;
     const lp = tl.LightParams{ .pos = v3(g.p.Pos.x, TORCH_HEIGHT, g.p.Pos.z), .radius = TORCH_RADIUS };
+    const fp = fireLight(&g.projs, t);
     const ms = g.liveMonsters();
     const drawHero = g.p.alive();
 
-    // --- depth pass (obstacle mesh + nearby monsters + player cast) ---
+    // --- torch depth pass (obstacle mesh + nearby monsters + player cast) ---
     g.torch.beginShadowPass(lp);
     g.sceneMesh.drawDepth();
-    drawMonstersCast(ms, g.p.Pos);
+    drawMonstersCast(ms, g.p.Pos, fp);
     if (drawHero) drawHeroBody(&g.p);
     g.torch.endShadowPass();
+
+    // --- fireball depth pass (only when a bolt is live) ---
+    if (fp.intensity > 0) {
+        g.torch.beginFireShadowPass(fp);
+        g.sceneMesh.drawDepth();
+        drawMonstersCast(ms, g.p.Pos, fp);
+        if (drawHero) drawHeroBody(&g.p);
+        g.torch.endFireShadowPass();
+    }
 
     // --- main pass ---
     rl.beginDrawing();
     rl.clearBackground(rgba(16, 16, 22, 255));
     g.torch.applyUniforms(cam, lp);
+    g.torch.applyFireUniforms(fp);
+    g.torch.applyFogUniforms(.{ .texId = @intCast(g.fog.tex.id), .half = g.fog.half });
     rl.beginMode3D(cam);
     g.torch.beginScene();
     // beginScene bound the shadow map on slot 10 and left it active; reset to 0 so
@@ -1022,12 +1238,12 @@ fn drawWorld(g: *Game) rl.Camera3D {
     g.sceneMesh.drawScene();
     rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(g.w.Half * 2, g.w.Half * 2), g.w.Ground);
     drawWalls(&g.w);
-    drawMonstersLit(ms, g.p.Pos);
+    drawMonstersLit(ms, g.p.Pos, fp);
     if (drawHero) drawHeroBody(&g.p);
     g.torch.endScene();
     if (drawHero) drawHeroFX(&g.p, t);
-    drawMonstersFX(ms, g.p.Pos);
-    drawLoot(&g.lootList, g.p.Pos);
+    drawMonstersFX(ms, g.p.Pos, fp);
+    drawLoot(&g.lootList, g.p.Pos, fp);
     drawProjectiles(&g.projs);
     drawPortal(&g.w, t);
     rl.endMode3D();
@@ -1035,7 +1251,9 @@ fn drawWorld(g: *Game) rl.Camera3D {
 }
 
 pub fn run(shot: bool) void {
-    if (shot) rl.setConfigFlags(.{ .window_hidden = true });
+    // 4x MSAA smooths every polygon edge in the scene (the biggest overall-fidelity
+    // win); set before initWindow or the GL context ignores it.
+    rl.setConfigFlags(.{ .msaa_4x_hint = true, .window_hidden = shot });
     rl.initWindow(1280, 800, "zig-diablo");
     defer rl.closeWindow();
     // Uncapped: no setTargetFPS. setTargetFPS paces by OS sleep, whose ~15.6ms Windows
@@ -1045,6 +1263,7 @@ pub fn run(shot: bool) void {
 
     var g = Game.init(if (shot) 1234 else mathx.timeSeed()) catch return;
     defer g.deinit();
+    defer g.rumble.stop(); // never leave a motor latched on after the window closes
 
     // Screenshot harness: skip the menu, sweep a couple of vantage points.
     const sweep = [_]rl.Vector3{ world.startPos(g.w), mathx.ground(0, 0) };
@@ -1061,20 +1280,25 @@ pub fn run(shot: bool) void {
 
         switch (g.scene) {
             .menu => {
-                if (rl.isKeyPressed(.enter) or rl.isKeyPressed(.space)) g.startRun();
+                if (rl.isKeyPressed(.enter) or rl.isKeyPressed(.space) or padStartPressed()) g.startRun();
                 g.rig.follow(g.p.Pos, dt); // let the backdrop drift
             },
             .playing => {
-                if (rl.isKeyPressed(.escape)) g.scene = .menu;
+                if (rl.isKeyPressed(.escape) or padStartPressed()) g.scene = .menu;
                 updatePlaying(&g, dt);
             },
             .dead => {
-                if (rl.isKeyPressed(.r)) g.startRun();
+                if (rl.isKeyPressed(.r) or padStartPressed()) g.startRun();
             },
             .victory => {
-                if (rl.isKeyPressed(.enter)) g.startRun();
+                if (rl.isKeyPressed(.enter) or padStartPressed()) g.startRun();
             },
         }
+
+        // Drive rumble every frame across all scenes so envelopes always decay to
+        // silence (the death rumble swells on into the death screen). Silent while
+        // paused or with no controller; still ticks so it fades in the background.
+        g.rumble.update(dt, rl.isGamepadAvailable(PAD) and !g.paused);
 
         const cam = drawWorld(&g);
         hudx.draw(&g, cam);

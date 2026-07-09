@@ -3,6 +3,7 @@ const rl = @import("raylib");
 const mathx = @import("mathx.zig");
 const gamemod = @import("game.zig");
 const playermod = @import("player.zig");
+const theme = @import("theme.zig");
 
 const Game = gamemod.Game;
 const Player = playermod.Player;
@@ -13,6 +14,11 @@ const v3 = mathx.v3;
 
 // HUD + world overlays + scene screens for the game (game.zig). 2D only — drawn after
 // endMode3D, so it never touches the torch lighting.
+
+// Height (px) of the bottom band the HUD occupies (orbs, belt, XP bar). The single
+// source of truth for how tall the HUD is; game.zig reads it to ignore world clicks
+// that land on the HUD, so the two can't drift apart.
+pub const bottomBandHeight: i32 = 130;
 
 fn sw() i32 {
     return rl.getScreenWidth();
@@ -57,17 +63,24 @@ pub fn draw(g: *Game, cam: rl.Camera3D) void {
     }
 }
 
+// A world-to-screen projection is safe to draw only if it's finite AND within a sane
+// pixel range: getWorldToScreen can return huge finite values for points near the
+// camera plane, which would overflow the i32 casts these overlays feed it into.
+fn projValid(sp: rl.Vector2) bool {
+    return std.math.isFinite(sp.x) and std.math.isFinite(sp.y) and @abs(sp.x) < 1.0e6 and @abs(sp.y) < 1.0e6;
+}
+
 // Monster health bars + floating combat text, projected from world to screen.
 fn drawWorldOverlays(g: *Game, cam: rl.Camera3D) void {
     const ms = g.liveMonsters();
-    for (ms, 0..) |*m, i| {
+    for (ms) |*m| {
         if (!m.alive() or !g.inVision(m.Pos)) continue;
-        const idx: i32 = @intCast(i);
-        const showBar = m.aggro or idx == g.hoverMonster or m.HP < m.MaxHP or m.boss;
+        const hovered = m.id == g.hoverMonster; // hoverMonster is an id, so no stale-index risk
+        const showBar = m.aggro or hovered or m.HP < m.MaxHP or m.boss;
         if (!showBar) continue;
         const head = v3(m.Pos.x, m.Height + 0.7, m.Pos.z);
         const sp = rl.getWorldToScreen(head, cam);
-        if (!std.math.isFinite(sp.x) or !std.math.isFinite(sp.y)) continue;
+        if (!projValid(sp)) continue;
         const bw: f32 = if (m.boss) 90 else 46;
         const frac = clampF(m.HP / m.MaxHP, 0, 1);
         const x: i32 = @intFromFloat(sp.x - bw / 2);
@@ -75,7 +88,7 @@ fn drawWorldOverlays(g: *Game, cam: rl.Camera3D) void {
         rl.drawRectangle(x - 1, y - 1, @as(i32, @intFromFloat(bw)) + 2, 7, rgba(0, 0, 0, 210));
         const fillCol = if (m.boss) rgba(230, 40, 110, 255) else rgba(200, 50, 40, 255);
         rl.drawRectangle(x, y, @intFromFloat(bw * frac), 5, fillCol);
-        if (idx == g.hoverMonster or m.boss) {
+        if (hovered or m.boss) {
             var nbuf: [64]u8 = undefined;
             const label = std.fmt.bufPrintZ(&nbuf, "{s}", .{m.Name}) catch "";
             const lw = rl.measureText(label, 14);
@@ -87,9 +100,9 @@ fn drawWorldOverlays(g: *Game, cam: rl.Camera3D) void {
     for (g.popups.items) |*pp| {
         if (!g.inVision(pp.Pos)) continue;
         const sp = rl.getWorldToScreen(pp.Pos, cam);
-        if (!std.math.isFinite(sp.x) or !std.math.isFinite(sp.y)) continue;
+        if (!projValid(sp)) continue;
         const a = mathx.u8f(clampF(pp.Life / pp.maxLife * 255, 0, 255));
-        var tbuf: [40]u8 = undefined;
+        var tbuf: [gamemod.POPUP_TEXT_CAP + 1]u8 = undefined; // +1 for bufPrintZ's sentinel
         const txt = std.fmt.bufPrintZ(&tbuf, "{s}", .{pp.text()}) catch "";
         const w = rl.measureText(txt, 20);
         rl.drawText(txt, @as(i32, @intFromFloat(sp.x)) - @divTrunc(w, 2) + 1, @as(i32, @intFromFloat(sp.y)) + 1, 20, rgba(0, 0, 0, a));
@@ -121,7 +134,7 @@ fn drawHUD(g: *Game) void {
 
     // Red damage flash.
     if (g.damageFlash > 0) {
-        const a = mathx.u8f(clampF(g.damageFlash / 0.4 * 120, 0, 120));
+        const a = mathx.u8f(clampF(g.damageFlash / gamemod.DAMAGE_FLASH_DUR * 120, 0, 120));
         rl.drawRectangle(0, 0, W, H, rgba(180, 0, 0, a));
     }
 
@@ -133,12 +146,12 @@ fn drawHUD(g: *Game) void {
     const healthCX = xpX - 24 - orbR;
     const manaCX = xpX + xpW + 24 + orbR;
 
-    drawOrb(healthCX, orbY, orbR, p.HP / p.MaxHP, rgba(190, 30, 30, 255), rgba(60, 14, 14, 255));
+    drawOrb(healthCX, orbY, orbR, p.HP / p.MaxHP, theme.healthColor, theme.healthSocket);
     var b1: [64]u8 = undefined;
     const hp = std.fmt.bufPrintZ(&b1, "{d}/{d}", .{ @as(i32, @intFromFloat(p.HP)), @as(i32, @intFromFloat(p.MaxHP)) }) catch "";
     text(hp, healthCX - @divTrunc(rl.measureText(hp, 16), 2), orbY - 8, 16, rl.Color.white);
 
-    drawOrb(manaCX, orbY, orbR, p.Mana / p.MaxMana, rgba(40, 70, 210, 255), rgba(16, 22, 60, 255));
+    drawOrb(manaCX, orbY, orbR, p.Mana / p.MaxMana, theme.manaColor, theme.manaSocket);
     var b2: [64]u8 = undefined;
     const mp = std.fmt.bufPrintZ(&b2, "{d}/{d}", .{ @as(i32, @intFromFloat(p.Mana)), @as(i32, @intFromFloat(p.MaxMana)) }) catch "";
     text(mp, manaCX - @divTrunc(rl.measureText(mp, 16), 2), orbY - 8, 16, rl.Color.white);
@@ -166,15 +179,15 @@ fn drawHUD(g: *Game) void {
     text(en, W - rl.measureText(en, 18) - 16, 32, 18, rgba(230, 180, 180, 230));
 
     // Transient status toast (top-center).
-    if (g.toastTime > 0 and g.toast_len > 0) {
-        const a = mathx.u8f(clampF(g.toastTime / 2.5 * 255, 0, 255));
-        centered(g.toastText(), 14, 22, withAlpha(rgba(255, 245, 210, 255), a));
+    if (g.toast.active()) {
+        const a = mathx.u8f(clampF(g.toast.time / gamemod.TOAST_DUR * 255, 0, 255));
+        centered(g.toast.text(), 14, 22, withAlpha(rgba(255, 245, 210, 255), a));
     }
 
     // Area-name banner (big, fades on entry).
-    if (g.bannerTime > 0 and g.banner_len > 0) {
-        const a = mathx.u8f(clampF(g.bannerTime, 0, 1) * 255);
-        centered(g.bannerText(), @divTrunc(H, 3), 56, withAlpha(rgba(255, 225, 160, 255), a));
+    if (g.banner.active()) {
+        const a = mathx.u8f(clampF(g.banner.time, 0, 1) * 255);
+        centered(g.banner.text(), @divTrunc(H, 3), 56, withAlpha(rgba(255, 225, 160, 255), a));
     }
 }
 
@@ -193,17 +206,17 @@ fn drawBelt(p: *const Player, cx: i32, y: i32) void {
     const total = w1 + gap + w2 + gap + rl.measureText(goldTxt, 16);
     var x = cx - @divTrunc(total, 2);
 
-    rl.drawRectangle(x, y, 12, 16, rgba(200, 40, 50, 255));
+    rl.drawRectangle(x, y, 12, 16, theme.healthColor);
     rl.drawRectangleLines(x, y, 12, 16, rgba(20, 20, 20, 255));
     text(hpTxt, x + 16, y, 16, rl.Color.white);
     x += w1 + gap;
 
-    rl.drawRectangle(x, y, 12, 16, rgba(50, 90, 230, 255));
+    rl.drawRectangle(x, y, 12, 16, theme.manaColor);
     rl.drawRectangleLines(x, y, 12, 16, rgba(20, 20, 20, 255));
     text(mpTxt, x + 16, y, 16, rl.Color.white);
     x += w2 + gap;
 
-    text(goldTxt, x, y, 16, rgba(255, 215, 80, 255));
+    text(goldTxt, x, y, 16, theme.goldColor);
 }
 
 // Small FPS / frame-time / object-count readout, top-right.
@@ -239,6 +252,7 @@ fn drawMenu() void {
         "Spacebar    -  dodge roll (brief invulnerability) - your lifeline",
         "1 / 2       -  drink Health / Mana potion",
         "Mouse wheel -  zoom    |    P - pause    |    Esc - menu",
+        "Gamepad: L-stick move  -  R-stick aim  -  X hit  Y firebolt  B dodge  -  L1/R1 potions  -  Start menu",
         "",
         "This world is slow, methodical, and deadly. Blows are heavy and",
         "telegraphed in red - read them and roll clear. You cannot facetank.",
