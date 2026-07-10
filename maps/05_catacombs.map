@@ -1,0 +1,269 @@
+version: 1
+name: The Catacombs
+boss: Coldcrow
+half: 48.0
+ground: 54 46 60
+accent: 40 34 46
+light: 0.93 0.87 1.08
+spawn: 0.0 42.0
+portal: 0.0 -41.0
+bossat: -3.4 -34.6
+ob: tree 40.51 -37.76 0.92 4.46
+ob: gravestone -39.97 -37.96 0.70 1.96
+ob: rock -14.97 -44.11 1.53 1.86
+ob: gravestone -10.67 22.81 0.70 2.10
+ob: gravestone -32.21 26.72 0.70 1.84
+ob: gravestone 7.38 8.71 0.70 2.46
+ob: tree 2.04 19.79 1.26 5.30
+ob: gravestone 6.09 1.51 0.70 1.72
+ob: tree -6.99 -16.89 1.05 4.93
+ob: gravestone -39.14 -12.02 0.70 2.02
+ob: rock -42.83 -26.05 1.09 2.30
+ob: tree -22.62 -26.37 0.99 6.20
+ob: gravestone -10.41 -7.99 0.70 2.50
+ob: rock 8.62 11.00 1.29 2.44
+ob: rock -44.90 24.01 1.26 2.24
+ob: tree -6.44 -32.99 1.03 6.68
+ob: gravestone 35.12 -24.07 0.70 2.01
+ob: gravestone 14.10 -37.13 0.70 1.95
+ob: tree -14.47 43.81 1.30 4.53
+ob: tree 36.53 -3.62 1.13 4.27
+ob: tree -11.52 -17.93 1.21 5.50
+ob: gravestone 40.50 -27.54 0.70 1.99
+ob: rock 10.13 -15.42 1.47 1.89
+ob: rock 4.71 5.65 1.35 2.38
+ob: rock 21.96 -36.23 1.50 1.73
+ob: rock 9.08 -33.95 1.35 1.40
+ob: gravestone -26.11 -40.13 0.70 1.72
+ob: gravestone -13.36 -6.36 0.70 2.00
+ob: tree 28.86 -38.35 1.08 4.05
+ob: gravestone 1.43 -15.18 0.70 2.33
+ob: gravestone 13.47 36.96 0.70 2.22
+ob: tree -4.01 -7.73 1.37 6.23
+ob: rock -41.72 -17.82 1.19 2.50
+ob: rock -28.86 -26.83 1.66 1.79
+ob: gravestone -9.46 4.20 0.70 2.11
+ob: tree -42.80 9.93 1.24 6.03
+ob: gravestone 32.61 -14.40 0.70 2.26
+ob: tree -29.62 25.03 1.08 4.24
+ob: tree -18.25 4.73 1.02 4.16
+ob: gravestone 31.53 7.56 0.70 1.77
+ob: tree 29.62 -12.50 1.37 6.98
+ob: gravestone 35.92 19.44 0.70 2.28
+ob: tree -6.25 11.77 1.33 5.40
+decor: pebble 21.86 -26.98 0.15
+decor: pebble 6.15 -20.49 0.28
+decor: pebble 10.48 -21.03 0.12
+decor: pebble 21.57 17.33 0.17
+decor: pebble -24.94 23.67 0.23
+decor: shroom -28.81 -37.86 0.17
+decor: tuft -38.39 -37.11 0.46
+decor: tuft -11.12 25.02 0.64
+decor: tuft -27.28 -25.26 0.36
+decor: pebble 29.40 31.91 0.15
+decor: tuft 34.30 -12.28 0.53
+decor: shroom -14.25 35.81 0.27
+decor: tuft -13.20 -0.69 0.52
+decor: tuft -21.42 -42.24 0.33
+decor: pebble 29.08 -34.59 0.15
+decor: pebble 19.96 -1.48 0.28
+decor: pebble 6.10 -1.23 0.21
+decor: tuft 21.78 -14.52 0.45
+decor: tuft 10.56 -27.04 0.38
+decor: bone 37.18 2.90 0.35
+decor: pebble 33.46 -10.52 0.29
+decor: tuft 13.39 44.78 0.41
+decor: pebble 29.83 -15.32 0.12
+decor: pebble 38.51 19.30 0.26
+decor: shroom 43.17 -26.65 0.28
+decor: tuft -41.62 41.77 0.60
+decor: pebble -36.03 24.53 0.17
+decor: tuft -0.13 -19.31 0.60
+decor: bone 36.76 -38.21 0.49
+decor: tuft -18.37 -2.50 0.51
+decor: tuft -29.10 -2.06 0.55
+decor: tuft 13.82 12.42 0.44
+decor: tuft 44.12 34.38 0.58
+decor: tuft -29.80 -30.63 0.32
+decor: tuft 34.38 -13.13 0.57
+decor: pebble 36.86 7.87 0.30
+decor: bone -38.83 15.18 0.47
+decor: tuft 42.67 4.29 0.30
+decor: pebble -33.98 43.95 0.20
+decor: tuft -15.16 20.31 0.55
+decor: tuft -40.12 39.54 0.51
+decor: pebble -1.13 23.90 0.16
+decor: tuft -13.49 18.30 0.37
+decor: pebble -15.97 -8.89 0.16
+decor: tuft -27.74 22.41 0.47
+decor: tuft 26.96 -3.09 0.45
+decor: tuft 17.37 8.21 0.32
+decor: tuft 30.99 12.81 0.65
+decor: pebble -18.80 -43.73 0.15
+decor: shroom 36.22 1.02 0.22
+decor: pebble 27.77 45.72 0.25
+decor: pebble -34.58 36.20 0.29
+decor: shroom -7.02 34.14 0.23
+decor: pebble -26.39 -18.48 0.28
+decor: bone -16.43 35.60 0.42
+decor: pebble 16.19 5.21 0.15
+decor: pebble -27.48 28.21 0.26
+decor: tuft -34.75 13.83 0.49
+decor: bone 14.18 5.48 0.45
+decor: bone -0.67 10.08 0.38
+decor: pebble -13.43 -22.13 0.21
+decor: pebble -34.19 13.83 0.22
+decor: pebble 37.53 11.91 0.25
+decor: pebble -22.53 -23.53 0.14
+decor: pebble -38.80 -42.35 0.11
+decor: pebble -9.77 -15.44 0.12
+decor: bone 9.82 39.04 0.43
+decor: pebble 26.34 0.05 0.19
+decor: tuft -29.08 -1.25 0.49
+decor: pebble -8.35 15.26 0.30
+decor: pebble -11.14 24.83 0.11
+decor: tuft -0.22 -12.15 0.33
+decor: tuft -41.41 -28.58 0.63
+decor: pebble 9.95 -31.57 0.24
+decor: tuft 18.09 23.26 0.43
+decor: tuft 22.66 -39.53 0.37
+decor: tuft 31.47 -33.15 0.59
+decor: tuft -33.95 2.25 0.42
+decor: tuft 5.74 7.46 0.48
+decor: shroom -24.23 -18.40 0.19
+decor: pebble -44.56 7.90 0.20
+decor: pebble 1.34 37.22 0.15
+decor: tuft 21.82 -17.03 0.56
+decor: pebble -10.92 3.13 0.14
+decor: tuft -37.35 -2.55 0.49
+decor: pebble -32.63 -5.66 0.20
+decor: tuft 39.75 -8.12 0.47
+decor: tuft -18.99 -45.04 0.52
+decor: pebble 26.65 -19.12 0.27
+decor: tuft -33.03 43.17 0.57
+decor: pebble -33.58 23.89 0.12
+decor: pebble 7.68 39.11 0.25
+decor: pebble -40.67 -12.00 0.14
+decor: bone -43.91 -17.64 0.42
+decor: shroom 7.68 -26.51 0.28
+decor: pebble 20.86 11.92 0.22
+decor: pebble -39.86 20.18 0.14
+decor: tuft -45.07 38.00 0.62
+decor: bone 36.94 -11.97 0.35
+decor: pebble -2.05 13.11 0.21
+decor: tuft -21.96 -8.25 0.35
+decor: tuft 41.99 27.12 0.45
+decor: pebble -17.73 -17.38 0.26
+decor: shroom -13.25 35.27 0.18
+decor: pebble -38.89 -6.29 0.11
+decor: tuft 5.88 -11.66 0.56
+decor: pebble -8.29 -33.51 0.29
+decor: shroom 41.26 -3.67 0.18
+decor: tuft 32.60 25.17 0.54
+decor: tuft -26.64 -26.10 0.64
+decor: pebble 33.73 -11.55 0.13
+decor: bone -0.85 -29.08 0.48
+decor: tuft -40.39 13.89 0.49
+decor: tuft -30.95 21.71 0.35
+decor: tuft -44.69 -36.86 0.44
+decor: pebble 40.63 6.54 0.27
+decor: pebble 3.91 -6.72 0.13
+decor: pebble 11.82 27.95 0.14
+decor: pebble 45.89 44.37 0.20
+decor: shroom -45.28 -38.24 0.26
+decor: pebble 22.76 -34.52 0.22
+decor: pebble 35.02 -42.43 0.17
+decor: bone -35.76 4.82 0.43
+decor: pebble -25.81 -25.77 0.30
+decor: bone -8.42 -17.63 0.46
+decor: pebble 23.92 26.57 0.26
+decor: bone -39.82 -18.86 0.34
+decor: pebble 37.28 -18.76 0.29
+decor: pebble 15.59 9.75 0.15
+decor: shroom 21.30 24.39 0.28
+decor: pebble -1.07 -17.03 0.15
+decor: tuft 5.33 15.12 0.52
+decor: tuft -24.31 16.14 0.36
+decor: pebble 18.50 7.92 0.14
+decor: pebble -39.23 33.54 0.11
+decor: bone -45.44 9.61 0.36
+decor: pebble -11.28 27.21 0.13
+decor: tuft -35.61 37.14 0.60
+decor: tuft -36.80 -1.68 0.46
+decor: tuft -41.09 -1.82 0.32
+decor: tuft -33.77 -33.58 0.61
+decor: pebble 36.61 -30.42 0.20
+decor: shroom -20.15 16.73 0.22
+decor: pebble -29.97 8.31 0.27
+decor: pebble -9.89 -25.68 0.14
+decor: pebble -33.11 -18.64 0.18
+decor: bone -23.11 23.15 0.42
+decor: tuft -37.91 -40.68 0.48
+decor: tuft 41.55 15.40 0.39
+decor: pebble 23.44 -18.39 0.17
+decor: bone 8.66 36.77 0.29
+decor: tuft -19.54 -11.44 0.30
+decor: tuft -22.11 2.60 0.36
+decor: pebble -11.59 19.86 0.21
+decor: pebble 19.35 -36.79 0.15
+decor: shroom 27.41 32.40 0.20
+decor: pebble -19.67 28.65 0.25
+decor: pebble -32.74 -0.12 0.13
+decor: tuft -14.99 21.79 0.47
+decor: tuft 11.82 -41.42 0.46
+decor: shroom -40.47 -43.27 0.26
+decor: pebble -7.37 -21.85 0.26
+decor: tuft 10.69 30.71 0.55
+decor: tuft 40.83 11.87 0.55
+decor: bone 14.58 7.31 0.44
+decor: shroom 8.22 31.37 0.20
+decor: pebble 19.01 33.28 0.19
+decor: pebble -21.79 -41.41 0.13
+decor: pebble -35.08 -17.14 0.15
+decor: tuft 32.59 30.47 0.39
+decor: pebble -0.19 -18.33 0.26
+decor: pebble 20.87 20.47 0.11
+decor: tuft 38.41 22.65 0.58
+decor: tuft 40.26 -16.91 0.62
+decor: tuft -2.25 -18.68 0.58
+decor: tuft -12.04 -4.59 0.41
+decor: shroom -4.25 -18.73 0.29
+decor: pebble 43.36 24.70 0.13
+decor: pebble 44.67 43.00 0.13
+decor: tuft 37.00 -40.74 0.58
+decor: pebble 15.87 31.06 0.15
+decor: tuft 21.11 -44.21 0.60
+decor: tuft -6.68 -5.07 0.32
+decor: shroom 3.42 3.69 0.22
+decor: tuft 7.70 -21.50 0.58
+decor: tuft -37.39 0.34 0.43
+decor: shroom 37.07 28.90 0.18
+decor: shroom -28.51 -8.64 0.19
+decor: tuft 37.75 -1.36 0.43
+decor: pebble 43.66 -28.89 0.13
+decor: tuft -6.16 31.70 0.37
+decor: tuft 14.30 -10.41 0.53
+decor: pebble 5.38 -35.62 0.11
+decor: tuft -33.21 -43.38 0.43
+decor: tuft 39.56 0.54 0.33
+decor: pebble -38.14 -28.09 0.29
+decor: bone -33.69 -5.75 0.31
+decor: tuft 15.89 -27.22 0.32
+decor: tuft 1.18 -44.23 0.47
+decor: pebble 30.79 22.69 0.11
+decor: shroom -25.65 20.78 0.27
+decor: tuft 36.13 10.80 0.50
+decor: tuft -32.10 39.94 0.36
+decor: pebble -44.45 0.90 0.14
+decor: pebble 38.11 30.43 0.16
+decor: bone 36.54 -41.51 0.26
+decor: pebble -21.81 8.96 0.14
+decor: shroom -39.07 -5.98 0.17
+pack: skeleton 2 22.3 -2.8
+pack: brute 2 -30.6 -2.4
+pack: zombie 4 9.3 -20.3
+pack: brute 3 -25.6 -29.8
+pack: skeleton 2 24.9 16.5
+pack: skeleton 4 -28.6 0.0
+pack: brute 3 16.4 -18.8
+pack: brute 3 -35.8 -19.1

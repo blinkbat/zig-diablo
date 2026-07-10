@@ -50,10 +50,13 @@ const FONT_PATH = "assets/IMFellEnglish-Regular.ttf";
 fn ensureFonts() void {
     if (fontsLoaded) return;
     fontsLoaded = true;
-    if (rl.loadFontEx(FONT_PATH, 96, null)) |big| {
+    // Atlas sizes leave DOWNSCALE-only headroom for every draw size in the game
+    // (after the 1.18 x-height factor): upscaling a glyph atlas is what makes
+    // text look blurry, and mild bilinear downscales stay crisp.
+    if (rl.loadFontEx(FONT_PATH, 120, null)) |big| {
         fontDisplay = big;
         rl.setTextureFilter(fontDisplay.texture, .bilinear);
-        if (rl.loadFontEx(FONT_PATH, 26, null)) |small| {
+        if (rl.loadFontEx(FONT_PATH, 40, null)) |small| {
             fontText = small;
             rl.setTextureFilter(fontText.texture, .bilinear);
             haveFont = true;
@@ -79,13 +82,16 @@ fn uiFont(size: i32) rl.Font {
 // IM Fell's x-height is far smaller than the old pixel font's, so at equal point
 // size it reads ~20% smaller. Drawing at 1.18x restores the intended presence;
 // textW uses the SAME factor, so every measured layout stays glyph-accurate.
+// ROUNDED to whole pixels: fractional render sizes resample every glyph and read
+// as blur, especially at UI sizes.
 fn fsize(size: i32) f32 {
-    return fi(size) * 1.18;
+    return @round(fi(size) * 1.18);
 }
 
 // Width of s at the given size in the UI font. ALL layout must measure through
 // this (never rl.measureText) or centering drifts off the drawn glyphs.
-fn textW(s: [:0]const u8, size: i32) i32 {
+// (pub: the editor overlay reuses the HUD's type + helpers.)
+pub fn textW(s: [:0]const u8, size: i32) i32 {
     if (!haveFont) return rl.measureText(s, size);
     return @intFromFloat(rl.measureTextEx(uiFont(size), s, fsize(size), 0).x);
 }
@@ -100,7 +106,7 @@ fn drawStr(s: [:0]const u8, x: i32, y: i32, size: i32, col: rl.Color) void {
 }
 
 // Text with a drop shadow for legibility over the 3D scene (1 px under 22, else 2).
-fn text(s: [:0]const u8, x: i32, y: i32, size: i32, col: rl.Color) void {
+pub fn text(s: [:0]const u8, x: i32, y: i32, size: i32, col: rl.Color) void {
     const off: i32 = if (size < 22) 1 else 2;
     drawStr(s, x + off, y + off, size, rgba(0, 0, 0, 200));
     drawStr(s, x, y, size, col);
@@ -123,26 +129,24 @@ fn glowCentered(s: [:0]const u8, cy: i32, size: i32, col: rl.Color, halo: rl.Col
 }
 
 // A soft rounded backing pill behind free-floating text.
-fn pill(x: i32, y: i32, w: i32, h: i32, col: rl.Color) void {
+pub fn pill(x: i32, y: i32, w: i32, h: i32, col: rl.Color) void {
     rl.drawRectangleRounded(.{ .x = fi(x), .y = fi(y), .width = fi(w), .height = fi(h) }, 0.9, 8, col);
 }
 
 // Top-level dispatcher: called once per frame after the 3D pass.
-pub fn draw(g: *Game, cam: rl.Camera3D) void {
+pub fn draw(g: *Game) void {
     ensureFonts();
     switch (g.scene) {
         .menu => {
             vignette();
-            drawMenu(g.elapsed);
+            drawMenu(g);
         },
         .playing => {
-            drawWorldOverlays(g, cam);
             vignette();
             drawHUD(g);
             if (g.paused) drawPauseOverlay();
         },
         .dead => {
-            drawWorldOverlays(g, cam);
             vignette();
             drawHUD(g);
             drawDeath(g);
@@ -151,14 +155,8 @@ pub fn draw(g: *Game, cam: rl.Camera3D) void {
             vignette();
             drawVictory(g);
         },
+        .editor => {}, // the editor draws its own overlay (editor.drawOverlay)
     }
-}
-
-// A world-to-screen projection is safe to draw only if it's finite AND within a sane
-// pixel range: getWorldToScreen can return huge finite values for points near the
-// camera plane, which would overflow the i32 casts these overlays feed it into.
-fn projValid(sp: rl.Vector2) bool {
-    return std.math.isFinite(sp.x) and std.math.isFinite(sp.y) and @abs(sp.x) < 1.0e6 and @abs(sp.y) < 1.0e6;
 }
 
 // Which foe owns the top-center plate this frame: the one under the cursor first,
@@ -190,11 +188,11 @@ fn drawEnemyPlate(g: *Game) void {
     const bx = cx - @divTrunc(bw, 2);
     const by = 16 + size + 6;
     // One soft backing behind name + bar so both read over any scene.
-    pill(bx - 18, 8, bw + 36, by - 8 + bh + 10, rgba(8, 6, 5, 165));
+    pill(bx - 18, 8, bw + 36, by - 8 + bh + 10, withAlpha(theme.ink, 165));
     var nbuf: [64]u8 = undefined;
     const name = std.fmt.bufPrintZ(&nbuf, "{s}", .{m.Name}) catch "";
     centered(name, 14, size, if (boss) rgba(255, 185, 205, 255) else rgba(240, 225, 205, 255));
-    rl.drawRectangle(bx - 2, by - 2, bw + 4, bh + 4, rgba(8, 6, 5, 235));
+    rl.drawRectangle(bx - 2, by - 2, bw + 4, bh + 4, withAlpha(theme.ink, 235));
     const fillCol = if (boss) rgba(225, 45, 105, 255) else rgba(200, 48, 40, 255);
     const frac = clampF(m.HP / m.MaxHP, 0, 1);
     const fw: i32 = @intFromFloat(fi(bw) * frac);
@@ -205,27 +203,13 @@ fn drawEnemyPlate(g: *Game) void {
     // Quarter ticks + a thin brass frame: the PoE signature of a "measured" bar.
     var q: i32 = 1;
     while (q < 4) : (q += 1) {
-        rl.drawRectangle(bx + @divTrunc(bw * q, 4), by, 1, bh, rgba(8, 6, 5, 170));
+        rl.drawRectangle(bx + @divTrunc(bw * q, 4), by, 1, bh, withAlpha(theme.ink, 170));
     }
     rl.drawRectangleLines(bx - 2, by - 2, bw + 4, bh + 4, withAlpha(theme.trimColor, 140));
 }
 
-// Floating combat text, projected from world to screen. (Enemy health lives on the
-// top-center plate — drawEnemyPlate — not over heads.)
-fn drawWorldOverlays(g: *Game, cam: rl.Camera3D) void {
-    // Floating combat text (hidden when its source sits in darkness).
-    for (g.popups.items) |*pp| {
-        if (!g.inVision(pp.Pos)) continue;
-        const sp = rl.getWorldToScreen(pp.Pos, cam);
-        if (!projValid(sp)) continue;
-        const a = mathx.u8f(clampF(pp.Life / pp.maxLife * 255, 0, 255));
-        var tbuf: [gamemod.POPUP_TEXT_CAP + 1]u8 = undefined; // +1 for bufPrintZ's sentinel
-        const txt = std.fmt.bufPrintZ(&tbuf, "{s}", .{pp.text()}) catch "";
-        const w = textW(txt, 20);
-        drawStr(txt, @as(i32, @intFromFloat(sp.x)) - @divTrunc(w, 2) + 1, @as(i32, @intFromFloat(sp.y)) + 1, 20, rgba(0, 0, 0, a));
-        drawStr(txt, @as(i32, @intFromFloat(sp.x)) - @divTrunc(w, 2), @as(i32, @intFromFloat(sp.y)), 20, withAlpha(pp.Color, a));
-    }
-}
+// (Floating combat text is gone by owner decree: no damage numbers, no "Dodge!" —
+// hit sparks, gore, the orbs, and the enemy plate carry all combat feedback.)
 
 // ---- 3D liquid orbs ----
 // Each orb is a REAL lit 3D scene rendered offscreen once per frame: a sphere mesh
@@ -419,7 +403,7 @@ fn drawOrb(cx: i32, cy: i32, radius: i32, frac_in: f32, full: rl.Color, empty: r
         rl.drawCircle(cx, cy, rf + 9, withAlpha(lerpColor(full, rl.Color.white, 0.15), pa));
     }
 
-    rl.drawCircle(cx, cy, rf + 5, rgba(8, 6, 5, 235));
+    rl.drawCircle(cx, cy, rf + 5, withAlpha(theme.ink, 235));
 
     if (ensureOrbAssets()) |rt| {
         renderOrbScene(rt, frac, full, empty, t, fi(cx) * 0.017);
@@ -493,7 +477,7 @@ fn drawHUD(g: *Game) void {
     const xpW = manaCX - orbR - 18 - xpX;
     const xpY = H - 24;
     const frac = if (p.XPNext > 0) @as(f32, @floatFromInt(p.XP)) / @as(f32, @floatFromInt(p.XPNext)) else 0;
-    rl.drawRectangle(xpX - 2, xpY - 2, xpW + 4, 12, rgba(8, 6, 5, 235));
+    rl.drawRectangle(xpX - 2, xpY - 2, xpW + 4, 12, withAlpha(theme.ink, 235));
     rl.drawRectangle(xpX, xpY, xpW, 8, rgba(28, 22, 14, 255));
     const fw: i32 = @intFromFloat(fi(xpW) * clampF(frac, 0, 1));
     if (fw > 0) {
@@ -508,7 +492,7 @@ fn drawHUD(g: *Game) void {
     }
     var tick: i32 = 1;
     while (tick < 10) : (tick += 1) {
-        rl.drawRectangle(xpX + @divTrunc(xpW * tick, 10), xpY, 1, 8, rgba(8, 6, 5, 170));
+        rl.drawRectangle(xpX + @divTrunc(xpW * tick, 10), xpY, 1, 8, withAlpha(theme.ink, 170));
     }
     rl.drawRectangleLines(xpX - 2, xpY - 2, xpW + 4, 12, withAlpha(theme.trimColor, 110));
 
@@ -603,7 +587,7 @@ fn drawTopRight(g: *Game) void {
     const perf = std.fmt.bufPrintZ(&b2, "FPS {d}  {d:.1} ms  {d} obj", .{ rl.getFPS(), rl.getFrameTime() * 1000, g.objectCount() }) catch "";
     const w = @max(textW(en, 22) + 46, textW(perf, 12) + 24);
     const x = W - w - 10;
-    pill(x, 8, w, 50, rgba(8, 6, 5, 175));
+    pill(x, 8, w, 50, withAlpha(theme.ink, 175));
     rl.drawRectangleRoundedLinesEx(.{ .x = fi(x), .y = 8, .width = fi(w), .height = 50 }, 0.9, 8, 1, withAlpha(theme.trimColor, 110));
     // Skull pip: cranium, hanging jaw, hollow sockets.
     const px = x + 14;
@@ -649,48 +633,62 @@ fn drawPauseOverlay() void {
     centered("Press P to resume", @divTrunc(sh(), 2) + 40, 24, rgba(220, 220, 220, 255));
 }
 
-fn drawMenu(t: f32) void {
+// The start menu: title + a short column of selectable items. Keyboard owns
+// `menuSel` from the run loop; here the mouse hovers to select and clicks to
+// activate (gamemod.menuActivate is the single activation path for both).
+fn drawMenu(g: *Game) void {
+    const t = g.elapsed;
     const W = sw();
     const H = sh();
     rl.drawRectangle(0, 0, W, H, rgba(4, 3, 6, 175));
     emberField(t, 22, rgba(255, 140, 50, 200), true);
 
-    // A smoldering backglow breathes behind the title.
+    // A smoldering backglow breathes behind the title. (Size 76 keeps the render
+    // size inside the 120 px display atlas — never upscale the title.)
     rl.drawCircleGradient(@divTrunc(W, 2), @divTrunc(H, 2) - 125, 320, rgba(120, 16, 8, mathx.u8f(60 + 25 * sinf(t * 1.8))), rgba(120, 16, 8, 0));
-    glowCentered("GO DIABLO", @divTrunc(H, 2) - 170, 90, rgba(210, 45, 40, 255), withAlpha(rgba(90, 8, 8, 255), mathx.u8f(95 + 35 * sinf(t * 1.8))));
-    // Gold rule under the title.
+    glowCentered("ZIG DIABLO", @divTrunc(H, 2) - 180, 76, rgba(210, 45, 40, 255), withAlpha(rgba(90, 8, 8, 255), mathx.u8f(95 + 35 * sinf(t * 1.8))));
     const ruleW: i32 = 340;
-    rl.drawRectangleGradientH(@divTrunc(W, 2) - ruleW, @divTrunc(H, 2) - 66, ruleW, 2, withAlpha(theme.goldColor, 0), theme.goldColor);
-    rl.drawRectangleGradientH(@divTrunc(W, 2), @divTrunc(H, 2) - 66, ruleW, 2, theme.goldColor, withAlpha(theme.goldColor, 0));
-    centered("A Diablo II-style action RPG", @divTrunc(H, 2) - 52, 26, rgba(220, 200, 180, 255));
+    rl.drawRectangleGradientH(@divTrunc(W, 2) - ruleW, @divTrunc(H, 2) - 86, ruleW, 2, withAlpha(theme.goldColor, 0), theme.goldColor);
+    rl.drawRectangleGradientH(@divTrunc(W, 2), @divTrunc(H, 2) - 86, ruleW, 2, theme.goldColor, withAlpha(theme.goldColor, 0));
 
-    const enterA = mathx.u8f(200 + 55 * sinf(t * 2.5));
-    centered("Press ENTER to descend", @divTrunc(H, 2) + 16, 32, withAlpha(rgba(255, 230, 160, 255), enterA));
+    var dispBuf: [48]u8 = undefined;
+    const dispLabel: [:0]const u8 = std.fmt.bufPrintZ(&dispBuf, "Display: {s}", .{switch (g.displayMode) {
+        .windowed => @as([]const u8, "Windowed"),
+        .borderless => "Fullscreen Windowed",
+        .fullscreen => "Fullscreen",
+    }}) catch "Display";
 
-    // Controls + creed, on a soft panel so they read over the drifting scene.
-    const panelW: i32 = 820;
-    const panelY = @divTrunc(H, 2) + 68;
-    const panelH: i32 = 292;
-    rl.drawRectangleRounded(.{ .x = fi(@divTrunc(W, 2) - @divTrunc(panelW, 2)), .y = fi(panelY), .width = fi(panelW), .height = fi(panelH) }, 0.08, 8, rgba(8, 6, 10, 170));
-    rl.drawRectangleRoundedLinesEx(.{ .x = fi(@divTrunc(W, 2) - @divTrunc(panelW, 2)), .y = fi(panelY), .width = fi(panelW), .height = fi(panelH) }, 0.08, 8, 1, withAlpha(theme.trimColor, 120));
+    const rootItems = gamemod.menuRootItems;
+    const optItems = [_][:0]const u8{ dispLabel, "Back" };
+    const items: []const [:0]const u8 = if (g.menuMode == .root) &rootItems else &optItems;
 
-    const lines = [_][:0]const u8{
-        "Left mouse  -  move, or attack the monster under the cursor",
-        "Right mouse -  cast Firebolt toward the cursor (uses mana)",
-        "Spacebar    -  dodge roll (brief invulnerability) - your lifeline",
-        "1 / 2       -  drink Health / Mana potion",
-        "Mouse wheel -  zoom    |    P - pause    |    Esc - menu",
-        "Gamepad: L-stick move  -  R-stick aim  -  X hit  Y firebolt  B dodge  -  L1/R1 potions  -  Start menu",
-        "",
-        "This world is slow, methodical, and deadly. Blows are heavy and",
-        "telegraphed in red - read them and roll clear. You cannot facetank.",
-        "Clear every monster to open the portal; survive five areas to win.",
-    };
-    var y = panelY + 18;
-    for (lines, 0..) |ln, i| {
-        const col = if (i >= 7) rgba(215, 175, 140, 235) else rgba(200, 200, 200, 230);
-        centered(ln, y, 18, col);
-        y += 26;
+    const mouse = rl.getMousePosition();
+    var y = @divTrunc(H, 2) - 20;
+    for (items, 0..) |label, i| {
+        const idx: i32 = @intCast(i);
+        const selected = g.menuSel == idx;
+        const size: i32 = if (selected) 36 else 30;
+        const w = textW(label, size);
+        const r = rl.Rectangle{ .x = fi(@divTrunc(W, 2) - @divTrunc(w, 2) - 20), .y = fi(y - 6), .width = fi(w + 40), .height = 46 };
+        if (rl.checkCollisionPointRec(mouse, r)) {
+            g.menuSel = idx;
+            if (rl.isMouseButtonPressed(.left)) gamemod.menuActivate(g, idx);
+        }
+        if (selected) {
+            // Gold daggers flank the chosen line, breathing gently.
+            const flare = mathx.u8f(180 + 60 * sinf(t * 3));
+            const gap = @divTrunc(w, 2) + 34;
+            text("-", @divTrunc(W, 2) - gap - 14, y + 6, 28, withAlpha(theme.goldColor, flare));
+            text("-", @divTrunc(W, 2) + gap, y + 6, 28, withAlpha(theme.goldColor, flare));
+            centered(label, y, size, rgba(255, 228, 160, 255));
+        } else {
+            centered(label, y + 3, size, rgba(205, 188, 165, 215));
+        }
+        y += 56;
+    }
+
+    if (g.menuMode == .options) {
+        centered("Alt+Enter toggles fullscreen windowed anywhere", y + 14, 15, rgba(170, 158, 140, 190));
     }
 }
 

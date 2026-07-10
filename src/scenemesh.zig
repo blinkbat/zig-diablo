@@ -148,29 +148,35 @@ fn cross(a: rl.Vector3, b: rl.Vector3) rl.Vector3 {
 
 // ---- Obstacle shapes (same geometry as the immediate-mode versions, baked once) ----
 
+// Every obstacle/decor bake offsets its geometry by Pos.y — props authored on a
+// rampart bake at rampart height (map.toWorld snaps Pos.y to the terrain).
+
 fn bakeBoulder(b: *Builder, o: world.Obstacle) void {
-    b.addSphere(v3(o.Pos.x, o.Height * 0.35, o.Pos.z), o.Radius, 8, 8, o.Tint);
-    b.addSphere(v3(o.Pos.x + o.Radius * 0.4, o.Height * 0.22, o.Pos.z + o.Radius * 0.3), o.Radius * 0.6, 8, 8, lerpColor(o.Tint, rl.Color.black, 0.15));
+    const gy = o.Pos.y;
+    b.addSphere(v3(o.Pos.x, gy + o.Height * 0.35, o.Pos.z), o.Radius, 8, 8, o.Tint);
+    b.addSphere(v3(o.Pos.x + o.Radius * 0.4, gy + o.Height * 0.22, o.Pos.z + o.Radius * 0.3), o.Radius * 0.6, 8, 8, lerpColor(o.Tint, rl.Color.black, 0.15));
     // A shed chip resting against the parent stone: boulders come in families.
-    b.addSphere(v3(o.Pos.x - o.Radius * 0.85, o.Radius * 0.16, o.Pos.z - o.Radius * 0.45), o.Radius * 0.28, 6, 6, lerpColor(o.Tint, rl.Color.white, 0.08));
+    b.addSphere(v3(o.Pos.x - o.Radius * 0.85, gy + o.Radius * 0.16, o.Pos.z - o.Radius * 0.45), o.Radius * 0.28, 6, 6, lerpColor(o.Tint, rl.Color.white, 0.08));
 }
 
 fn bakeGravestone(b: *Builder, o: world.Obstacle) void {
     // Slab + a rounded RIDGE along its top (a horizontal cylinder as wide as the
     // slab, matching its thickness) — the old full sphere ballooned out past the
     // slab's faces and read as a stone lollipop. Plus a settled plinth at the foot.
+    const gy = o.Pos.y;
     const dark = lerpColor(o.Tint, rl.Color.black, 0.3);
-    b.addCube(v3(o.Pos.x, o.Height / 2, o.Pos.z), v3(o.Radius * 2, o.Height, 0.35), o.Tint);
-    b.addCylinder(v3(o.Pos.x - o.Radius, o.Height, o.Pos.z), v3(o.Pos.x + o.Radius, o.Height, o.Pos.z), 0.19, 0.19, 8, o.Tint);
-    b.addSphere(v3(o.Pos.x - o.Radius, o.Height, o.Pos.z), 0.19, 6, 6, o.Tint);
-    b.addSphere(v3(o.Pos.x + o.Radius, o.Height, o.Pos.z), 0.19, 6, 6, o.Tint);
-    b.addCube(v3(o.Pos.x, 0.14, o.Pos.z), v3(o.Radius * 2 + 0.3, 0.28, 0.62), dark);
+    b.addCube(v3(o.Pos.x, gy + o.Height / 2, o.Pos.z), v3(o.Radius * 2, o.Height, 0.35), o.Tint);
+    b.addCylinder(v3(o.Pos.x - o.Radius, gy + o.Height, o.Pos.z), v3(o.Pos.x + o.Radius, gy + o.Height, o.Pos.z), 0.19, 0.19, 8, o.Tint);
+    b.addSphere(v3(o.Pos.x - o.Radius, gy + o.Height, o.Pos.z), 0.19, 6, 6, o.Tint);
+    b.addSphere(v3(o.Pos.x + o.Radius, gy + o.Height, o.Pos.z), 0.19, 6, 6, o.Tint);
+    b.addCube(v3(o.Pos.x, gy + 0.14, o.Pos.z), v3(o.Radius * 2 + 0.3, 0.28, 0.62), dark);
 }
 
 fn bakeTree(b: *Builder, o: world.Obstacle) void {
     const bark = o.Tint;
     const x = o.Pos.x;
     const z = o.Pos.z;
+    const gy = o.Pos.y;
     const segs_n = 4;
     const lean = v3(0.12, 0, 0.05);
     // Root flares gripping the ground: old trees don't rise out of a clean socket.
@@ -180,13 +186,13 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
         const rf: f32 = @floatFromInt(r);
         const ang = rf * (std.math.tau / 4.0) + o.Height * 1.7;
         const reach = 0.5 + 0.18 * sinf(o.Height * 3 + rf * 2.1);
-        b.addCylinder(v3(x, 0.32, z), v3(x + cosf(ang) * reach, 0.02, z + sinf(ang) * reach), 0.15, 0.045, 5, rootCol);
+        b.addCylinder(v3(x, gy + 0.32, z), v3(x + cosf(ang) * reach, gy + 0.02, z + sinf(ang) * reach), 0.15, 0.045, 5, rootCol);
     }
-    var prev = v3(x, 0, z);
+    var prev = v3(x, gy, z);
     var i: i32 = 1;
     while (i <= segs_n) : (i += 1) {
         const f: f32 = @as(f32, @floatFromInt(i)) / segs_n;
-        const top = v3(x + lean.x * o.Height * f * f, o.Height * 0.62 * f, z + lean.z * o.Height * f * f);
+        const top = v3(x + lean.x * o.Height * f * f, gy + o.Height * 0.62 * f, z + lean.z * o.Height * f * f);
         const r0 = 0.38 * (1 - 0.6 * @as(f32, @floatFromInt(i - 1)) / segs_n);
         const r1 = 0.38 * (1 - 0.6 * f);
         b.addCylinder(prev, top, r0, r1, 8, bark);
@@ -223,7 +229,7 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
 
 fn bakePebble(b: *Builder, d: world.Decor) void {
     // Sunk to ~40% so it reads as half-buried in the dirt.
-    b.addSphere(v3(d.Pos.x, d.Size * 0.4, d.Pos.z), d.Size, 6, 6, d.Tint);
+    b.addSphere(v3(d.Pos.x, d.Pos.y + d.Size * 0.4, d.Pos.z), d.Size, 6, 6, d.Tint);
 }
 
 fn bakeTuft(b: *Builder, d: world.Decor) void {
@@ -240,9 +246,9 @@ fn bakeTuft(b: *Builder, d: world.Decor) void {
         const h = d.Size * (0.85 + 0.4 * sinf(seed + iff));
         const dx = cosf(ang);
         const dz = sinf(ang);
-        const root = v3(d.Pos.x, 0, d.Pos.z);
-        const mid = v3(d.Pos.x + dx * lean * d.Size * 0.4, h * 0.62, d.Pos.z + dz * lean * d.Size * 0.4);
-        const tip = v3(d.Pos.x + dx * lean * d.Size * 1.15, h * 0.94, d.Pos.z + dz * lean * d.Size * 1.15);
+        const root = v3(d.Pos.x, d.Pos.y, d.Pos.z);
+        const mid = v3(d.Pos.x + dx * lean * d.Size * 0.4, d.Pos.y + h * 0.62, d.Pos.z + dz * lean * d.Size * 0.4);
+        const tip = v3(d.Pos.x + dx * lean * d.Size * 1.15, d.Pos.y + h * 0.94, d.Pos.z + dz * lean * d.Size * 1.15);
         const rootCol = lerpColor(d.Tint, rl.Color.black, 0.3);
         const tipCol = lerpColor(d.Tint, rgba(172, 195, 100, 255), 0.5 + 0.12 * @mod(iff, 2.0));
         b.addCylinder(root, mid, 0.055 * (0.8 + d.Size), 0.03, 3, rootCol);
@@ -252,8 +258,8 @@ fn bakeTuft(b: *Builder, d: world.Decor) void {
 
 fn bakeShroom(b: *Builder, d: world.Decor) void {
     const stemH = d.Size * 1.1;
-    b.addCylinder(v3(d.Pos.x, 0, d.Pos.z), v3(d.Pos.x, stemH, d.Pos.z), d.Size * 0.22, d.Size * 0.16, 5, rgba(216, 206, 186, 255));
-    b.addSphere(v3(d.Pos.x, stemH, d.Pos.z), d.Size * 0.55, 6, 6, d.Tint);
+    b.addCylinder(v3(d.Pos.x, d.Pos.y, d.Pos.z), v3(d.Pos.x, d.Pos.y + stemH, d.Pos.z), d.Size * 0.22, d.Size * 0.16, 5, rgba(216, 206, 186, 255));
+    b.addSphere(v3(d.Pos.x, d.Pos.y + stemH, d.Pos.z), d.Size * 0.55, 6, 6, d.Tint);
 }
 
 fn bakeBone(b: *Builder, d: world.Decor) void {
@@ -265,8 +271,8 @@ fn bakeBone(b: *Builder, d: world.Decor) void {
         const iff: f32 = @floatFromInt(i);
         const ang = seed + iff * 2.1;
         const half = d.Size * (0.7 + 0.25 * sinf(seed + iff * 1.7));
-        const a = v3(d.Pos.x - cosf(ang) * half, 0.05, d.Pos.z - sinf(ang) * half);
-        const c = v3(d.Pos.x + cosf(ang) * half, 0.07 + iff * 0.04, d.Pos.z + sinf(ang) * half);
+        const a = v3(d.Pos.x - cosf(ang) * half, d.Pos.y + 0.05, d.Pos.z - sinf(ang) * half);
+        const c = v3(d.Pos.x + cosf(ang) * half, d.Pos.y + 0.07 + iff * 0.04, d.Pos.z + sinf(ang) * half);
         b.addCylinder(a, c, 0.04, 0.04, 4, d.Tint);
         b.addSphere(a, 0.06, 5, 5, d.Tint);
         b.addSphere(c, 0.06, 5, 5, d.Tint);

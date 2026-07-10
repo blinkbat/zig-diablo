@@ -3,9 +3,11 @@ const rl = @import("raylib");
 const mathx = @import("mathx.zig");
 const tl = @import("torchlight.zig");
 const world = @import("world.zig");
+const mapmod = @import("map.zig");
 const monster = @import("monster.zig");
 const projectile = @import("projectile.zig");
 const scenemesh = @import("scenemesh.zig");
+const editor = @import("editor.zig");
 const fogmod = @import("fog.zig");
 const playermod = @import("player.zig");
 const loot = @import("loot.zig");
@@ -57,6 +59,14 @@ const TORCH_RADIUS = 12.0;
 // (0.42) and the actual collision radius (playermod.radius 0.55) — the body you
 // see finally fills the hitbox you play.
 const HERO_SCALE = 1.22;
+
+// The off-hand torch grip: ONE set of offsets shared by the drawn stick + flame
+// (hero-local frame) and torchFlameWorld (the world anchor for the light and
+// embers), so the visual flame and the light source can never drift apart.
+const TORCH_GRIP_RIGHT = 0.45;
+const TORCH_GRIP_FWD = 0.05;
+const TORCH_FLAME_Y = 1.64; // flame-heart height in the hero's ground-local frame
+
 // A live player fireball is its own moving light: a warm pool that follows the bolt
 // and lights (+ shadows) whatever it flies past, even out beyond the torch radius.
 // Modeled overhead like the torch so its downward shadow map stays well-oriented.
@@ -70,12 +80,6 @@ const CULL = TORCH_RADIUS + 3;
 
 pub const DAMAGE_FLASH_DUR = 0.4;
 pub const TOAST_DUR = 2.5;
-
-// Floating combat text: the inline buffer capacity (shared by the Popup store, the
-// formatter, and the HUD that renders it) and the default lift above an entity's
-// ground position so numbers float over the body rather than at its feet.
-pub const POPUP_TEXT_CAP = 32;
-const POPUP_HEIGHT = 1.6;
 
 // How long the area-name banner holds before fading (seconds). Level-up reuses the
 // banner with its own shorter hold.
@@ -128,22 +132,58 @@ fn TextField(comptime cap: usize) type {
     };
 }
 
-// Popup is floating combat text anchored in the world. Its text lives inline in a
-// fixed buffer so the popup is self-contained inside the ArrayList (no dangling slice).
-pub const Popup = struct {
-    Pos: rl.Vector3 = mathx.zero3,
-    text_buf: [POPUP_TEXT_CAP]u8 = undefined,
-    text_len: usize = 0,
-    Color: rl.Color = rgba(255, 255, 255, 255),
-    Life: f32 = 0,
-    maxLife: f32 = 0,
+pub const Scene = enum { menu, playing, dead, victory, editor };
+pub const MenuMode = enum { root, options };
+pub const DisplayMode = enum { windowed, borderless, fullscreen };
 
-    pub fn text(self: *const Popup) []const u8 {
-        return self.text_buf[0..self.text_len];
+pub const menuRootItems = [_][:0]const u8{ "Adventure", "Editor", "Options", "Quit" };
+
+// Switch the window's display mode, unwinding whatever mode is active first so
+// the raylib toggles never stack (each toggle is its own on/off latch).
+fn setDisplayMode(g: *Game, want: DisplayMode) void {
+    if (g.displayMode == want) return;
+    switch (g.displayMode) {
+        .borderless => rl.toggleBorderlessWindowed(),
+        .fullscreen => rl.toggleFullscreen(),
+        .windowed => {},
     }
-};
+    switch (want) {
+        .borderless => rl.toggleBorderlessWindowed(),
+        .fullscreen => rl.toggleFullscreen(),
+        .windowed => {},
+    }
+    g.displayMode = want;
+}
 
-pub const Scene = enum { menu, playing, dead, victory };
+pub fn cycleDisplayMode(g: *Game, fwd: bool) void {
+    const n = 3;
+    const cur: i32 = @intFromEnum(g.displayMode);
+    const next: DisplayMode = @enumFromInt(@mod(cur + (if (fwd) @as(i32, 1) else -1) + n, n));
+    setDisplayMode(g, next);
+}
+
+// Activate a menu item (shared by keyboard Enter and mouse click in hudx).
+pub fn menuActivate(g: *Game, idx: i32) void {
+    if (g.menuMode == .options) {
+        switch (idx) {
+            0 => cycleDisplayMode(g, true),
+            else => {
+                g.menuMode = .root;
+                g.menuSel = 2;
+            },
+        }
+        return;
+    }
+    switch (idx) {
+        0 => g.startRun(),
+        1 => editor.enter(g),
+        2 => {
+            g.menuMode = .options;
+            g.menuSel = 0;
+        },
+        else => g.quit = true,
+    }
+}
 
 // A melee monster's true reach: its attack range, plus the target's radius, plus a
 // small lunge. The strike check and the drawn telegraph ring MUST use this same
@@ -186,9 +226,9 @@ fn torchFlameWorld(p: *const Player) rl.Vector3 {
     const f = mathx.orFacing(p.Facing, 0, -1);
     const right = mathx.perpXZ(f);
     return v3(
-        p.Pos.x + (-right.x * 0.45 + f.x * 0.05) * HERO_SCALE,
-        p.Pos.y + 1.65 * HERO_SCALE,
-        p.Pos.z + (-right.z * 0.45 + f.z * 0.05) * HERO_SCALE,
+        p.Pos.x + (-right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD) * HERO_SCALE,
+        p.Pos.y + TORCH_FLAME_Y * HERO_SCALE,
+        p.Pos.z + (-right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD) * HERO_SCALE,
     );
 }
 
@@ -201,8 +241,23 @@ pub const Game = struct {
     sceneMesh: scenemesh.SceneMesh,
     fog: fogmod.Fog,
     w: world.World,
+    // The authored campaign: maps/*.map in lexicographic order. `map` is the
+    // CURRENT area's parsed file — the world and monster spawns come from it, and
+    // w.Name aliases its name buffer (so assign map before rebuilding w).
+    map: mapmod.Map,
+    mapPaths: [mapmod.MAX_MAPS][96]u8 = undefined,
+    mapPathLens: [mapmod.MAX_MAPS]usize = undefined,
+    mapCount: usize = 0,
     areaIndex: usize = 0,
     lastArea: usize,
+    ed: editor.Editor = .{},
+    playtest: bool = false, // playing FROM the editor: all exits lead back to it
+
+    // Start menu state + display mode.
+    menuMode: MenuMode = .root,
+    menuSel: i32 = 0,
+    quit: bool = false,
+    displayMode: DisplayMode = .windowed,
 
     p: Player,
     monsters: [MAX_MONSTERS]Monster = undefined,
@@ -210,7 +265,6 @@ pub const Game = struct {
     nextID: i32 = 0,
     projs: ProjList = .{},
     lootList: std.ArrayList(LootDrop),
-    popups: std.ArrayList(Popup),
 
     rig: CamRig,
 
@@ -241,27 +295,29 @@ pub const Game = struct {
     pub fn init(seed: u64) !Game {
         var torch = try tl.Torch.init();
         errdefer torch.deinit();
-        var rng = mathx.Rng.init(seed);
-        const lastArea = world.areas.len - 1;
-        const w = world.buildWorld(world.areas[0], &rng, lastArea == 0);
-        const sceneMesh = scenemesh.SceneMesh.init(&w, torch.scene, torch.depthShader);
-        var fog = fogmod.Fog.init();
-        fog.reset(w.Half);
+        const rng = mathx.Rng.init(seed);
 
         var g = Game{
             .rng = rng,
             .torch = torch,
-            .sceneMesh = sceneMesh,
-            .fog = fog,
-            .w = w,
-            .lastArea = lastArea,
-            .p = playermod.newPlayer(world.startPos(w)),
+            .sceneMesh = undefined,
+            .fog = fogmod.Fog.init(),
+            .w = undefined,
+            .map = undefined,
+            .lastArea = 0,
+            .p = playermod.newPlayer(mathx.zero3),
             .lootList = std.ArrayList(LootDrop).init(alloc),
-            .popups = std.ArrayList(Popup).init(alloc),
             .rig = cameramod.newCamRig(),
         };
+        g.mapCount = mapmod.listCampaign(&g.mapPaths, &g.mapPathLens);
+        g.lastArea = if (g.mapCount > 0) g.mapCount - 1 else 0;
+        g.map = g.loadMapAt(0);
+        g.w = mapmod.toWorld(&g.map, g.lastArea == 0);
+        g.sceneMesh = scenemesh.SceneMesh.init(&g.w, g.torch.scene, g.torch.depthShader);
+        g.fog.reset(g.w.Half);
+        g.p = playermod.newPlayer(g.map.spawn);
         g.areaIndex = 0;
-        g.torch.setLightColor(world.areas[0].light);
+        g.torch.setLightColor(g.map.light);
         g.spawnPacks();
         g.rig.snap(g.p.Pos);
         g.torchXZ = torchFlameWorld(&g.p);
@@ -269,17 +325,33 @@ pub const Game = struct {
         return g;
     }
 
+    // Load the idx-th campaign map file; a missing folder or a corrupt file falls
+    // back to the built-in empty field so the game always boots.
+    pub fn loadMapAt(g: *Game, idx: usize) mapmod.Map {
+        if (g.mapCount == 0) return mapmod.defaultMap();
+        const i = @min(idx, g.mapCount - 1);
+        return mapmod.load(g.mapPaths[i][0..g.mapPathLens[i]]) catch mapmod.defaultMap();
+    }
+
+    // Where the editor saves the current area's map.
+    pub fn currentMapPath(g: *Game) []const u8 {
+        if (g.mapCount == 0) return mapmod.dir ++ "/01_custom" ++ mapmod.ext;
+        const i = @min(g.areaIndex, g.mapCount - 1);
+        return g.mapPaths[i][0..g.mapPathLens[i]];
+    }
+
     pub fn deinit(g: *Game) void {
         g.sceneMesh.deinit();
         g.fog.deinit();
         g.torch.deinit();
         g.lootList.deinit();
-        g.popups.deinit();
         hudx.unloadOrbRT();
     }
 
     // startRun resets a finished/dead game back to area 0 with a fresh hero.
     pub fn startRun(g: *Game) void {
+        g.playtest = false;
+        g.paused = false; // a pause from the previous run must not freeze this one
         g.p = playermod.newPlayer(mathx.zero3);
         g.kills = 0;
         g.elapsed = 0;
@@ -287,11 +359,12 @@ pub const Game = struct {
         g.scene = .playing;
     }
 
-    // enterArea (re)builds the world for the given area index and spawns packs.
+    // enterArea loads the given campaign map, rebuilds the world, and spawns packs.
     pub fn enterArea(g: *Game, idx: usize) void {
         g.areaIndex = if (idx > g.lastArea) g.lastArea else idx;
-        g.w = world.buildWorld(world.areas[g.areaIndex], &g.rng, g.areaIndex == g.lastArea);
-        g.torch.setLightColor(world.areas[g.areaIndex].light); // each floor gets its own night
+        g.map = g.loadMapAt(g.areaIndex);
+        g.w = mapmod.toWorld(&g.map, g.areaIndex == g.lastArea);
+        g.torch.setLightColor(g.map.light); // each floor gets its own night
         g.sceneMesh.rebuild(&g.w);
         g.fog.reset(g.w.Half); // each area is a fresh layout: forget the old exploration
         g.fog.sync(); // upload the cleared grid now: a restart from dead/victory draws
@@ -300,10 +373,9 @@ pub const Game = struct {
         g.monsterCount = 0;
         g.projs.count = 0;
         g.lootList.clearRetainingCapacity();
-        g.popups.clearRetainingCapacity();
         g.parts.clear(); // stray sparks must not carry across the portal
         g.spawnPacks();
-        g.p.Pos = world.startPos(g.w);
+        g.p.Pos = g.map.spawn;
         g.p.hasMoveTarget = false;
         g.p.targetMonster = -1;
         g.p.HP = g.p.MaxHP;
@@ -314,21 +386,18 @@ pub const Game = struct {
         g.setToast("", .{});
     }
 
-    // spawnPacks scatters monster groups across the arena, plus one boss near the portal.
+    // spawnPacks deploys the map's authored packs (members jittered around each
+    // pack's anchor) plus the area champion at its authored post. Difficulty tier
+    // is the campaign position — map 3 hits like old area 3.
     fn spawnPacks(g: *Game) void {
-        const def = world.areas[g.areaIndex];
-        const spawnPos = world.startPos(g.w);
-        var pack: i32 = 0;
-        while (pack < def.packs) : (pack += 1) {
-            const center = g.randomOpenTile(spawnPos, 16);
-            const packSize = 2 + g.rng.intn(3);
-            const kind = def.kinds[@intCast(g.rng.intn(@intCast(def.kinds.len)))];
+        const tier: i32 = @intCast(g.areaIndex);
+        for (g.map.packList()) |pk| {
             var i: i32 = 0;
-            while (i < packSize) : (i += 1) {
-                g.spawn(monster.makeMonster(kind, def.tier, &g.rng, g.randomOpenTileNear(center, 5)));
+            while (i < pk.count) : (i += 1) {
+                g.spawn(monster.makeMonster(pk.kind, tier, &g.rng, g.randomOpenTileNear(v3(pk.x, 0, pk.z), 5)));
             }
         }
-        g.spawn(monster.makeBoss(def.tier, def.boss, &g.rng, g.randomOpenTileNear(g.w.PortalPos, 8)));
+        g.spawn(monster.makeBoss(tier, g.map.boss.slice(), &g.rng, g.randomOpenTileNear(g.map.bossPos, 3)));
     }
 
     fn spawn(g: *Game, m_in: Monster) void {
@@ -351,18 +420,6 @@ pub const Game = struct {
             if (m.id == id) return m;
         }
         return null;
-    }
-
-    fn randomOpenTile(g: *Game, from: rl.Vector3, minFrom: f32) rl.Vector3 {
-        const h = g.w.Half - 3;
-        var attempt: i32 = 0;
-        while (attempt < 60) : (attempt += 1) {
-            const p = mathx.ground((g.rng.float() * 2 - 1) * h, (g.rng.float() * 2 - 1) * h);
-            if (distXZ(p, from) < minFrom) continue;
-            if (g.w.onFeature(p.x, p.z)) continue; // packs spawn on the floor, not the high ground
-            if (!g.w.blocked(p, 1.0)) return p;
-        }
-        return mathx.ground(0, 0);
     }
 
     fn randomOpenTileNear(g: *Game, center: rl.Vector3, spread: f32) rl.Vector3 {
@@ -400,21 +457,6 @@ pub const Game = struct {
         g.banner.set(dur, fmt, args);
     }
 
-    pub fn addPopup(g: *Game, pos: rl.Vector3, txt: []const u8, col: rl.Color) void {
-        var pp = Popup{ .Pos = pos, .Color = col, .Life = 1.0, .maxLife = 1.0 };
-        const n = @min(txt.len, pp.text_buf.len);
-        @memcpy(pp.text_buf[0..n], txt[0..n]);
-        pp.text_len = n;
-        g.popups.append(pp) catch @panic("oom");
-    }
-
-    // Format a floating combat-text popup in one step (damage/XP/gold numbers all
-    // share this instead of each hand-rolling a stack buffer + bufPrint).
-    pub fn addPopupFmt(g: *Game, pos: rl.Vector3, col: rl.Color, comptime fmt: []const u8, args: anytype) void {
-        var buf: [POPUP_TEXT_CAP]u8 = undefined;
-        const txt = std.fmt.bufPrint(&buf, fmt, args) catch return;
-        g.addPopup(pos, txt, col);
-    }
 };
 
 // ---- Simulation ----
@@ -443,7 +485,6 @@ fn updatePlaying(g: *Game, dt_in: f32) void {
     separateMonsters(g);
     updateProjectiles(g, dt);
     updateLoot(g, dt);
-    updatePopups(g, dt);
     updateDeaths(g, dt);
     updatePortal(g);
     updateAmbientFX(g, dt);
@@ -571,7 +612,6 @@ fn aimYVel(fromY: f32, toY: f32, distH: f32, speed: f32) f32 {
 fn doDodge(g: *Game, dir: rl.Vector3) void {
     if (g.p.startRoll(dir)) {
         g.rumble.play(rumble.dodge);
-        g.addPopup(v3(g.p.Pos.x, g.p.Pos.y + 2.6, g.p.Pos.z), "Dodge!", rgba(180, 220, 255, 255));
         // The tuck kicks a fan of scuffed dust out behind the launch point.
         g.parts.burst(&g.rng, v3(g.p.Pos.x - dir.x * 0.3, g.p.Pos.y + 0.12, g.p.Pos.z - dir.z * 0.3), 7, 2.6, 0.07, 0.4, rgba(200, 172, 132, 110), 5);
     }
@@ -789,11 +829,8 @@ fn damageMonster(g: *Game, m: *Monster, dmg: f32, crit: bool) void {
     m.HP -= dmg;
     m.hitFlash = monster.monster_hitflash;
     m.aggro = true;
-    const col = if (crit) rgba(255, 220, 60, 255) else rl.Color.white;
-    const di: i32 = @intFromFloat(dmg);
-    const pp = v3(m.Pos.x, m.Pos.y + POPUP_HEIGHT, m.Pos.z);
-    if (crit) g.addPopupFmt(pp, col, "{d}!", .{di}) else g.addPopupFmt(pp, col, "{d}", .{di});
     // Hit sparks: a few pale chips off the body; crits flare bigger and golder.
+    // (No floating damage numbers by owner decree — the sparks ARE the feedback.)
     const hitAt = v3(m.Pos.x, m.Pos.y + MONSTER_TORSO_BASE + m.Height * 0.5, m.Pos.z);
     if (crit) {
         g.parts.burst(&g.rng, hitAt, 12, 5.5, 0.11, 0.5, rgba(255, 215, 90, 255), 9);
@@ -819,8 +856,11 @@ fn killMonster(g: *Game, m: *Monster) void {
     g.parts.burst(&g.rng, at, n, 6.0, 0.13, 0.7, lerpColor(m.Color, rl.Color.white, 0.25), 10);
     g.parts.burst(&g.rng, at, n / 2, 3.5, 0.16, 0.9, lerpColor(m.Color, rl.Color.black, 0.45), 12);
     if (g.p.addXP(m.XP)) onLevelUp(g);
-    g.addPopupFmt(v3(m.Pos.x, m.Pos.y + POPUP_HEIGHT, m.Pos.z), rgba(120, 200, 255, 255), "+{d} XP", .{m.XP});
+    // rollLoot scatters in XZ without terrain knowledge: re-seat each new drop on
+    // the ground it actually landed on (a rampart kill may scatter off the edge).
+    const firstNew = g.lootList.items.len;
     loot.rollLoot(m, &g.rng, &g.lootList);
+    for (g.lootList.items[firstNew..]) |*d| d.Pos = g.w.snapY(d.Pos);
     if (m.boss) g.setToast("{s} has been slain!", .{m.Name});
     if (g.p.targetMonster == m.id) g.p.targetMonster = -1;
 }
@@ -829,7 +869,6 @@ fn onLevelUp(g: *Game) void {
     g.setBanner(LEVELUP_BANNER_DUR, "Level {d}!", .{g.p.Level});
     g.rumble.play(rumble.level_up);
     g.shake = maxF(g.shake, 0.3);
-    g.addPopup(v3(g.p.Pos.x, g.p.Pos.y + 2.7, g.p.Pos.z), "LEVEL UP", rgba(255, 230, 120, 255));
     // A golden fountain out of the hero: slow, buoyant motes that hang in the air.
     g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 1.2, g.p.Pos.z), 30, 4.5, 0.12, 1.3, rgba(255, 225, 110, 255), -2);
     g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 0.5, g.p.Pos.z), 14, 2.0, 0.09, 1.6, rgba(255, 250, 210, 255), -3);
@@ -946,15 +985,12 @@ fn separateMonsters(g: *Game) void {
 fn hitPlayer(g: *Game, dmg: f32) void {
     // I-frames from a dodge roll negate the blow entirely.
     if (g.p.invulnerable()) {
-        g.addPopup(v3(g.p.Pos.x, g.p.Pos.y + 2.5, g.p.Pos.z), "dodged", rgba(180, 220, 255, 230));
         return;
     }
     g.p.takeDamage(dmg);
     g.damageFlash = DAMAGE_FLASH_DUR;
     g.shake = maxF(g.shake, 0.25);
     g.rumble.play(rumble.hurt);
-    const di: i32 = @intFromFloat(dmg);
-    g.addPopupFmt(v3(g.p.Pos.x, g.p.Pos.y + 2.5, g.p.Pos.z), rgba(255, 90, 90, 255), "-{d}", .{di});
     g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 1.35, g.p.Pos.z), 8, 4.5, 0.1, 0.45, rgba(220, 40, 40, 255), 9);
     if (!g.p.alive()) {
         g.rumble.play(rumble.death); // stronger than `hurt`, so it takes over the fade
@@ -1058,8 +1094,7 @@ fn collect(g: *Game, d: LootDrop) void {
     switch (d.Kind) {
         .gold => {
             g.p.Gold += d.Amount;
-            g.addPopupFmt(v3(g.p.Pos.x, g.p.Pos.y + POPUP_HEIGHT, g.p.Pos.z), theme.goldColor, "+{d}g", .{d.Amount});
-            g.parts.burst(&g.rng, v3(d.Pos.x, 0.4, d.Pos.z), 8, 2.5, 0.07, 0.6, theme.goldColor, -1);
+            g.parts.burst(&g.rng, v3(d.Pos.x, d.Pos.y + 0.4, d.Pos.z), 8, 2.5, 0.07, 0.6, theme.goldColor, -1);
         },
         .health_potion => {
             if (g.p.HealthPots < playermod.maxPots) g.p.HealthPots += 1;
@@ -1072,15 +1107,6 @@ fn collect(g: *Game, d: LootDrop) void {
     }
 }
 
-fn keepPopup(c: SweepCtx, pp: *Popup) bool {
-    pp.Life -= c.dt;
-    pp.Pos.y += c.dt * 1.4;
-    return pp.Life > 0;
-}
-fn updatePopups(g: *Game, dt: f32) void {
-    const n = retain(Popup, g.popups.items, SweepCtx{ .g = g, .dt = dt }, keepPopup);
-    g.popups.shrinkRetainingCapacity(n);
-}
 
 // Drop faded-out corpses, keeping live monsters packed contiguously at the front.
 fn keepMonster(c: SweepCtx, m: *Monster) bool {
@@ -1187,12 +1213,50 @@ fn updatePortal(g: *Game) void {
         g.setToast("Area cleared - a portal has opened!", .{});
     }
     if (g.w.PortalOpen and distXZ(g.p.Pos, g.w.PortalPos) < 2.4) {
-        if (g.w.IsLast) {
+        if (g.playtest) {
+            endPlaytest(g);
+            g.ed.status("portal reached - playtest complete", .{});
+        } else if (g.w.IsLast) {
             g.scene = .victory;
         } else {
             g.enterArea(g.areaIndex + 1);
         }
     }
+}
+
+// Launch a playtest of the CURRENT in-memory map from the editor: real spawns,
+// real fog of war, real HUD. Every exit (Esc, death, portal) leads back to the
+// editor with the author's map untouched — no disk round-trip.
+pub fn startPlaytest(g: *Game) void {
+    g.playtest = true;
+    g.paused = false;
+    g.p = playermod.newPlayer(g.map.spawn);
+    g.monsterCount = 0;
+    g.projs.count = 0;
+    g.lootList.clearRetainingCapacity();
+    g.parts.clear();
+    g.w.PortalOpen = false;
+    g.fog.reset(g.w.Half);
+    g.fog.sync();
+    g.spawnPacks();
+    g.rig.snap(g.p.Pos);
+    g.torchXZ = torchFlameWorld(&g.p);
+    g.setBanner(AREA_BANNER_DUR, "Playtest: {s}", .{g.w.Name});
+    g.scene = .playing;
+}
+
+// Ctrl+F5 (crawler): playtest starting from the editor's cursor, not the spawn.
+pub fn startPlaytestAt(g: *Game, at: rl.Vector3) void {
+    startPlaytest(g);
+    g.p.Pos = g.w.snapY(at);
+    g.rig.snap(g.p.Pos);
+    g.torchXZ = torchFlameWorld(&g.p);
+}
+
+fn endPlaytest(g: *Game) void {
+    g.playtest = false;
+    editor.apply(g); // clean world, no monsters, fog fully revealed
+    g.scene = .editor;
 }
 
 // ---- Rendering (frozen torchlight + baked scene mesh) ----
@@ -1245,7 +1309,7 @@ fn drawHeroBody(p: *const Player) void {
     const sleeve = lerpColor(hood, rl.Color.black, 0.1);
     const bhandB = v3(base.x - f.x * 0.18 + right.x * 0.4, 1.15 + bob, base.z - f.z * 0.18 + right.z * 0.4);
     rl.drawCapsule(v3(base.x + right.x * 0.28 + f.x * 0.05, 1.3 + bob, base.z + right.z * 0.28 + f.z * 0.05), bhandB, 0.1, 6, 4, sleeve);
-    const thandB = v3(base.x - right.x * 0.45 + f.x * 0.05, 1.28, base.z - right.z * 0.45 + f.z * 0.05);
+    const thandB = v3(base.x - right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD, 1.28, base.z - right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD);
     rl.drawCapsule(v3(base.x - right.x * 0.28 + f.x * 0.02, 1.3 + bob, base.z - right.z * 0.28 + f.z * 0.02), thandB, 0.1, 6, 4, sleeve);
 
     sphere(v3(base.x, 1.72 + bob, base.z), 0.34, hood);
@@ -1265,7 +1329,7 @@ fn drawHeroBody(p: *const Player) void {
     rl.drawCylinderEx(bhand, v3(bhand.x - f.x * 0.18, bhand.y + 0.62, bhand.z - f.z * 0.18), 0.07, 0.03, 5, bowCol);
     rl.drawCylinderEx(bhand, v3(bhand.x - f.x * 0.18, bhand.y - 0.62, bhand.z - f.z * 0.18), 0.07, 0.03, 5, bowCol);
 
-    const thand = v3(base.x - right.x * 0.45 + f.x * 0.05, 0.95, base.z - right.z * 0.45 + f.z * 0.05);
+    const thand = v3(base.x - right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD, 0.95, base.z - right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD);
     rl.drawCylinderEx(thand, v3(thand.x, thand.y + 0.55, thand.z), 0.05, 0.04, 5, rgba(70, 48, 30, 255));
 }
 
@@ -1306,8 +1370,8 @@ fn drawHeroFX(p: *const Player, t: f32) void {
     // a live flame TONGUE licking upward (stretching and swaying on two beats), and
     // a white-hot heart — plus the ember drift above.
     const flick = 1 + 0.18 * sinf(t * 22) + 0.1 * sinf(t * 37);
-    const thand = v3(base.x - right.x * 0.45 + f.x * 0.05, 0.95, base.z - right.z * 0.45 + f.z * 0.05);
-    const flame = v3(thand.x, thand.y + 0.68, thand.z);
+    const thand = v3(base.x - right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD, 0.95, base.z - right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD);
+    const flame = v3(thand.x, TORCH_FLAME_Y, thand.z);
     sphere(flame, 0.5 * flick, rgba(230, 80, 20, 40)); // wide soft halo
     sphere(flame, 0.32 * flick, rgba(235, 95, 25, 120));
     const tongueH = 0.44 + 0.11 * sinf(t * 13) + 0.06 * sinf(t * 29);
@@ -1327,7 +1391,7 @@ fn drawHeroFX(p: *const Player, t: f32) void {
     rl.drawCircle3D(v3(base.x, 0.045, base.z), p.Radius + 0.15, v3(1, 0, 0), 90, rgba(150, 190, 255, 90));
 }
 
-fn drawWalls(w: *const world.World) void {
+pub fn drawWalls(w: *const world.World) void {
     const h = w.Half;
     const wallH = 4.0;
     const t = 1.2;
@@ -1744,7 +1808,7 @@ fn drawLoot(lootList: *std.ArrayList(LootDrop), lightXZ: rl.Vector3, torchR: f32
     }
 }
 
-fn drawPortal(w: *const world.World, t: f32) void {
+pub fn drawPortal(w: *const world.World, t: f32) void {
     const pp = w.PortalPos;
     if (!w.PortalOpen) {
         // Dormant: a dark stone dais with a faint rune ring that slowly pulses,
@@ -1835,7 +1899,7 @@ fn drawFireflies(g: *const Game, t: f32) void {
 }
 
 // drawWorld renders one frame of the 3D scene through the frozen torch pipeline.
-fn drawWorld(g: *Game) rl.Camera3D {
+fn drawWorld(g: *Game) void {
     var cam = g.rig.cam;
     if (g.shake > 0) {
         const amp = g.shake * 0.7;
@@ -1901,7 +1965,6 @@ fn drawWorld(g: *Game) rl.Camera3D {
     drawFireflies(g, t);
     g.parts.draw();
     rl.endMode3D();
-    return cam;
 }
 
 pub fn run(shot: bool) void {
@@ -1910,6 +1973,10 @@ pub fn run(shot: bool) void {
     rl.setConfigFlags(.{ .msaa_4x_hint = true, .window_hidden = shot });
     rl.initWindow(1280, 800, "zig-diablo");
     defer rl.closeWindow();
+    // Esc is NAVIGATION (menus, editor modals, playtest exit) — raylib's default
+    // exit key is Esc, which would kill the window instead. Quitting goes through
+    // the menu's Quit item (g.quit) or the close button only.
+    rl.setExitKey(.null);
     // Uncapped: no setTargetFPS. setTargetFPS paces by OS sleep, whose ~15.6ms Windows
     // timer granularity makes a 60fps target periodically oversleep into a dropped frame
     // (a "chug" despite ample headroom). Running free removes that jitter. To re-cap
@@ -1951,36 +2018,66 @@ pub fn run(shot: bool) void {
     var frame: i32 = 0;
     var shotIdx: usize = 0;
 
-    while (!rl.windowShouldClose()) {
+    while (!rl.windowShouldClose() and !g.quit) {
         const dt = rl.getFrameTime();
         g.elapsed += dt; // advances in every scene (drives flicker/animation)
 
+        // Alt+Enter anywhere: toggle fullscreen-windowed (borderless).
+        const altHeld = rl.isKeyDown(.left_alt) or rl.isKeyDown(.right_alt);
+        if (altHeld and rl.isKeyPressed(.enter)) {
+            setDisplayMode(&g, if (g.displayMode == .windowed) .borderless else .windowed);
+        }
+
         switch (g.scene) {
             .menu => {
-                if (rl.isKeyPressed(.enter) or rl.isKeyPressed(.space) or padStartPressed()) g.startRun();
+                const n: i32 = if (g.menuMode == .root) menuRootItems.len else 2;
+                if (rl.isKeyPressed(.down) or rl.isKeyPressed(.s)) g.menuSel = @mod(g.menuSel + 1, n);
+                if (rl.isKeyPressed(.up) or rl.isKeyPressed(.w)) g.menuSel = @mod(g.menuSel - 1 + n, n);
+                if ((rl.isKeyPressed(.enter) and !altHeld) or rl.isKeyPressed(.space) or padStartPressed()) menuActivate(&g, g.menuSel);
+                if (g.menuMode == .options) {
+                    if (rl.isKeyPressed(.escape)) {
+                        g.menuMode = .root;
+                        g.menuSel = 2;
+                    }
+                    if (g.menuSel == 0 and (rl.isKeyPressed(.left) or rl.isKeyPressed(.right))) {
+                        cycleDisplayMode(&g, rl.isKeyPressed(.right));
+                    }
+                }
                 g.rig.follow(g.p.Pos, dt); // let the backdrop drift
             },
             .playing => {
-                if (rl.isKeyPressed(.escape) or padStartPressed()) g.scene = .menu;
-                updatePlaying(&g, dt);
+                if (rl.isKeyPressed(.escape) or padStartPressed()) {
+                    if (g.playtest) endPlaytest(&g) else g.scene = .menu;
+                }
+                if (g.scene == .playing) updatePlaying(&g, dt);
             },
             .dead => {
-                if (rl.isKeyPressed(.r) or padStartPressed()) g.startRun();
+                if (rl.isKeyPressed(.r) or padStartPressed()) {
+                    if (g.playtest) endPlaytest(&g) else g.startRun();
+                }
                 g.parts.update(dt); // let the killing blow's burst finish playing
             },
             .victory => {
                 if (rl.isKeyPressed(.enter) or padStartPressed()) g.startRun();
             },
+            .editor => editor.update(&g, dt),
         }
 
         // Drive rumble every frame across all scenes so envelopes always decay to
         // silence (the death rumble swells on into the death screen). Silent while
-        // paused or with no controller; still ticks so it fades in the background.
-        g.rumble.update(dt, rl.isGamepadAvailable(PAD) and !g.paused);
+        // paused, with no controller, or in the HEADLESS screenshot harness — an
+        // automated --gameshot run must never buzz a connected pad on the desk.
+        g.rumble.update(dt, !shot and rl.isGamepadAvailable(PAD) and !g.paused);
 
-        const cam = drawWorld(&g);
-        hudx.draw(&g, cam);
-        rl.endDrawing();
+        if (g.scene == .editor) {
+            editor.draw(&g);
+            editor.drawOverlay(&g);
+            rl.endDrawing();
+        } else {
+            drawWorld(&g);
+            hudx.draw(&g);
+            rl.endDrawing();
+        }
 
         if (shot) {
             frame += 1;
@@ -1992,11 +2089,17 @@ pub fn run(shot: bool) void {
                 rl.takeScreenshot(name);
                 shotIdx += 1;
                 if (shotIdx >= sweep.len) {
-                    // After the world vantages, photograph each full-screen scene.
-                    const extraScenes = [_]Scene{ .menu, .dead, .victory };
+                    // After the world vantages, photograph each full-screen scene
+                    // (the editor last — entered properly so it loads + applies).
+                    const extraScenes = [_]Scene{ .menu, .dead, .victory, .editor };
                     const ei = shotIdx - sweep.len;
                     if (ei >= extraScenes.len) break;
-                    g.scene = extraScenes[ei];
+                    if (extraScenes[ei] == .editor) {
+                        g.areaIndex = 0;
+                        editor.enter(&g);
+                    } else {
+                        g.scene = extraScenes[ei];
+                    }
                     continue;
                 }
                 g.p.Pos = sweep[shotIdx];

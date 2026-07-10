@@ -20,3 +20,7 @@ pub const goldColor = rgba(255, 215, 80, 255);
 // Brass trim: the thin warm liner on HUD sockets, bars, and panels — one metal
 // throughout so the interface reads as a single forged kit.
 pub const trimColor = rgba(150, 116, 60, 255);
+
+// Ink: the near-black backing every pill, bar and plaque sits on (used with
+// withAlpha at each site). One tone so the whole interface shares one shadow.
+pub const ink = rgba(8, 6, 5, 255);

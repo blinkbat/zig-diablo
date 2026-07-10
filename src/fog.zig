@@ -86,6 +86,13 @@ pub const Fog = struct {
         }
     }
 
+    // Editor mode: no exploration — the whole arena reads as fully seen.
+    pub fn revealAll(self: *Fog, half: f32) void {
+        @memset(&self.cells, 255);
+        self.half = if (half > 0) half else 1;
+        self.dirty = true;
+    }
+
     // Upload the grid to the GPU if it changed since the last sync.
     pub fn sync(self: *Fog) void {
         if (!self.dirty) return;
