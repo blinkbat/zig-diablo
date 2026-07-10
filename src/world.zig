@@ -84,10 +84,10 @@ pub const MAX_RAMPS = 4;
 
 // World holds the static level: extents, scenery, and the exit portal.
 pub const World = struct {
-    Half: f32 = 0, // arena spans -Half..Half on X and Z
+    HalfW: f32 = 0, // arena spans -HalfW..HalfW on X
+    HalfD: f32 = 0, // ...and -HalfD..HalfD on Z (rectangular arenas welcome)
     Ground: rl.Color = rgba(255, 255, 255, 255),
     Accent: rl.Color = rgba(255, 255, 255, 255),
-    Name: []const u8 = "",
     obstacles: [MAX_OBSTACLES]Obstacle = undefined,
     obstacle_count: usize = 0,
     decor: [MAX_DECOR]Decor = undefined,
@@ -150,7 +150,7 @@ pub const World = struct {
 
     /// Whether a circle of the given radius at p hits scenery or leaves the arena.
     pub fn blocked(self: *const World, p: rl.Vector3, radius: f32) bool {
-        if (@abs(p.x) > self.Half - radius or @abs(p.z) > self.Half - radius) return true;
+        if (@abs(p.x) > self.HalfW - radius or @abs(p.z) > self.HalfD - radius) return true;
         for (self.obs()) |o| {
             const rr = o.Radius + radius;
             if (dist2XZ(o.Pos, p) < rr * rr) return true;
@@ -182,7 +182,7 @@ pub const World = struct {
     /// flying above an obstacle clears it), the arena edge, or terrain (cliff
     /// faces are cover: a bolt below a ledge top splats against its side).
     pub fn rayHitsObstacle(self: *const World, p: rl.Vector3, radius: f32) bool {
-        if (@abs(p.x) > self.Half or @abs(p.z) > self.Half) return true;
+        if (@abs(p.x) > self.HalfW or @abs(p.z) > self.HalfD) return true;
         if (self.groundY(p.x, p.z) > p.y) return true;
         for (self.obs()) |o| {
             if (o.Height < 1.0) continue;

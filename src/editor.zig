@@ -69,6 +69,58 @@ fn brushesFor(l: Layer) []const [:0]const u8 {
     };
 }
 
+// Hover blurbs (ui.buttonTip): the layer strip and every brush explain themselves.
+const layerTips = [_][:0]const u8{
+    "Terrain shaping: ledges + ramps (Tab cycles layers)",
+    "Ground dressing: paint or scatter, never blocks",
+    "Blocking scenery: rocks, trees, gravestones",
+    "Foe packs, the boss, player spawn, the portal",
+};
+const floorTips = [_][:0]const u8{
+    "Drag a rectangle; [ ] sets its height",
+    "Drag a rectangle; R (or chips) sets the rise",
+    "Click a ledge or ramp to remove it",
+};
+const decorTips = [_][:0]const u8{
+    "Paint pebbles (drag to sweep)",
+    "Paint grass tufts (drag to sweep)",
+    "Paint mushrooms (drag to sweep)",
+    "Paint old bones (drag to sweep)",
+    "Sweep-erase DECOR only ([ ] sets radius)",
+};
+const propTips = [_][:0]const u8{
+    "Stamp boulders (snaps to grid; Alt = free)",
+    "Stamp trees (snaps to grid; Alt = free)",
+    "Stamp gravestones (snaps to grid; Alt = free)",
+    "Sweep-erase PROPS only ([ ] sets radius)",
+};
+const entityTips = [_][:0]const u8{
+    "Place a pib pack; click a pack to grab or edit it",
+    "Place a zombie pack; click a pack to grab or edit it",
+    "Place a skeleton pack; click a pack to grab or edit it",
+    "Place a brute pack; click a pack to grab or edit it",
+    "Move the area champion's post",
+    "Move where the hero enters",
+    "Move the area exit",
+    "Click-erase PACKS only ([ ] sets radius)",
+};
+
+fn brushTipsFor(l: Layer) []const [:0]const u8 {
+    return switch (l) {
+        .floor => &floorTips,
+        .decor => &decorTips,
+        .props => &propTips,
+        .entities => &entityTips,
+    };
+}
+
+comptime {
+    std.debug.assert(floorTips.len == floorBrushes.len);
+    std.debug.assert(decorTips.len == decorBrushes.len);
+    std.debug.assert(propTips.len == propBrushes.len);
+    std.debug.assert(entityTips.len == entityBrushes.len);
+}
+
 // The brush tables and their semantic decoders (decorKind/propKind/entityBrush)
 // are parallel lists: pin their lengths so adding a kind can't silently skew the
 // index mapping.
@@ -91,10 +143,45 @@ const PACK_GRAB_R = 1.6;
 
 // The editor sun: high over the camera target, wide enough to light any map.
 const EDITOR_SUN_H = 38.0;
-const EDITOR_SUN_R = 80.0;
+const EDITOR_SUN_R = 110.0; // covers the corner diagonal of a 60x60 arena
 
 pub const Modal = enum { none, save_as, new_map, open_map, rename, confirm, pack_edit };
 pub const Pending = enum { none, open, new, exit };
+
+// ---- Marquee selection + clipboard (crawler: Shift+drag selects, drag inside
+// moves contents, Ctrl+C/X/V copy/cut/paste, Del deletes, Esc clears) ----
+
+const SelRect = struct {
+    minX: f32,
+    minZ: f32,
+    maxX: f32,
+    maxZ: f32,
+
+    fn contains(s: SelRect, x: f32, z: f32) bool {
+        return x >= s.minX and x <= s.maxX and z >= s.minZ and z <= s.maxZ;
+    }
+};
+
+fn normRect(a: rl.Vector3, b: rl.Vector3) SelRect {
+    return .{
+        .minX = @min(a.x, b.x),
+        .minZ = @min(a.z, b.z),
+        .maxX = @max(a.x, b.x),
+        .maxZ = @max(a.z, b.z),
+    };
+}
+
+// The clipboard holds objects RELATIVE to the copied rect's center, so a paste
+// lands the arrangement on the cursor. Terrain features are deliberately not
+// clipboard material — moving cliffs under an arrangement is a different job.
+var clipProps: [world.MAX_OBSTACLES]world.Obstacle = undefined;
+var clipPropN: usize = 0;
+var clipDecor: [world.MAX_DECOR]world.Decor = undefined;
+var clipDecorN: usize = 0;
+var clipPacks: [mapmod.MAX_PACKS]mapmod.Pack = undefined;
+var clipPackN: usize = 0;
+var clipHas = false;
+var selBankPending = false; // selection-move undo banks on first movement only
 
 // Curated palette presets (the five classic area moods) applied as one click:
 // ground, accent, and torch light together.
@@ -190,6 +277,11 @@ pub const Editor = struct {
     strokeChanged: bool = false,
     lastPaint: rl.Vector3 = mathx.zero3,
 
+    // Marquee selection (Shift+drag): a world-rect of objects to move/copy/cut.
+    sel: ?SelRect = null,
+    selDrag: ?rl.Vector3 = null, // marquee anchor while Shift+LMB held
+    selMove: ?rl.Vector3 = null, // last ground point while dragging contents
+
     // Right-button click-vs-drag disambiguation (crawler: 4 px threshold).
     rightStart: rl.Vector2 = .{ .x = 0, .y = 0 },
     rightMoved: bool = false,
@@ -217,7 +309,8 @@ pub const Editor = struct {
     pendingOpen: usize = 0,
     field_buf: [40]u8 = [_]u8{0} ** 40, // modal text input
     field_len: usize = 0,
-    newHalf: f32 = 30,
+    newHalfW: f32 = 30,
+    newHalfD: f32 = 30,
 
     status_buf: [96]u8 = [_]u8{0} ** 96,
     status_len: usize = 0,
@@ -303,7 +396,7 @@ pub fn enter(g: *Game) void {
 pub fn apply(g: *Game) void {
     g.w = mapmod.toWorld(&g.map, g.areaIndex == g.lastArea);
     g.sceneMesh.rebuild(&g.w);
-    g.fog.revealAll(g.w.Half);
+    g.fog.revealAll(g.w.HalfW, g.w.HalfD);
     g.fog.sync();
     g.torch.setLightColor(g.map.light);
     g.monsterCount = 0;
@@ -468,6 +561,152 @@ fn eraseWithin(g: *Game, p: rl.Vector3, r: f32) bool {
     return changed;
 }
 
+// ---- Selection operations ----
+
+// Copy (optionally cut) everything inside the selection into the clipboard,
+// positions stored relative to the rect center.
+fn copySelection(g: *Game, cut: bool) void {
+    const ed = &g.ed;
+    const s = ed.sel orelse return ed.status("nothing selected (Shift+drag)", .{});
+    const cx = (s.minX + s.maxX) / 2;
+    const cz = (s.minZ + s.maxZ) / 2;
+    const m = &g.map;
+    clipPropN = 0;
+    clipDecorN = 0;
+    clipPackN = 0;
+    for (m.obstacles[0..m.obstacle_count]) |o| {
+        if (s.contains(o.Pos.x, o.Pos.z)) {
+            clipProps[clipPropN] = o;
+            clipProps[clipPropN].Pos = v3(o.Pos.x - cx, 0, o.Pos.z - cz);
+            clipPropN += 1;
+        }
+    }
+    for (m.decor[0..m.decor_count]) |d| {
+        if (s.contains(d.Pos.x, d.Pos.z)) {
+            clipDecor[clipDecorN] = d;
+            clipDecor[clipDecorN].Pos = v3(d.Pos.x - cx, 0, d.Pos.z - cz);
+            clipDecorN += 1;
+        }
+    }
+    for (m.packList()) |pk| {
+        if (s.contains(pk.x, pk.z)) {
+            clipPacks[clipPackN] = pk;
+            clipPacks[clipPackN].x = pk.x - cx;
+            clipPacks[clipPackN].z = pk.z - cz;
+            clipPackN += 1;
+        }
+    }
+    clipHas = clipPropN + clipDecorN + clipPackN > 0;
+    if (!clipHas) return ed.status("selection is empty", .{});
+    if (cut) deleteSelection(g);
+    ed.status("{s} {d} props, {d} decor, {d} packs", .{ if (cut) @as([]const u8, "cut") else "copied", clipPropN, clipDecorN, clipPackN });
+}
+
+fn deleteSelection(g: *Game) void {
+    const ed = &g.ed;
+    const s = ed.sel orelse return ed.status("nothing selected (Shift+drag)", .{});
+    bankUndo(g);
+    const m = &g.map;
+    var i: usize = m.obstacle_count;
+    while (i > 0) {
+        i -= 1;
+        if (s.contains(m.obstacles[i].Pos.x, m.obstacles[i].Pos.z)) m.removeObstacle(i);
+    }
+    i = m.decor_count;
+    while (i > 0) {
+        i -= 1;
+        if (s.contains(m.decor[i].Pos.x, m.decor[i].Pos.z)) m.removeDecor(i);
+    }
+    i = m.pack_count;
+    while (i > 0) {
+        i -= 1;
+        if (s.contains(m.packs[i].x, m.packs[i].z)) m.removePack(i);
+    }
+    markDirty(g);
+}
+
+// Paste the clipboard arrangement centered on `at`, clamped into the arena;
+// items past a cap are dropped (reported, never silent).
+fn pasteAt(g: *Game, at: rl.Vector3) void {
+    const ed = &g.ed;
+    if (!clipHas) return ed.status("clipboard is empty (Ctrl+C first)", .{});
+    bankUndo(g);
+    const m = &g.map;
+    const limW = m.halfW - 1.2;
+    const limD = m.halfD - 1.2;
+    var dropped: usize = 0;
+    for (clipProps[0..clipPropN]) |o| {
+        if (m.obstacle_count >= world.MAX_OBSTACLES) {
+            dropped += 1;
+            continue;
+        }
+        m.obstacles[m.obstacle_count] = o;
+        m.obstacles[m.obstacle_count].Pos = v3(clampF(at.x + o.Pos.x, -limW, limW), 0, clampF(at.z + o.Pos.z, -limD, limD));
+        m.obstacle_count += 1;
+    }
+    for (clipDecor[0..clipDecorN]) |d| {
+        if (m.decor_count >= world.MAX_DECOR) {
+            dropped += 1;
+            continue;
+        }
+        m.decor[m.decor_count] = d;
+        m.decor[m.decor_count].Pos = v3(clampF(at.x + d.Pos.x, -limW, limW), 0, clampF(at.z + d.Pos.z, -limD, limD));
+        m.decor_count += 1;
+    }
+    for (clipPacks[0..clipPackN]) |pk| {
+        if (m.pack_count >= mapmod.MAX_PACKS) {
+            dropped += 1;
+            continue;
+        }
+        m.packs[m.pack_count] = pk;
+        m.packs[m.pack_count].x = clampF(at.x + pk.x, -limW, limW);
+        m.packs[m.pack_count].z = clampF(at.z + pk.z, -limD, limD);
+        m.pack_count += 1;
+    }
+    markDirty(g);
+    if (dropped > 0) {
+        ed.status("pasted (dropped {d}: limits)", .{dropped});
+    } else {
+        ed.status("pasted", .{});
+    }
+}
+
+// Shift everything inside the selection by delta, and the rect with it. Membership
+// is re-evaluated against the PRE-move rect each step; deltas are one frame small,
+// so contents and rect travel together.
+fn moveSelection(g: *Game, delta: rl.Vector3) void {
+    const ed = &g.ed;
+    const s = ed.sel orelse return;
+    const m = &g.map;
+    const limW = m.halfW - 1.2;
+    const limD = m.halfD - 1.2;
+    for (m.obstacles[0..m.obstacle_count]) |*o| {
+        if (s.contains(o.Pos.x, o.Pos.z)) {
+            o.Pos.x = clampF(o.Pos.x + delta.x, -limW, limW);
+            o.Pos.z = clampF(o.Pos.z + delta.z, -limD, limD);
+        }
+    }
+    for (m.decor[0..m.decor_count]) |*d| {
+        if (s.contains(d.Pos.x, d.Pos.z)) {
+            d.Pos.x = clampF(d.Pos.x + delta.x, -limW, limW);
+            d.Pos.z = clampF(d.Pos.z + delta.z, -limD, limD);
+        }
+    }
+    for (m.packs[0..m.pack_count]) |*pk| {
+        if (s.contains(pk.x, pk.z)) {
+            pk.x = clampF(pk.x + delta.x, -limW, limW);
+            pk.z = clampF(pk.z + delta.z, -limD, limD);
+        }
+    }
+    ed.sel = .{
+        .minX = s.minX + delta.x,
+        .minZ = s.minZ + delta.z,
+        .maxX = s.maxX + delta.x,
+        .maxZ = s.maxZ + delta.z,
+    };
+    markDirty(g);
+}
+
 // Floor-layer erase: remove the terrain feature whose rect contains the click.
 fn eraseFeatureAt(g: *Game, p: rl.Vector3) bool {
     const m = &g.map;
@@ -575,12 +814,12 @@ fn scatterDecor(g: *Game) void {
     bankUndo(g);
     const m = &g.map;
     m.decor_count = 0;
-    const target: usize = @intFromFloat(m.half * 4.5);
+    const target: usize = @intFromFloat((m.halfW + m.halfD) * 2.25);
     var placed: usize = 0;
     var attempt: usize = 0;
     while (placed < target and attempt < target * 8) : (attempt += 1) {
-        const x = (g.rng.float() * 2 - 1) * (m.half - 2);
-        const z = (g.rng.float() * 2 - 1) * (m.half - 2);
+        const x = (g.rng.float() * 2 - 1) * (m.halfW - 2);
+        const z = (g.rng.float() * 2 - 1) * (m.halfD - 2);
         if (g.w.blocked(v3(x, 0, z), 0.3)) continue;
         if (g.w.onFeature(x, z)) continue;
         const roll = g.rng.float();
@@ -662,11 +901,12 @@ fn doOpen(g: *Game, idx: usize) void {
 fn doNew(g: *Game) void {
     const ed = &g.ed;
     g.map = mapmod.defaultMap();
-    g.map.half = ed.newHalf;
+    g.map.halfW = ed.newHalfW;
+    g.map.halfD = ed.newHalfD;
     if (ed.field_len > 0) g.map.name.set(ed.field_buf[0..ed.field_len]);
-    g.map.spawn = v3(0, 0, ed.newHalf - mapmod.SPAWN_INSET);
-    g.map.portal = v3(0, 0, -(ed.newHalf - mapmod.PORTAL_INSET));
-    g.map.bossPos = v3(0, 0, -(ed.newHalf - mapmod.BOSS_INSET));
+    g.map.spawn = v3(0, 0, ed.newHalfD - mapmod.SPAWN_INSET);
+    g.map.portal = v3(0, 0, -(ed.newHalfD - mapmod.PORTAL_INSET));
+    g.map.bossPos = v3(0, 0, -(ed.newHalfD - mapmod.BOSS_INSET));
     g.map.pack_count = 0;
     apply(g);
     ed.camTarget = g.map.spawn;
@@ -762,8 +1002,8 @@ pub fn update(g: *Game, dt: f32) void {
         if (rl.isKeyDown(.d) or rl.isKeyDown(.right)) pan.x += 1;
     }
     const speed = 26.0 / g.rig.zoom;
-    ed.camTarget.x = clampF(ed.camTarget.x + pan.x * speed * dt, -g.map.half, g.map.half);
-    ed.camTarget.z = clampF(ed.camTarget.z + pan.z * speed * dt, -g.map.half, g.map.half);
+    ed.camTarget.x = clampF(ed.camTarget.x + pan.x * speed * dt, -g.map.halfW, g.map.halfW);
+    ed.camTarget.z = clampF(ed.camTarget.z + pan.z * speed * dt, -g.map.halfD, g.map.halfD);
     ed.camTarget.y = g.w.groundY(ed.camTarget.x, ed.camTarget.z);
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0 and !ed.uiHot) g.rig.addZoom(wheel);
@@ -780,8 +1020,8 @@ pub fn update(g: *Game, dt: f32) void {
         if (ed.rightMoved) {
             if (ed.panAnchor) |anchor| {
                 if (mousePoint(g)) |cur| {
-                    ed.camTarget.x = clampF(ed.camTarget.x - (cur.x - anchor.x), -g.map.half, g.map.half);
-                    ed.camTarget.z = clampF(ed.camTarget.z - (cur.z - anchor.z), -g.map.half, g.map.half);
+                    ed.camTarget.x = clampF(ed.camTarget.x - (cur.x - anchor.x), -g.map.halfW, g.map.halfW);
+                    ed.camTarget.z = clampF(ed.camTarget.z - (cur.z - anchor.z), -g.map.halfD, g.map.halfD);
                     ed.camTarget.y = g.w.groundY(ed.camTarget.x, ed.camTarget.z);
                     panning = true;
                 }
@@ -868,6 +1108,12 @@ pub fn update(g: *Game, dt: f32) void {
         if (shift) doRedo(g) else doUndo(g);
     }
     if (ctrl and rl.isKeyPressed(.y)) doRedo(g);
+    if (ctrl and rl.isKeyPressed(.c)) copySelection(g, false);
+    if (ctrl and rl.isKeyPressed(.x)) copySelection(g, true);
+    if (ctrl and rl.isKeyPressed(.v)) {
+        if (mousePoint(g)) |p| pasteAt(g, p);
+    }
+    if (rl.isKeyPressed(.delete)) deleteSelection(g);
     if (ctrl and rl.isKeyPressed(.r) and recoveryExists()) {
         if (mapmod.load(REC_PATH)) |m| {
             g.map = m;
@@ -904,18 +1150,62 @@ pub fn update(g: *Game, dt: f32) void {
             ed.ctxOpen = false;
             return;
         }
+        if (ed.sel != null or ed.selDrag != null) {
+            ed.sel = null;
+            ed.selDrag = null;
+            return;
+        }
         requestAction(g, .exit, 0);
         return;
     }
 
     // World interaction — blocked while the pointer is over chrome or a menu.
+    // Every in-flight drag is released here, or a marquee/stroke that ends over
+    // a panel would stay armed and resume by itself back over the world.
     if (ed.uiHot or ed.ctxOpen) {
         ed.dragStart = null;
+        ed.selDrag = null;
+        ed.selMove = null;
         if (ed.strokeActive) endStroke(ed);
         return;
     }
     const pt = mousePoint(g);
     if (pt) |p| {
+        // ---- Marquee selection owns the mouse while active ----
+        if (shift and rl.isMouseButtonPressed(.left)) {
+            ed.selDrag = p;
+            ed.sel = null;
+        }
+        if (ed.selDrag) |a| {
+            if (rl.isMouseButtonReleased(.left)) {
+                const s = normRect(a, p);
+                ed.sel = if (s.maxX - s.minX > 1.0 and s.maxZ - s.minZ > 1.0) s else null;
+                ed.selDrag = null;
+            }
+            return;
+        }
+        if (ed.sel) |s| {
+            if (rl.isMouseButtonPressed(.left) and !shift and s.contains(p.x, p.z)) {
+                ed.selMove = p;
+                selBankPending = true; // bank on the FIRST real move, not the grab
+            }
+            if (ed.selMove) |last| {
+                if (rl.isMouseButtonDown(.left)) {
+                    const delta = v3(p.x - last.x, 0, p.z - last.z);
+                    if (@abs(delta.x) + @abs(delta.z) > 1e-4) {
+                        if (selBankPending) {
+                            bankUndo(g);
+                            selBankPending = false;
+                        }
+                        moveSelection(g, delta);
+                    }
+                    ed.selMove = p;
+                }
+                if (rl.isMouseButtonReleased(.left)) ed.selMove = null;
+                return;
+            }
+        }
+
         const tp = toolPoint(ed, p);
         switch (ed.layer) {
             .floor => {
@@ -1033,23 +1323,62 @@ pub fn draw(g: *Game) void {
 
     g.torch.beginShadowPass(lp);
     g.sceneMesh.drawDepth();
+    drawEncounterPreviews(g);
     g.torch.endShadowPass();
 
     rl.beginDrawing();
     rl.clearBackground(rgba(16, 16, 22, 255));
     g.torch.applyUniforms(cam, lp);
     g.torch.applyFireUniforms(fp);
-    g.torch.applyFogUniforms(.{ .texId = @intCast(g.fog.tex.id), .half = g.fog.half });
+    g.torch.applyFogUniforms(.{ .texId = @intCast(g.fog.tex.id), .halfW = g.fog.halfW, .halfD = g.fog.halfD });
     rl.beginMode3D(cam);
     g.torch.beginScene();
     rl.gl.rlActiveTextureSlot(0);
     g.sceneMesh.drawScene();
-    rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(g.w.Half * 2, g.w.Half * 2), g.w.Ground);
+    rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(g.w.HalfW * 2, g.w.HalfD * 2), g.w.Ground);
     gamemod.drawWalls(&g.w);
+    drawEncounterPreviews(g);
     g.torch.endScene();
     gamemod.drawPortal(&g.w, g.elapsed);
     drawMarkers(g);
     rl.endMode3D();
+}
+
+// Live monster silhouettes on every pack (arranged in the deploy ring) plus the
+// boss at its post — the ENCOUNTER reads at a glance instead of abstract rings.
+// Statuesque: no bob, facing outward. Drawn in both passes so they cast shadows
+// like the real bodies will. makeMonster ignores its rng, so previews are
+// deterministic and free to rebuild every frame.
+fn drawEncounterPreviews(g: *Game) void {
+    for (g.map.packList()) |pk| {
+        const c = g.w.snapY(v3(pk.x, 0, pk.z));
+        const n: i32 = @max(pk.count, 1);
+        var i: i32 = 0;
+        while (i < n) : (i += 1) {
+            const a = @as(f32, @floatFromInt(i)) * (std.math.tau / @as(f32, @floatFromInt(n)));
+            var mm = monster.makeMonster(pk.kind, 0, &g.rng, g.w.snapY(v3(c.x + mathx.cosf(a) * 1.1, 0, c.z + mathx.sinf(a) * 1.1)));
+            mm.Facing = v3(mathx.cosf(a), 0, mathx.sinf(a));
+            gamemod.drawMonsterBody(&mm);
+        }
+    }
+    var boss = monster.makeBoss(0, g.map.boss.slice(), &g.rng, g.w.snapY(g.map.bossPos));
+    boss.Facing = v3(0, 0, 1);
+    gamemod.drawMonsterBody(&boss);
+}
+
+// rl.drawGrid only draws square grids, so clip GRID-spaced lines to the arena
+// rect ourselves. Sits a hair above the floor to avoid z-fighting.
+fn drawRectGrid(m: *const mapmod.Map) void {
+    const col = rgba(255, 255, 255, 40);
+    const y = 0.01;
+    var x: f32 = -m.halfW;
+    while (x <= m.halfW + 0.01) : (x += GRID) {
+        rl.drawLine3D(v3(x, y, -m.halfD), v3(x, y, m.halfD), col);
+    }
+    var z: f32 = -m.halfD;
+    while (z <= m.halfD + 0.01) : (z += GRID) {
+        rl.drawLine3D(v3(-m.halfW, y, z), v3(m.halfW, y, z), col);
+    }
 }
 
 fn drawMarkers(g: *Game) void {
@@ -1057,31 +1386,33 @@ fn drawMarkers(g: *Game) void {
     const m = &g.map;
     const t = g.elapsed;
 
-    if (ed.grid) rl.drawGrid(@intFromFloat(m.half), GRID);
+    if (ed.grid) drawRectGrid(m);
 
     marker(g, m.spawn, SPAWN_COL, 1.0);
     marker(g, m.portal, PORTAL_COL, 1.4);
     marker(g, m.bossPos, BOSS_COL, 1.2);
 
-    // Packs: a dark grounding puck (so the color pops against the bright editor
-    // sun), a doubled ring in the kind's body color, a fat center orb with halo,
-    // and one pip per member — parseable at any zoom.
+    // Packs: the LIVE silhouettes (drawEncounterPreviews) show the encounter;
+    // here just the grab ring in the kind's color over a dark puck.
     _ = t;
     for (m.packList()) |pk| {
         const col = packColor(pk.kind);
         const c = g.w.snapY(v3(pk.x, 0, pk.z));
-        rl.drawCylinderEx(v3(c.x, c.y + 0.01, c.z), v3(c.x, c.y + 0.03, c.z), 1.9, 1.9, 20, withAlpha(theme.ink, 140));
+        rl.drawCylinderEx(v3(c.x, c.y + 0.01, c.z), v3(c.x, c.y + 0.03, c.z), PACK_GRAB_R + 0.3, PACK_GRAB_R + 0.3, 20, withAlpha(theme.ink, 120));
         rl.drawCircle3D(v3(c.x, c.y + 0.06, c.z), PACK_GRAB_R, v3(1, 0, 0), 90, col);
         rl.drawCircle3D(v3(c.x, c.y + 0.06, c.z), PACK_GRAB_R - 0.15, v3(1, 0, 0), 90, withAlpha(col, 150));
-        rl.drawSphereEx(v3(c.x, c.y + 0.32, c.z), 0.32, 8, 8, col);
-        rl.drawSphereEx(v3(c.x, c.y + 0.32, c.z), 0.48, 8, 8, withAlpha(col, 70));
-        if (pk.count > 0) {
-            var i: i32 = 0;
-            while (i < pk.count) : (i += 1) {
-                const a = @as(f32, @floatFromInt(i)) * (std.math.tau / @as(f32, @floatFromInt(pk.count)));
-                rl.drawSphereEx(v3(c.x + mathx.cosf(a) * 1.1, c.y + 0.18, c.z + mathx.sinf(a) * 1.1), 0.16, 6, 6, col);
-            }
+    }
+
+    // Marquee selection: the live drag rect, then the committed one.
+    if (ed.selDrag) |a| {
+        if (mousePoint(g)) |cur| {
+            const s = normRect(a, cur);
+            rl.drawCubeWiresV(v3((s.minX + s.maxX) / 2, 0.4, (s.minZ + s.maxZ) / 2), v3(s.maxX - s.minX, 0.8, s.maxZ - s.minZ), rgba(255, 235, 160, 230));
         }
+    }
+    if (ed.sel) |s| {
+        rl.drawCubeWiresV(v3((s.minX + s.maxX) / 2, 0.4, (s.minZ + s.maxZ) / 2), v3(s.maxX - s.minX, 0.8, s.maxZ - s.minZ), rgba(255, 220, 120, 255));
+        rl.drawCylinderEx(v3((s.minX + s.maxX) / 2, 0.01, (s.minZ + s.maxZ) / 2), v3((s.minX + s.maxX) / 2, 0.02, (s.minZ + s.maxZ) / 2), 0.3, 0.3, 12, rgba(255, 220, 120, 90));
     }
 
     // Prop footprints (their collision circles) so spacing reads at a glance.
@@ -1102,7 +1433,8 @@ fn drawMarkers(g: *Game) void {
         }
     }
 
-    if (!ed.uiHot and !ed.ctxOpen) drawCursorAids(g);
+    // Cursor aids hide while a marquee owns the mouse (they'd fight the rect).
+    if (!ed.uiHot and !ed.ctxOpen and ed.selDrag == null and ed.selMove == null) drawCursorAids(g);
 }
 
 // Cursor affordances: the snapped puck + cell, the erase brush circle with its
@@ -1205,27 +1537,83 @@ pub fn drawOverlay(g: *Game) void {
     drawStatusBar(g, W, H);
     drawContextMenu(g, &ctx);
     drawModal(g, &ctx);
+    hoverWorldTip(g, &ctx);
+    ui.drawTip(&ctx); // whatever earned a tooltip this frame, drawn over it all
 
     // Chrome owns the pointer wherever a widget was hot; world input reads this
     // next frame (one-frame lag, imperceptible).
     ed.uiHot = ctx.anyHot;
 }
 
+// When the pointer is over the WORLD, name what's under it: packs, the three
+// anchors, props, decor, terrain — the map explains itself on hover.
+fn hoverWorldTip(g: *Game, ctx: *ui.Ctx) void {
+    const ed = &g.ed;
+    if (ctx.anyHot or ed.modal != .none or ed.ctxOpen) return;
+    // Tips only at rest: mid-paint / mid-drag they'd flicker under the brush.
+    if (rl.isMouseButtonDown(.left) or rl.isMouseButtonDown(.right)) return;
+    const p = mousePoint(g) orelse return;
+    var buf: [96]u8 = undefined;
+    const m = &g.map;
+    for (m.packList()) |pk| {
+        if (distXZ(v3(pk.x, 0, pk.z), p) < PACK_GRAB_R) {
+            const s = std.fmt.bufPrint(&buf, "{s} pack x{d} - grab to move, click in place to edit", .{ @tagName(pk.kind), pk.count }) catch return;
+            ctx.setTip(s);
+            return;
+        }
+    }
+    if (distXZ(m.bossPos, p) < 1.4) {
+        const s = std.fmt.bufPrint(&buf, "Boss post: {s}", .{m.boss.slice()}) catch return;
+        ctx.setTip(s);
+        return;
+    }
+    if (distXZ(m.spawn, p) < 1.2) return ctx.setTip("Spawn - where the hero enters");
+    if (distXZ(m.portal, p) < 1.6) return ctx.setTip("Portal - the area exit");
+    for (m.obstacles[0..m.obstacle_count]) |o| {
+        if (distXZ(o.Pos, p) < o.Radius + 0.3) {
+            const s = std.fmt.bufPrint(&buf, "{s} (Props layer)", .{@tagName(o.Kind)}) catch return;
+            ctx.setTip(s);
+            return;
+        }
+    }
+    for (m.decor[0..m.decor_count]) |d| {
+        if (distXZ(d.Pos, p) < 0.6) {
+            const s = std.fmt.bufPrint(&buf, "{s} (Decor layer)", .{@tagName(d.Kind)}) catch return;
+            ctx.setTip(s);
+            return;
+        }
+    }
+    for (m.ramps[0..m.ramp_count]) |r| {
+        if (p.x >= r.minX and p.x <= r.maxX and p.z >= r.minZ and p.z <= r.maxZ) {
+            const s = std.fmt.bufPrint(&buf, "ramp h {d:.1} rises {s} - RMB to re-height", .{ r.h, @tagName(r.rise) }) catch return;
+            ctx.setTip(s);
+            return;
+        }
+    }
+    for (m.ledges[0..m.ledge_count]) |l| {
+        if (p.x >= l.minX and p.x <= l.maxX and p.z >= l.minZ and p.z <= l.maxZ) {
+            const s = std.fmt.bufPrint(&buf, "ledge h {d:.1} - RMB to re-height", .{l.h}) catch return;
+            ctx.setTip(s);
+            return;
+        }
+    }
+}
+
 fn drawTopbar(g: *Game, ctx: *ui.Ctx, W: i32) void {
     const ed = &g.ed;
     ui.panel(ui.rect(0, 0, W, TOPBAR_H), null);
     var x: i32 = 8;
-    if (ui.button(ctx, ui.rect(x, 7, 54, 26), "New", 17, false)) requestAction(g, .new, 0);
+    if (ui.buttonTip(ctx, ui.rect(x, 7, 54, 26), "New", 17, false, "Start a blank map (Ctrl+N)")) requestAction(g, .new, 0);
     x += 60;
-    if (ui.button(ctx, ui.rect(x, 7, 60, 26), "Open", 17, false)) openModal(ed, .open_map);
+    if (ui.buttonTip(ctx, ui.rect(x, 7, 60, 26), "Open", 17, false, "Open a campaign map (Ctrl+O)")) openModal(ed, .open_map);
     x += 66;
-    if (ui.button(ctx, ui.rect(x, 7, 58, 26), "Save", 17, false)) saveCurrent(g);
+    if (ui.buttonTip(ctx, ui.rect(x, 7, 58, 26), "Save", 17, false, "Save to its file, .bak kept (Ctrl+S)")) saveCurrent(g);
     x += 64;
-    if (ui.button(ctx, ui.rect(x, 7, 84, 26), "Save As", 17, false)) openModal(ed, .save_as);
+    if (ui.buttonTip(ctx, ui.rect(x, 7, 84, 26), "Save As", 17, false, "Save under a new file name (Ctrl+Shift+S)")) openModal(ed, .save_as);
     x += 90;
-    if (ui.button(ctx, ui.rect(x, 7, 62, 26), "Undo", 17, false)) doUndo(g);
+    if (ui.buttonTip(ctx, ui.rect(x, 7, 62, 26), "Undo", 17, false, "Undo the last edit (Ctrl+Z)")) doUndo(g);
     x += 68;
-    if (ui.button(ctx, ui.rect(x, 7, 62, 26), "Redo", 17, false)) doRedo(g);
+    if (ui.buttonTip(ctx, ui.rect(x, 7, 62, 26), "Redo", 17, false, "Redo (Ctrl+Y)")) doRedo(g);
     x += 74;
 
     var nameBuf: [72]u8 = undefined;
@@ -1234,9 +1622,9 @@ fn drawTopbar(g: *Game, ctx: *ui.Ctx, W: i32) void {
 
     var rx: i32 = W - 8;
     rx -= 66;
-    if (ui.button(ctx, ui.rect(rx, 7, 66, 26), "Menu", 17, false)) requestAction(g, .exit, 0);
+    if (ui.buttonTip(ctx, ui.rect(rx, 7, 66, 26), "Menu", 17, false, "Back to the title (Esc)")) requestAction(g, .exit, 0);
     rx -= 116;
-    if (ui.button(ctx, ui.rect(rx, 7, 110, 26), "Playtest F5", 17, false)) {
+    if (ui.buttonTip(ctx, ui.rect(rx, 7, 110, 26), "Playtest F5", 17, false, "Play this map now - Ctrl+F5 starts at the cursor")) {
         gamemod.startPlaytest(g);
     }
 }
@@ -1249,9 +1637,9 @@ fn drawPalette(g: *Game, ctx: *ui.Ctx) void {
     // LAYERS: the workspace switch (Tab cycles; Alt+1..4 jumps).
     ui.panel(ui.rect(px, y, PALETTE_W, 152), "LAYERS");
     y += 26;
-    inline for (@typeInfo(Layer).@"enum".fields) |f| {
+    inline for (@typeInfo(Layer).@"enum".fields, 0..) |f, li| {
         const l: Layer = @enumFromInt(f.value);
-        if (ui.button(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 26), l.label(), 14, ed.layer == l)) {
+        if (ui.buttonTip(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 26), l.label(), 16, ed.layer == l, layerTips[li])) {
             ed.layer = l;
         }
         y += 30;
@@ -1260,19 +1648,20 @@ fn drawPalette(g: *Game, ctx: *ui.Ctx) void {
 
     // BRUSHES: the active layer's kit, numbered like its hotkeys.
     const brushes = brushesFor(ed.layer);
+    const tips = brushTipsFor(ed.layer);
     const extraRows: i32 = if (ed.layer == .decor) 2 else 0;
     ui.panel(ui.rect(px, y, PALETTE_W, 26 + @as(i32, @intCast(brushes.len)) * 30 + extraRows * 28 + 6), "BRUSHES");
     y += 26;
     for (brushes, 0..) |label, i| {
         var kb: [24]u8 = undefined;
         const lbl = std.fmt.bufPrintZ(&kb, "{d}  {s}", .{ i + 1, label }) catch "";
-        if (ui.button(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 26), lbl, 14, ed.brush() == i)) ed.setBrush(i);
+        if (ui.buttonTip(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 26), lbl, 16, ed.brush() == i, tips[i])) ed.setBrush(i);
         y += 30;
     }
     if (ed.layer == .decor) {
-        if (ui.button(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 24), "Scatter (X)", 15, false)) scatterDecor(g);
+        if (ui.buttonTip(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 24), "Scatter (X)", 15, false, "Re-roll ALL decor over open floor (undoable)")) scatterDecor(g);
         y += 28;
-        if (ui.button(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 24), "Clear all", 15, false)) {
+        if (ui.buttonTip(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 24), "Clear all", 15, false, "Delete every decor on the map (undoable)")) {
             bankUndo(g);
             g.map.decor_count = 0;
             markDirty(g);
@@ -1286,14 +1675,24 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
     const px = W - PANEL_W - 8;
     var y: i32 = TOPBAR_H + 8;
 
-    ui.panel(ui.rect(px, y, PANEL_W, 168), "MAP");
+    ui.panel(ui.rect(px, y, PANEL_W, 196), "MAP");
     y += 26;
-    if (ui.button(ctx, ui.rect(px + 8, y, PANEL_W - 16, 24), "Rename...", 15, false)) openModal(ed, .rename);
+    if (ui.buttonTip(ctx, ui.rect(px + 8, y, PANEL_W - 16, 24), "Rename...", 15, false, "The name shown on the area banner")) openModal(ed, .rename);
     y += 30;
-    var half = g.map.half;
-    if (ui.stepperF(ctx, px + 10, y, "size", &half, 4, 18, 48)) {
+    ui.tipFor(ctx, ui.rect(px + 8, y - 2, PANEL_W - 16, 26), "East-west half-extent; shrinking clamps contents");
+    var halfW = g.map.halfW;
+    if (ui.stepperF(ctx, px + 10, y, "width", &halfW, 4, 18, 48)) {
         bankUndo(g);
-        g.map.half = half;
+        g.map.halfW = halfW;
+        clampContents(&g.map);
+        markDirty(g);
+    }
+    y += 28;
+    ui.tipFor(ctx, ui.rect(px + 8, y - 2, PANEL_W - 16, 26), "North-south half-extent; shrinking clamps contents");
+    var halfD = g.map.halfD;
+    if (ui.stepperF(ctx, px + 10, y, "depth", &halfD, 4, 18, 48)) {
+        bankUndo(g);
+        g.map.halfD = halfD;
         clampContents(&g.map);
         markDirty(g);
     }
@@ -1301,6 +1700,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
     hudx.text("palette", px + 10, y + 3, 15, rgba(200, 190, 172, 230));
     var sx = px + 76;
     for (presets) |p| {
+        ui.tipFor(ctx, ui.rect(sx, y, 24, 22), p.name);
         const active = g.map.ground.r == p.ground.r and g.map.ground.g == p.ground.g and g.map.ground.b == p.ground.b;
         if (ui.swatch(ctx, sx, y, 24, 22, p.ground, p.accent, active)) {
             bankUndo(g);
@@ -1327,14 +1727,17 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
         .entities => {
             if (ed.entityBrush() == .pack) {
                 ui.panel(ui.rect(px, y, PANEL_W, 62), "PACK");
+                ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Members stamped per new pack");
                 _ = ui.stepperI(ctx, px + 10, y + 28, "members", &ed.packCount, 1, 8);
             } else if (ed.entityBrush() == .erase) {
                 ui.panel(ui.rect(px, y, PANEL_W, 62), "ERASE");
+                ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Erase sweep radius ([ ] adjusts)");
                 _ = ui.stepperF(ctx, px + 10, y + 28, "radius", &ed.brushR, 0.5, 0.5, 4.0);
             }
         },
         .floor => {
             ui.panel(ui.rect(px, y, PANEL_W, 94), "TERRAIN");
+            ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Height of NEW ledges/ramps; RMB a feature to apply");
             _ = ui.stepperF(ctx, px + 10, y + 28, "height", &ed.featureH, 0.4, 1.2, 4.0);
             if (ed.brush() == 1) {
                 var used: i32 = 0;
@@ -1348,6 +1751,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
         },
         .decor, .props => {
             ui.panel(ui.rect(px, y, PANEL_W, 62), "BRUSH");
+            ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Brush radius: decor spread + erase sweep ([ ])");
             _ = ui.stepperF(ctx, px + 10, y + 28, "radius", &ed.brushR, 0.5, 0.5, 4.0);
         },
     }
@@ -1356,19 +1760,21 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
 // Keep authored anchors AND terrain rects inside a shrunken arena; features that
 // collapse below a usable span are dropped rather than left as slivers.
 fn clampContents(m: *mapmod.Map) void {
-    const lim = m.half - 2;
-    m.spawn = v3(clampF(m.spawn.x, -lim, lim), 0, clampF(m.spawn.z, -lim, lim));
-    m.portal = v3(clampF(m.portal.x, -lim, lim), 0, clampF(m.portal.z, -lim, lim));
-    m.bossPos = v3(clampF(m.bossPos.x, -lim, lim), 0, clampF(m.bossPos.z, -lim, lim));
-    const flim = m.half - 1.2;
+    const limW = m.halfW - 2;
+    const limD = m.halfD - 2;
+    m.spawn = v3(clampF(m.spawn.x, -limW, limW), 0, clampF(m.spawn.z, -limD, limD));
+    m.portal = v3(clampF(m.portal.x, -limW, limW), 0, clampF(m.portal.z, -limD, limD));
+    m.bossPos = v3(clampF(m.bossPos.x, -limW, limW), 0, clampF(m.bossPos.z, -limD, limD));
+    const flimW = m.halfW - 1.2;
+    const flimD = m.halfD - 1.2;
     var i: usize = m.ledge_count;
     while (i > 0) {
         i -= 1;
         const l = &m.ledges[i];
-        l.minX = clampF(l.minX, -flim, flim);
-        l.maxX = clampF(l.maxX, -flim, flim);
-        l.minZ = clampF(l.minZ, -flim, flim);
-        l.maxZ = clampF(l.maxZ, -flim, flim);
+        l.minX = clampF(l.minX, -flimW, flimW);
+        l.maxX = clampF(l.maxX, -flimW, flimW);
+        l.minZ = clampF(l.minZ, -flimD, flimD);
+        l.maxZ = clampF(l.maxZ, -flimD, flimD);
         if (l.maxX - l.minX < 1.5 or l.maxZ - l.minZ < 1.5) {
             m.removeLedge(i);
         }
@@ -1377,10 +1783,10 @@ fn clampContents(m: *mapmod.Map) void {
     while (i > 0) {
         i -= 1;
         const r = &m.ramps[i];
-        r.minX = clampF(r.minX, -flim, flim);
-        r.maxX = clampF(r.maxX, -flim, flim);
-        r.minZ = clampF(r.minZ, -flim, flim);
-        r.maxZ = clampF(r.maxZ, -flim, flim);
+        r.minX = clampF(r.minX, -flimW, flimW);
+        r.maxX = clampF(r.maxX, -flimW, flimW);
+        r.minZ = clampF(r.minZ, -flimD, flimD);
+        r.maxZ = clampF(r.maxZ, -flimD, flimD);
         if (r.maxX - r.minX < 1.5 or r.maxZ - r.minZ < 1.5) {
             m.removeRamp(i);
         }
@@ -1395,17 +1801,21 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     const my = H - 30 - MM_S - 14;
     const frame = ui.rect(mx - 5, my - 5, MM_S + 10, MM_S + 10);
     ui.panel(frame, null);
+    ui.tipFor(ctx, frame, "The whole map - click or drag to travel");
 
-    const half = g.map.half;
-    const scale = @as(f32, @floatFromInt(MM_S)) / (2 * half);
-    const fx = @as(f32, @floatFromInt(mx));
-    const fy = @as(f32, @floatFromInt(my));
+    // Aspect-fit: a rectangular arena letterboxes inside the square minimap.
+    const halfW = g.map.halfW;
+    const halfD = g.map.halfD;
+    const mmf = @as(f32, @floatFromInt(MM_S));
+    const scale = mmf / @max(halfW * 2, halfD * 2);
+    const ox = @as(f32, @floatFromInt(mx)) + (mmf - halfW * 2 * scale) / 2;
+    const oy = @as(f32, @floatFromInt(my)) + (mmf - halfD * 2 * scale) / 2;
 
-    rl.drawRectangle(mx, my, MM_S, MM_S, lerpColor(g.map.ground, rl.Color.black, 0.45));
+    rl.drawRectangle(@intFromFloat(ox), @intFromFloat(oy), @intFromFloat(halfW * 2 * scale), @intFromFloat(halfD * 2 * scale), lerpColor(g.map.ground, rl.Color.black, 0.45));
     for (g.map.ledges[0..g.map.ledge_count]) |l| {
         rl.drawRectangle(
-            @intFromFloat(fx + (l.minX + half) * scale),
-            @intFromFloat(fy + (l.minZ + half) * scale),
+            @intFromFloat(ox + (l.minX + halfW) * scale),
+            @intFromFloat(oy + (l.minZ + halfD) * scale),
             @intFromFloat(@max((l.maxX - l.minX) * scale, 1)),
             @intFromFloat(@max((l.maxZ - l.minZ) * scale, 1)),
             lerpColor(g.map.ground, rl.Color.white, 0.25),
@@ -1413,8 +1823,8 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     }
     for (g.map.ramps[0..g.map.ramp_count]) |r| {
         rl.drawRectangle(
-            @intFromFloat(fx + (r.minX + half) * scale),
-            @intFromFloat(fy + (r.minZ + half) * scale),
+            @intFromFloat(ox + (r.minX + halfW) * scale),
+            @intFromFloat(oy + (r.minZ + halfD) * scale),
             @intFromFloat(@max((r.maxX - r.minX) * scale, 1)),
             @intFromFloat(@max((r.maxZ - r.minZ) * scale, 1)),
             rgba(120, 150, 110, 255),
@@ -1426,27 +1836,27 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
             .tree => rgba(74, 120, 62, 255),
             .gravestone => rgba(195, 195, 205, 255),
         };
-        rl.drawRectangle(@intFromFloat(fx + (o.Pos.x + half) * scale - 1), @intFromFloat(fy + (o.Pos.z + half) * scale - 1), 2, 2, col);
+        rl.drawRectangle(@intFromFloat(ox + (o.Pos.x + halfW) * scale - 1), @intFromFloat(oy + (o.Pos.z + halfD) * scale - 1), 2, 2, col);
     }
     for (g.map.packList()) |pk| {
-        rl.drawRectangle(@intFromFloat(fx + (pk.x + half) * scale - 1), @intFromFloat(fy + (pk.z + half) * scale - 1), 3, 3, packColor(pk.kind));
+        rl.drawRectangle(@intFromFloat(ox + (pk.x + halfW) * scale - 1), @intFromFloat(oy + (pk.z + halfD) * scale - 1), 3, 3, packColor(pk.kind));
     }
-    rl.drawRectangle(@intFromFloat(fx + (g.map.bossPos.x + half) * scale - 2), @intFromFloat(fy + (g.map.bossPos.z + half) * scale - 2), 4, 4, BOSS_COL);
-    rl.drawRectangle(@intFromFloat(fx + (g.map.spawn.x + half) * scale - 2), @intFromFloat(fy + (g.map.spawn.z + half) * scale - 2), 4, 4, SPAWN_COL);
-    rl.drawRectangle(@intFromFloat(fx + (g.map.portal.x + half) * scale - 2), @intFromFloat(fy + (g.map.portal.z + half) * scale - 2), 4, 4, PORTAL_COL);
+    rl.drawRectangle(@intFromFloat(ox + (g.map.bossPos.x + halfW) * scale - 2), @intFromFloat(oy + (g.map.bossPos.z + halfD) * scale - 2), 4, 4, BOSS_COL);
+    rl.drawRectangle(@intFromFloat(ox + (g.map.spawn.x + halfW) * scale - 2), @intFromFloat(oy + (g.map.spawn.z + halfD) * scale - 2), 4, 4, SPAWN_COL);
+    rl.drawRectangle(@intFromFloat(ox + (g.map.portal.x + halfW) * scale - 2), @intFromFloat(oy + (g.map.portal.z + halfD) * scale - 2), 4, 4, PORTAL_COL);
 
     // The camera's approximate view square, and click/drag-to-travel.
     const viewHalf = 24.0 / g.rig.zoom;
-    const vx: i32 = @intFromFloat(fx + (ed.camTarget.x - viewHalf + half) * scale);
-    const vy: i32 = @intFromFloat(fy + (ed.camTarget.z - viewHalf + half) * scale);
+    const vx: i32 = @intFromFloat(ox + (ed.camTarget.x - viewHalf + halfW) * scale);
+    const vy: i32 = @intFromFloat(oy + (ed.camTarget.z - viewHalf + halfD) * scale);
     const vs: i32 = @intFromFloat(2 * viewHalf * scale);
     rl.drawRectangleLines(@max(vx, mx), @max(vy, my), @min(vs, MM_S), @min(vs, MM_S), rgba(255, 235, 190, 220));
 
     if (rl.checkCollisionPointRec(ctx.mouse, frame)) {
         ctx.anyHot = true;
         if (ctx.down) {
-            ed.camTarget.x = clampF((ctx.mouse.x - fx) / scale - half, -half, half);
-            ed.camTarget.z = clampF((ctx.mouse.y - fy) / scale - half, -half, half);
+            ed.camTarget.x = clampF((ctx.mouse.x - ox) / scale - halfW, -halfW, halfW);
+            ed.camTarget.z = clampF((ctx.mouse.y - oy) / scale - halfD, -halfD, halfD);
         }
     }
 }
@@ -1454,7 +1864,7 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
 fn drawStatusBar(g: *Game, W: i32, H: i32) void {
     const ed = &g.ed;
     ui.panel(ui.rect(0, H - 30, W, 30), null);
-    const hints: [:0]const u8 = "Tab layer   1-9 brush   LMB paint/drag   RMB menu/pan   Alt off-grid   M mirror   [ ] size   Ctrl+Z undo   Ctrl+S save   F5/Ctrl+F5 playtest";
+    const hints: [:0]const u8 = "Tab layer   1-9 brush   LMB paint   Shift+drag select   Ctrl+C/X/V   Del   RMB menu/pan   M mirror   [ ] size   Ctrl+Z undo   Ctrl+S save   F5 playtest";
     hudx.text(hints, 12, H - 25, 15, rgba(200, 190, 172, 220));
 
     var right: [96]u8 = undefined;
@@ -1511,6 +1921,24 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
         }
     }
 
+    // A terrain feature under the click gets a re-height row (current featureH).
+    var featKind: enum { none, ledge, ramp } = .none;
+    var featIdx: usize = 0;
+    for (m.ramps[0..m.ramp_count], 0..) |r0, i| {
+        if (p.x >= r0.minX and p.x <= r0.maxX and p.z >= r0.minZ and p.z <= r0.maxZ) {
+            featKind = .ramp;
+            featIdx = i;
+        }
+    }
+    if (featKind == .none) {
+        for (m.ledges[0..m.ledge_count], 0..) |l, i| {
+            if (p.x >= l.minX and p.x <= l.maxX and p.z >= l.minZ and p.z <= l.maxZ) {
+                featKind = .ledge;
+                featIdx = i;
+            }
+        }
+    }
+
     const rowH = 26;
     const menuW = 188;
     var rows: i32 = 4; // spawn/portal/boss/cancel
@@ -1519,6 +1947,7 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
         .ob, .dec => 1,
         .none => 0,
     };
+    if (featKind != .none) rows += 1;
     const sw = rl.getScreenWidth();
     const sh = rl.getScreenHeight();
     const mx: i32 = @min(@as(i32, @intFromFloat(ed.ctxAt.x)), sw - menuW - 6);
@@ -1566,6 +1995,21 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
             y += rowH;
         },
         .none => {},
+    }
+    if (featKind != .none) {
+        var fb: [40]u8 = undefined;
+        const flbl = std.fmt.bufPrintZ(&fb, "{s} height -> {d:.1}", .{ if (featKind == .ledge) @as([]const u8, "Ledge") else "Ramp", ed.featureH }) catch "Set height";
+        if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), flbl, 16, false)) {
+            bankUndo(g);
+            switch (featKind) {
+                .ledge => m.ledges[featIdx].h = ed.featureH,
+                .ramp => m.ramps[featIdx].h = ed.featureH,
+                .none => {},
+            }
+            markDirty(g);
+            ed.ctxOpen = false;
+        }
+        y += rowH;
     }
     if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Move spawn here", 16, false)) {
         bankUndo(g);
@@ -1634,12 +2078,13 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
             if (ui.button(ctx, ui.rect(mb.x + 310, mb.y + 116, 86, 30), "Cancel", 17, false)) ed.modal = .none;
         },
         .new_map => {
-            const mb = ui.beginModal(ctx, 420, 200, "New Map");
+            const mb = ui.beginModal(ctx, 420, 232, "New Map");
             hudx.text("name", mb.x + 24, mb.y + 46, 16, rgba(200, 190, 172, 230));
             ui.textField(ctx, ui.rect(mb.x + 24, mb.y + 66, 372, 30), &ed.field_buf, &ed.field_len, true, g.elapsed);
-            _ = ui.stepperF(ctx, mb.x + 24, mb.y + 106, "size", &ed.newHalf, 4, 18, 48);
-            if (ui.button(ctx, ui.rect(mb.x + 214, mb.y + 148, 88, 30), "Create", 17, false) or rl.isKeyPressed(.enter)) doNew(g);
-            if (ui.button(ctx, ui.rect(mb.x + 310, mb.y + 148, 86, 30), "Cancel", 17, false)) ed.modal = .none;
+            _ = ui.stepperF(ctx, mb.x + 24, mb.y + 106, "width", &ed.newHalfW, 4, 18, 48);
+            _ = ui.stepperF(ctx, mb.x + 24, mb.y + 138, "depth", &ed.newHalfD, 4, 18, 48);
+            if (ui.button(ctx, ui.rect(mb.x + 214, mb.y + 180, 88, 30), "Create", 17, false) or rl.isKeyPressed(.enter)) doNew(g);
+            if (ui.button(ctx, ui.rect(mb.x + 310, mb.y + 180, 86, 30), "Cancel", 17, false)) ed.modal = .none;
         },
         .open_map => {
             const listH: i32 = @intCast(@max(1, g.mapCount) * 34 + 108);

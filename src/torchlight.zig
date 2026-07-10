@@ -78,7 +78,7 @@ const sceneFS =
     \\uniform int shadowMapResolution;
     \\uniform float lightRadius;
     \\uniform sampler2D fogMap;
-    \\uniform float fogHalf;
+    \\uniform vec2 fogHalf; // arena half-extents (w, d): rectangular arenas
     \\uniform mat4 fireVP;
     \\uniform sampler2D fireMap;
     \\uniform int fireMapResolution;
@@ -183,7 +183,8 @@ const sceneFS =
     \\    float core = 1.0 - smoothstep(0.0, lightRadius*0.95, lightDist);
     \\    finalColor.rgb *= mix(vec3(0.74, 0.82, 1.10), vec3(1.10, 1.00, 0.86), core);
     \\    // FOG OF WAR: persistent exploration at this ground point (0 unseen .. 1 seen).
-    \\    // The arena spans [-fogHalf, fogHalf] on X/Z; map that onto the [0,1] fog map.
+    \\    // The arena spans [-fogHalf.x, fogHalf.x] on X and [-fogHalf.y, fogHalf.y]
+    \\    // on Z; map that onto the [0,1] fog map (componentwise).
     \\    vec2 fogUV = fragPosition.xz/(2.0*fogHalf) + 0.5;
     \\    float seen = texture(fogMap, fogUV).r;
     \\    // SEEN: a dim, cool, desaturated memory of the lit terrain -- drained toward
@@ -253,11 +254,12 @@ pub const FireParams = struct {
 };
 
 /// The fog-of-war memory layer sampled by the scene shader. `texId` is the GPU id of a
-/// grayscale exploration map (see fog.zig); `half` is the arena half-extent it covers,
-/// so the shader can map a fragment's XZ into the map's [0,1] range.
+/// grayscale exploration map (see fog.zig); `halfW`/`halfD` are the arena half-extents
+/// it covers, so the shader can map a fragment's XZ into the map's [0,1] range.
 pub const FogParams = struct {
     texId: u32,
-    half: f32,
+    halfW: f32,
+    halfD: f32,
 };
 
 pub const Torch = struct {
@@ -435,8 +437,8 @@ pub const Torch = struct {
     // and upload the arena half-extent so the shader can map fragments into the map.
     pub fn applyFogUniforms(self: *Torch, fog: FogParams) void {
         self.fogTexId = fog.texId;
-        const h = fog.half;
-        rl.setShaderValue(self.scene, self.loc_fogHalf, &h, .float);
+        const h = [2]f32{ fog.halfW, fog.halfD };
+        rl.setShaderValue(self.scene, self.loc_fogHalf, &h, .vec2);
     }
 
     // Wrap the lit geometry between beginScene()/endScene(), inside beginMode3D(cam).

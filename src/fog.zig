@@ -25,7 +25,8 @@ pub const Fog = struct {
     // Only ever increases (max on reveal), so the frontier the hero reached never fades.
     cells: [RES * RES]u8 = [_]u8{0} ** (RES * RES),
     tex: rl.Texture2D = undefined,
-    half: f32 = 1, // arena half-extent the grid spans; drives world->UV (kept > 0)
+    halfW: f32 = 1, // arena half-extents the grid spans; drive world->UV (kept > 0)
+    halfD: f32 = 1,
     dirty: bool = true, // a cell changed (or the area is fresh): re-upload pending
 
     pub fn init() Fog {
@@ -48,9 +49,10 @@ pub const Fog = struct {
     }
 
     // Start a new area: forget everything and remember the extents to map against.
-    pub fn reset(self: *Fog, half: f32) void {
+    pub fn reset(self: *Fog, halfW: f32, halfD: f32) void {
         @memset(&self.cells, 0);
-        self.half = if (half > 0) half else 1;
+        self.halfW = if (halfW > 0) halfW else 1;
+        self.halfD = if (halfD > 0) halfD else 1;
         self.dirty = true;
     }
 
@@ -59,19 +61,20 @@ pub const Fog = struct {
     // max so the outermost frontier the hero ever reached keeps a soft edge while every
     // cell behind it saturates to fully-seen. Iterates only the disc's bounding box.
     pub fn reveal(self: *Fog, pos: rl.Vector3, radius: f32) void {
-        const span = self.half * 2;
+        const spanW = self.halfW * 2;
+        const spanD = self.halfD * 2;
         const inner = radius * 0.82; // fully seen within this; linear ramp out to `radius`
         const ramp = if (radius > inner) radius - inner else 1;
-        const cx0 = cellIndex((pos.x - radius + self.half) / span);
-        const cx1 = cellIndex((pos.x + radius + self.half) / span);
-        const cz0 = cellIndex((pos.z - radius + self.half) / span);
-        const cz1 = cellIndex((pos.z + radius + self.half) / span);
+        const cx0 = cellIndex((pos.x - radius + self.halfW) / spanW);
+        const cx1 = cellIndex((pos.x + radius + self.halfW) / spanW);
+        const cz0 = cellIndex((pos.z - radius + self.halfD) / spanD);
+        const cz1 = cellIndex((pos.z + radius + self.halfD) / spanD);
         var cz = cz0;
         while (cz <= cz1) : (cz += 1) {
-            const wz = cellCenterWorld(cz, span, self.half);
+            const wz = cellCenterWorld(cz, spanD, self.halfD);
             var cx = cx0;
             while (cx <= cx1) : (cx += 1) {
-                const wx = cellCenterWorld(cx, span, self.half);
+                const wx = cellCenterWorld(cx, spanW, self.halfW);
                 const dx = wx - pos.x;
                 const dz = wz - pos.z;
                 const d = @sqrt(dx * dx + dz * dz);
@@ -87,9 +90,10 @@ pub const Fog = struct {
     }
 
     // Editor mode: no exploration — the whole arena reads as fully seen.
-    pub fn revealAll(self: *Fog, half: f32) void {
+    pub fn revealAll(self: *Fog, halfW: f32, halfD: f32) void {
         @memset(&self.cells, 255);
-        self.half = if (half > 0) half else 1;
+        self.halfW = if (halfW > 0) halfW else 1;
+        self.halfD = if (halfD > 0) halfD else 1;
         self.dirty = true;
     }
 

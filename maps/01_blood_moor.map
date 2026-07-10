@@ -1,7 +1,7 @@
-version: 1
+version: 2
 name: The Blood Moor
 boss: Bishibosh
-half: 38.0
+size: 48.0 38.0
 ground: 92 80 62
 accent: 72 62 50
 light: 1.04 0.94 0.80
@@ -203,6 +203,45 @@ decor: pebble -3.32 -22.30 0.22
 decor: tuft -22.33 -26.35 0.32
 decor: shroom 15.82 -20.13 0.20
 decor: bone 10.13 -18.23 0.29
+decor: bone 11.52 -3.61 0.30
+decor: bone 11.99 -2.46 0.29
+decor: bone 11.64 -2.43 0.46
+decor: bone -8.94 -24.04 0.30
+decor: bone -7.96 -24.14 0.48
+decor: bone -8.30 -23.86 0.35
+decor: bone -8.50 -24.55 0.45
+decor: bone -15.57 -9.37 0.37
+decor: bone -15.57 -7.71 0.35
+decor: tuft -17.00 -14.04 0.31
+decor: tuft -17.08 -13.77 0.41
+decor: tuft -17.47 -13.70 0.45
+decor: tuft -16.65 -13.14 0.38
+decor: tuft -16.77 -12.83 0.36
+decor: tuft -15.44 -14.09 0.45
+decor: tuft -16.14 -12.69 0.39
+decor: tuft -17.25 -13.37 0.46
+decor: tuft -17.73 -12.53 0.36
+decor: tuft -19.04 -13.89 0.47
+decor: tuft -17.61 -13.71 0.58
+decor: tuft -17.36 -12.33 0.39
+decor: tuft -18.75 -12.05 0.58
+decor: pebble -16.45 -12.37 0.25
+decor: pebble -18.17 -13.73 0.18
+decor: pebble -26.32 6.94 0.15
+decor: pebble -25.87 7.47 0.24
+decor: pebble -25.16 9.01 0.30
+decor: pebble -24.70 7.61 0.27
+decor: pebble -24.53 5.98 0.24
+decor: shroom -30.89 8.23 0.20
+decor: shroom -32.67 7.22 0.19
+decor: shroom -33.41 15.08 0.18
+decor: shroom -35.03 15.51 0.25
+decor: shroom -33.89 17.33 0.21
+decor: shroom -34.67 15.77 0.24
+decor: shroom -33.17 15.14 0.23
+decor: shroom -34.50 15.41 0.17
+decor: shroom -36.08 15.59 0.27
+decor: shroom -36.33 16.30 0.25
 pack: fallen 2 4.3 -25.1
 pack: zombie 2 -10.1 4.4
 pack: zombie 2 2.2 -16.1

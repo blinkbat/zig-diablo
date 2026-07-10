@@ -18,10 +18,11 @@ const lerpColor = mathx.lerpColor;
 // exist; every line is `key: payload` and unknown keys are an ERROR (typos must
 // not silently drop half a map). `#` starts a comment.
 //
-//   version: 1
+//   version: 2
 //   name: The Blood Moor
 //   boss: Bishibosh
-//   half: 38
+//   size: 38 30                          (arena half-extents: width depth;
+//                                         legacy v1 "half: 38" loads as square)
 //   ground: 92 80 62
 //   accent: 72 62 50
 //   light: 1.04 0.94 0.80
@@ -37,7 +38,7 @@ const lerpColor = mathx.lerpColor;
 // Tints are NOT stored: presentation colors derive deterministically from the
 // map's palette + a position hash (same look every load, nothing to keep in sync).
 
-pub const FORMAT_VERSION = 1;
+pub const FORMAT_VERSION = 2; // v2: rectangular arenas (size: W D); v1 'half:' still loads
 pub const MAX_PACKS = 24;
 pub const MAX_MAPS = 16;
 pub const ext = ".map";
@@ -71,7 +72,8 @@ pub const Pack = struct {
 pub const Map = struct {
     name: StrBuf(48) = .{},
     boss: StrBuf(48) = .{},
-    half: f32 = 30,
+    halfW: f32 = 30,
+    halfD: f32 = 30,
     ground: rl.Color = rgba(92, 80, 62, 255),
     accent: rl.Color = rgba(72, 62, 50, 255),
     light: [3]f32 = .{ 1.0, 0.95, 0.85 },
@@ -167,14 +169,15 @@ fn decorTint(m: *const Map, kind: world.DecorKind, x: f32, z: f32) rl.Color {
     };
 }
 
-/// Materialize the static world this map describes. `Name` aliases the map's own
-/// name buffer, so the Map must outlive the World (both live on Game).
+/// Materialize the static world this map describes. The World carries no strings:
+/// names are read from Game.map at display time (a slice into a by-value World
+/// would dangle whenever the source struct moves).
 pub fn toWorld(m: *const Map, isLast: bool) world.World {
     var w = world.World{
-        .Half = m.half,
+        .HalfW = m.halfW,
+        .HalfD = m.halfD,
         .Ground = m.ground,
         .Accent = m.accent,
-        .Name = m.name.slice(),
         .PortalPos = v3(m.portal.x, 0, m.portal.z),
         .IsLast = isLast,
     };
@@ -215,7 +218,7 @@ pub fn save(m: *const Map, path: []const u8) !void {
     try w.print("version: {d}\n", .{FORMAT_VERSION});
     try w.print("name: {s}\n", .{m.name.slice()});
     try w.print("boss: {s}\n", .{m.boss.slice()});
-    try w.print("half: {d:.1}\n", .{m.half});
+    try w.print("size: {d:.1} {d:.1}\n", .{ m.halfW, m.halfD });
     try w.print("ground: {d} {d} {d}\n", .{ m.ground.r, m.ground.g, m.ground.b });
     try w.print("accent: {d} {d} {d}\n", .{ m.accent.r, m.accent.g, m.accent.b });
     try w.print("light: {d:.2} {d:.2} {d:.2}\n", .{ m.light[0], m.light[1], m.light[2] });
@@ -288,8 +291,13 @@ pub fn load(path: []const u8) LoadError!Map {
             m.name.set(rest);
         } else if (std.mem.eql(u8, key, "boss")) {
             m.boss.set(rest);
+        } else if (std.mem.eql(u8, key, "size")) {
+            m.halfW = nextF32(&it) catch return fail(lineNo, line, "bad size");
+            m.halfD = nextF32(&it) catch return fail(lineNo, line, "bad size");
         } else if (std.mem.eql(u8, key, "half")) {
-            m.half = nextF32(&it) catch return fail(lineNo, line, "bad half");
+            // Legacy v1 square arenas: one extent for both axes.
+            m.halfW = nextF32(&it) catch return fail(lineNo, line, "bad half");
+            m.halfD = m.halfW;
         } else if (std.mem.eql(u8, key, "ground")) {
             m.ground = rgba(nextU8(&it) catch return fail(lineNo, line, "bad ground"), nextU8(&it) catch return fail(lineNo, line, "bad ground"), nextU8(&it) catch return fail(lineNo, line, "bad ground"), 255);
         } else if (std.mem.eql(u8, key, "accent")) {
@@ -369,7 +377,8 @@ pub fn load(path: []const u8) LoadError!Map {
 // the renderer or simulation: zero-size arenas, inverted feature rects, empty
 // pack counts (a pack of 0 divides by zero in the editor's tick ring).
 fn sanitize(m: *Map) void {
-    m.half = std.math.clamp(m.half, 12, 60);
+    m.halfW = std.math.clamp(m.halfW, 12, 60);
+    m.halfD = std.math.clamp(m.halfD, 12, 60);
     if (m.name.len == 0) m.name.set("Unnamed");
     if (m.boss.len == 0) m.boss.set("Champion");
     for (m.ledges[0..m.ledge_count]) |*l| {

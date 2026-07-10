@@ -242,8 +242,8 @@ pub const Game = struct {
     fog: fogmod.Fog,
     w: world.World,
     // The authored campaign: maps/*.map in lexicographic order. `map` is the
-    // CURRENT area's parsed file — the world and monster spawns come from it, and
-    // w.Name aliases its name buffer (so assign map before rebuilding w).
+    // CURRENT area's parsed file — the world, monster spawns, and displayed
+    // area name all come from it.
     map: mapmod.Map,
     mapPaths: [mapmod.MAX_MAPS][96]u8 = undefined,
     mapPathLens: [mapmod.MAX_MAPS]usize = undefined,
@@ -314,14 +314,14 @@ pub const Game = struct {
         g.map = g.loadMapAt(0);
         g.w = mapmod.toWorld(&g.map, g.lastArea == 0);
         g.sceneMesh = scenemesh.SceneMesh.init(&g.w, g.torch.scene, g.torch.depthShader);
-        g.fog.reset(g.w.Half);
+        g.fog.reset(g.w.HalfW, g.w.HalfD);
         g.p = playermod.newPlayer(g.map.spawn);
         g.areaIndex = 0;
         g.torch.setLightColor(g.map.light);
         g.spawnPacks();
         g.rig.snap(g.p.Pos);
         g.torchXZ = torchFlameWorld(&g.p);
-        g.setBanner(AREA_BANNER_DUR, "{s}", .{g.w.Name});
+        g.setBanner(AREA_BANNER_DUR, "{s}", .{g.map.name.slice()});
         return g;
     }
 
@@ -366,7 +366,7 @@ pub const Game = struct {
         g.w = mapmod.toWorld(&g.map, g.areaIndex == g.lastArea);
         g.torch.setLightColor(g.map.light); // each floor gets its own night
         g.sceneMesh.rebuild(&g.w);
-        g.fog.reset(g.w.Half); // each area is a fresh layout: forget the old exploration
+        g.fog.reset(g.w.HalfW, g.w.HalfD); // each area is a fresh layout: forget the old exploration
         g.fog.sync(); // upload the cleared grid now: a restart from dead/victory draws
         // this frame WITHOUT running updatePlaying, so it would otherwise render the new
         // area against the previous area's still-resident fog mask for one frame.
@@ -382,7 +382,7 @@ pub const Game = struct {
         g.p.Mana = g.p.MaxMana;
         g.rig.snap(g.p.Pos);
         g.torchXZ = torchFlameWorld(&g.p); // snap the light with the teleport
-        g.setBanner(AREA_BANNER_DUR, "{s}", .{g.w.Name});
+        g.setBanner(AREA_BANNER_DUR, "{s}", .{g.map.name.slice()});
         g.setToast("", .{});
     }
 
@@ -1236,12 +1236,12 @@ pub fn startPlaytest(g: *Game) void {
     g.lootList.clearRetainingCapacity();
     g.parts.clear();
     g.w.PortalOpen = false;
-    g.fog.reset(g.w.Half);
+    g.fog.reset(g.w.HalfW, g.w.HalfD);
     g.fog.sync();
     g.spawnPacks();
     g.rig.snap(g.p.Pos);
     g.torchXZ = torchFlameWorld(&g.p);
-    g.setBanner(AREA_BANNER_DUR, "Playtest: {s}", .{g.w.Name});
+    g.setBanner(AREA_BANNER_DUR, "Playtest: {s}", .{g.map.name.slice()});
     g.scene = .playing;
 }
 
@@ -1392,17 +1392,19 @@ fn drawHeroFX(p: *const Player, t: f32) void {
 }
 
 pub fn drawWalls(w: *const world.World) void {
-    const h = w.Half;
+    const hw = w.HalfW;
+    const hd = w.HalfD;
     const wallH = 4.0;
     const t = 1.2;
     const col = w.Accent;
+    // North/south walls run the WIDTH; east/west run the DEPTH (rect arenas).
     const segs = [_]rl.Vector3{
-        v3(0, wallH / 2, -h), v3(0, wallH / 2, h),
-        v3(-h, wallH / 2, 0), v3(h, wallH / 2, 0),
+        v3(0, wallH / 2, -hd), v3(0, wallH / 2, hd),
+        v3(-hw, wallH / 2, 0), v3(hw, wallH / 2, 0),
     };
     const sizes = [_]rl.Vector3{
-        v3(h * 2 + t, wallH, t), v3(h * 2 + t, wallH, t),
-        v3(t, wallH, h * 2 + t), v3(t, wallH, h * 2 + t),
+        v3(hw * 2 + t, wallH, t), v3(hw * 2 + t, wallH, t),
+        v3(t, wallH, hd * 2 + t), v3(t, wallH, hd * 2 + t),
     };
     // Each rampart gets a stone profile instead of one extruded slab: a paler
     // capstone course overhanging the top, and a darker plinth at the foot.
@@ -1417,13 +1419,18 @@ pub fn drawWalls(w: *const world.World) void {
     // walking the arena edge you pass tower after tower instead of one endless slab.
     const pier = lerpColor(col, rl.Color.black, 0.18);
     const pierCap = lerpColor(cap, rl.Color.white, 0.06);
-    var px: f32 = -h;
-    while (px <= h + 0.1) : (px += 9.0) {
-        for ([_]f32{ -h, h }) |edge| {
+    var px: f32 = -hw;
+    while (px <= hw + 0.1) : (px += 9.0) {
+        for ([_]f32{ -hd, hd }) |edge| {
             rl.drawCubeV(v3(px, (wallH + 0.5) / 2.0, edge), v3(1.7, wallH + 0.5, t + 0.7), pier);
             rl.drawCubeV(v3(px, wallH + 0.66, edge), v3(2.0, 0.32, t + 1.0), pierCap);
-            rl.drawCubeV(v3(edge, (wallH + 0.5) / 2.0, px), v3(t + 0.7, wallH + 0.5, 1.7), pier);
-            rl.drawCubeV(v3(edge, wallH + 0.66, px), v3(t + 1.0, 0.32, 2.0), pierCap);
+        }
+    }
+    var pz: f32 = -hd;
+    while (pz <= hd + 0.1) : (pz += 9.0) {
+        for ([_]f32{ -hw, hw }) |edge| {
+            rl.drawCubeV(v3(edge, (wallH + 0.5) / 2.0, pz), v3(t + 0.7, wallH + 0.5, 1.7), pier);
+            rl.drawCubeV(v3(edge, wallH + 0.66, pz), v3(t + 1.0, 0.32, 2.0), pierCap);
         }
     }
 }
@@ -1477,7 +1484,8 @@ fn monsterHeadFwd(m: *const Monster) f32 {
 // Body + per-kind silhouette. Every appendage is drawn here (not in the FX pass) so
 // it exists in BOTH the shadow depth pass and the lit pass: horns and arms cast.
 // The whole (ground-relative) body is lifted by the monster's terrain height.
-fn drawMonsterBody(m: *const Monster) void {
+// (pub: the editor draws statuesque encounter previews with the same bodies.)
+pub fn drawMonsterBody(m: *const Monster) void {
     rl.gl.rlPushMatrix();
     defer rl.gl.rlPopMatrix();
     rl.gl.rlTranslatef(0, m.Pos.y, 0);
@@ -1877,13 +1885,14 @@ fn drawFireflies(g: *const Game, t: f32) void {
     };
     const col = cols[g.areaIndex % cols.len];
     const n: usize = if (g.areaIndex == 3) 26 else 16; // the Dark Wood teems
-    const half = g.w.Half - 4;
+    const halfW = g.w.HalfW - 4;
+    const halfD = g.w.HalfD - 4;
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const iff: f32 = @floatFromInt(i);
         // Golden-ratio scatter: even coverage with no two seats aligned.
-        const hx = (@mod(iff * 0.7548777, 1.0) * 2 - 1) * half;
-        const hz = (@mod(iff * 0.5698403, 1.0) * 2 - 1) * half;
+        const hx = (@mod(iff * 0.7548777, 1.0) * 2 - 1) * halfW;
+        const hz = (@mod(iff * 0.5698403, 1.0) * 2 - 1) * halfD;
         const pos = v3(
             hx + sinf(t * 0.31 + iff * 2.1) * 1.8,
             0.65 + 0.45 * sinf(t * 0.23 + iff * 1.3) + @mod(iff, 3.0) * 0.3,
@@ -1945,14 +1954,14 @@ fn drawWorld(g: *Game) void {
     rl.clearBackground(rgba(16, 16, 22, 255));
     g.torch.applyUniforms(cam, lp);
     g.torch.applyFireUniforms(fp);
-    g.torch.applyFogUniforms(.{ .texId = @intCast(g.fog.tex.id), .half = g.fog.half });
+    g.torch.applyFogUniforms(.{ .texId = @intCast(g.fog.tex.id), .halfW = g.fog.halfW, .halfD = g.fog.halfD });
     rl.beginMode3D(cam);
     g.torch.beginScene();
     // beginScene bound the shadow map on slot 10 and left it active; reset to 0 so
     // immediate-mode texture0 binds land on slot 0, not on the shadow map.
     rl.gl.rlActiveTextureSlot(0);
     g.sceneMesh.drawScene();
-    rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(g.w.Half * 2, g.w.Half * 2), g.w.Ground);
+    rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(g.w.HalfW * 2, g.w.HalfD * 2), g.w.Ground);
     drawWalls(&g.w);
     drawMonstersLit(ms, lightGround, lp.radius, fp);
     if (drawHero) drawHeroBody(&g.p);

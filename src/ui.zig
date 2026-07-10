@@ -20,6 +20,12 @@ pub const Ctx = struct {
     down: bool, // LMB held
     anyHot: bool = false, // pointer over any widget (accumulated)
 
+    // Deferred tooltip: whatever hovered LAST this frame wins, drawn on top of
+    // everything by drawTip. Copied into a buffer so formatted tips can use a
+    // caller's stack storage.
+    tipBuf: [96]u8 = undefined,
+    tipLen: usize = 0,
+
     pub fn begin() Ctx {
         return .{
             .mouse = rl.getMousePosition(),
@@ -33,7 +39,38 @@ pub const Ctx = struct {
         if (h) ctx.anyHot = true;
         return h;
     }
+
+    pub fn setTip(ctx: *Ctx, text: []const u8) void {
+        const n = @min(text.len, ctx.tipBuf.len - 1);
+        @memcpy(ctx.tipBuf[0..n], text[0..n]);
+        ctx.tipLen = n;
+    }
 };
+
+// Attach a tooltip to any rectangle (labels, steppers, the minimap...).
+pub fn tipFor(ctx: *Ctx, r: rl.Rectangle, text: [:0]const u8) void {
+    if (rl.checkCollisionPointRec(ctx.mouse, r)) ctx.setTip(text);
+}
+
+// A button that explains itself on hover.
+pub fn buttonTip(ctx: *Ctx, r: rl.Rectangle, label: [:0]const u8, size: i32, active: bool, tp: [:0]const u8) bool {
+    if (rl.checkCollisionPointRec(ctx.mouse, r)) ctx.setTip(tp);
+    return button(ctx, r, label, size, active);
+}
+
+// Draw the pending tooltip at the cursor, clamped on-screen. Call LAST.
+pub fn drawTip(ctx: *Ctx) void {
+    if (ctx.tipLen == 0) return;
+    ctx.tipBuf[ctx.tipLen] = 0;
+    const s: [:0]const u8 = ctx.tipBuf[0..ctx.tipLen :0];
+    const w = hudx.textW(s, 15);
+    var x: i32 = @as(i32, @intFromFloat(ctx.mouse.x)) + 16;
+    var y: i32 = @as(i32, @intFromFloat(ctx.mouse.y)) + 22;
+    x = @min(x, rl.getScreenWidth() - w - 24);
+    y = @min(y, rl.getScreenHeight() - 36);
+    hudx.pill(x - 8, y - 4, w + 16, 27, withAlpha(theme.ink, 235));
+    hudx.text(s, x, y, 15, rgba(235, 222, 198, 255));
+}
 
 pub fn rect(x: i32, y: i32, w: i32, h: i32) rl.Rectangle {
     return .{ .x = @floatFromInt(x), .y = @floatFromInt(y), .width = @floatFromInt(w), .height = @floatFromInt(h) };

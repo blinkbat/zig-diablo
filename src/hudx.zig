@@ -701,7 +701,7 @@ fn drawDeath(g: *Game) void {
     emberField(g.elapsed, 14, rgba(200, 40, 30, 160), true);
     glowCentered("YOU HAVE DIED", cy - 80, 70, rgba(225, 45, 40, 255), rgba(70, 5, 5, 130));
     var buf: [128]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, "You reached {s} at level {d} with {d} kills.", .{ g.w.Name, g.p.Level, g.kills }) catch "";
+    const s = std.fmt.bufPrintZ(&buf, "You reached {s} at level {d} with {d} kills.", .{ g.map.name.slice(), g.p.Level, g.kills }) catch "";
     centered(s, cy + 10, 22, rgba(230, 210, 200, 255));
     const pulse = mathx.u8f(200 + 55 * sinf(g.elapsed * 2.5));
     centered("Press R to start a new game", cy + 60, 26, withAlpha(rgba(255, 230, 160, 255), pulse));
