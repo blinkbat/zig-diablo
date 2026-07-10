@@ -55,6 +55,14 @@ pub const Monster = struct {
     pub fn alive(m: *const Monster) bool {
         return m.HP > 0 and !m.dying;
     }
+
+    /// Telegraph progress 0→1 as a committed strike winds up (0 when not winding
+    /// up). Shared by the body pose, the flashing tint, and the FX ring/beam so the
+    /// drawn telegraph and the strike timing can never drift apart.
+    pub fn windupProgress(m: *const Monster) f32 {
+        if (m.windup <= 0 or m.windupTime <= 0) return 0;
+        return 1 - m.windup / m.windupTime;
+    }
 };
 
 // makeMonster builds a monster of the given kind, scaled by difficulty tier.
@@ -134,8 +142,8 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
 }
 
 // makeBoss promotes a brute into the area's champion. The name is supplied by the
-// area definition (world.areaDef.boss), so there's no parallel tier->name table to
-// keep in lockstep with the area list.
+// caller (the map's `boss:` field), so there's no parallel tier->name table to
+// keep in lockstep.
 pub fn makeBoss(tier: i32, name: []const u8, rng: *Rng, pos: rl.Vector3) Monster {
     var m = makeMonster(.brute, tier, rng, pos);
     m.boss = true;

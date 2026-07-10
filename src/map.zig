@@ -285,7 +285,10 @@ pub fn load(path: []const u8) LoadError!Map {
 
         if (std.mem.eql(u8, key, "version")) {
             const ver = nextF32(&it) catch return fail(lineNo, line, "bad version");
-            if (@as(i32, @intFromFloat(ver)) > FORMAT_VERSION) return fail(lineNo, line, "map is from a newer format version");
+            // Compare as a float (never @intFromFloat an unvalidated parse — a huge,
+            // inf, or NaN version would make that cast illegal behavior). The negated
+            // form also rejects NaN, which is never a version we support.
+            if (!(ver <= @as(f32, @floatFromInt(FORMAT_VERSION)))) return fail(lineNo, line, "map is from a newer format version");
             sawVersion = true;
         } else if (std.mem.eql(u8, key, "name")) {
             m.name.set(rest);

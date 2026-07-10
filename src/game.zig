@@ -925,7 +925,7 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
     if (m.Ranged) {
         // Kite: hold at range, back off if the player gets close, then shoot.
         if (toPlayer > m.atkRange * 0.85) {
-            moveMonster(g, m, dirXZ(m.Pos, g.p.Pos), dt);
+            moveMonster(g, m, m.Facing, dt); // == dirXZ(m.Pos, g.p.Pos), already set above
         } else if (toPlayer < m.atkRange * 0.35) {
             moveMonster(g, m, dirXZ(g.p.Pos, m.Pos), dt * 0.7);
         }
@@ -937,7 +937,7 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
     // at someone standing a cliff above or below; keep pressing toward them (which
     // funnels the pack to the ramp) instead of swinging at a wall of stone.
     if (toPlayer > m.atkRange + g.p.Radius or @abs(m.Pos.y - g.p.Pos.y) >= 1.0) {
-        moveMonster(g, m, dirXZ(m.Pos, g.p.Pos), dt);
+        moveMonster(g, m, m.Facing, dt); // == dirXZ(m.Pos, g.p.Pos), already set above
     } else if (m.atkCD <= 0) {
         m.windup = m.windupTime;
     }
@@ -1450,7 +1450,7 @@ const PibGrip = struct { hand: rl.Vector3, raise: f32, f: rl.Vector3 };
 fn pibGrip(m: *const Monster) PibGrip {
     const f = mathx.orFacing(m.Facing, 0, 1);
     const right = mathx.perpXZ(f);
-    const raise: f32 = if (m.windup > 0) (1 - m.windup / m.windupTime) * 0.7 else 0;
+    const raise: f32 = m.windupProgress() * 0.7;
     return .{
         .hand = v3(m.Pos.x + right.x * m.Radius * 0.95 + f.x * 0.15, MONSTER_TORSO_BASE + 0.42 + monsterBob(m) + raise, m.Pos.z + right.z * m.Radius * 0.95 + f.z * 0.15),
         .raise = raise,
@@ -1497,7 +1497,7 @@ pub fn drawMonsterBody(m: *const Monster) void {
     } else if (m.hitFlash > 0) {
         col = lerpColor(col, rl.Color.white, 0.75);
     } else if (m.windup > 0) {
-        col = lerpColor(col, rgba(255, 80, 40, 255), 0.35 + 0.45 * (1 - m.windup / m.windupTime));
+        col = lerpColor(col, rgba(255, 80, 40, 255), 0.35 + 0.45 * m.windupProgress());
     }
     const htop = (m.Height - 0.5) * shrink;
     const x = m.Pos.x;
@@ -1587,7 +1587,7 @@ pub fn drawMonsterBody(m: *const Monster) void {
             // While the shot telegraphs, an arrow sits nocked and draws back — the
             // red beam says a shot is coming; the arrow says from where.
             if (m.windup > 0) {
-                const pull = 1 - m.windup / m.windupTime;
+                const pull = m.windupProgress();
                 const nock = v3(bh.x - f.x * (0.2 + 0.3 * pull), bh.y, bh.z - f.z * (0.2 + 0.3 * pull));
                 rl.drawCylinderEx(nock, v3(bh.x + f.x * 0.3, bh.y, bh.z + f.z * 0.3), 0.03, 0.03, 4, rgba(140, 108, 70, 255));
                 rl.drawCylinderEx(v3(bh.x + f.x * 0.3, bh.y, bh.z + f.z * 0.3), v3(bh.x + f.x * 0.42, bh.y, bh.z + f.z * 0.42), 0.055, 0.0, 4, rgba(225, 220, 200, 255));
@@ -1691,7 +1691,7 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
             rl.drawCircle3D(v3(m.Pos.x, 0.06, m.Pos.z), m.Radius + 0.55 + 0.1 * sinf(t * 3), v3(1, 0, 0), 90, rgba(255, 60, 60, 90));
         }
         if (m.windup > 0) {
-            const tp = 1 - m.windup / m.windupTime;
+            const tp = m.windupProgress();
             const a = mathx.u8f(clampF(110 + 130 * tp, 0, 255));
             if (m.Ranged) {
                 // Aim the threat beam at the player's true elevation (compensating
@@ -1710,7 +1710,7 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
         // whenever the pig is in view, flaring hard as the strike comes down. The
         // knife IS the pib's telegraph — you should never lose track of it.
         if (m.Kind == .fallen) {
-            const tp = if (m.windup > 0) 1 - m.windup / m.windupTime else 0;
+            const tp = m.windupProgress();
             const tip = pibKnifeTip(pibGrip(m));
             const tw = 0.7 + 0.3 * sinf(t * 9 + m.Pos.x * 3 + m.Pos.z * 5); // idle twinkle
             sphere(tip, (0.035 + 0.07 * tp) * tw, rgba(255, 255, 245, 255));

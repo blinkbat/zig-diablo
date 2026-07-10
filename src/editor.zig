@@ -345,11 +345,11 @@ pub const Editor = struct {
     }
 
     fn decorKind(ed: *const Editor) world.DecorKind {
-        return @enumFromInt(@min(ed.brush(), 3));
+        return @enumFromInt(@min(ed.brush(), lastVariant(world.DecorKind)));
     }
 
     fn propKind(ed: *const Editor) world.ObstacleKind {
-        return @enumFromInt(@min(ed.brush(), 2));
+        return @enumFromInt(@min(ed.brush(), lastVariant(world.ObstacleKind)));
     }
 
     fn entityBrush(ed: *const Editor) EntityBrush {
@@ -363,9 +363,16 @@ pub const Editor = struct {
     }
 
     fn packKind(ed: *const Editor) monster.MonsterKind {
-        return @enumFromInt(@min(ed.brush(), 3));
+        return @enumFromInt(@min(ed.brush(), lastVariant(monster.MonsterKind)));
     }
 };
+
+// Highest valid @intFromEnum for T — the brush tables end in a non-kind entry
+// (the eraser), so the raw brush index is clamped to a real kind through this
+// instead of a hand-copied max that drifts when a kind is added.
+fn lastVariant(comptime T: type) usize {
+    return @typeInfo(T).@"enum".fields.len - 1;
+}
 
 // ---- Crash-recovery autosave (crawler: a non-.map extension so it never shows
 // in Open or the campaign; never touches the real file; cleared on save/exit) ----
@@ -420,6 +427,12 @@ fn mousePoint(g: *Game) ?rl.Vector3 {
 // CENTERS, terrain rects on the LINES. Decor never snaps (dressing shouldn't
 // march in rows), and holding Alt places anything freely.
 const GRID = 2.0;
+
+// Keep placed content and the fixed anchors inside the arena wall when the arena
+// shrinks or a paste lands near the edge. Objects (props/decor/packs/features) sit
+// a little closer to the wall than the spawn/portal/boss anchors do.
+const CONTENT_INSET = 1.2;
+const ANCHOR_INSET = 2.0;
 
 fn freePlace() bool {
     return rl.isKeyDown(.left_alt) or rl.isKeyDown(.right_alt);
@@ -632,8 +645,8 @@ fn pasteAt(g: *Game, at: rl.Vector3) void {
     if (!clipHas) return ed.status("clipboard is empty (Ctrl+C first)", .{});
     bankUndo(g);
     const m = &g.map;
-    const limW = m.halfW - 1.2;
-    const limD = m.halfD - 1.2;
+    const limW = m.halfW - CONTENT_INSET;
+    const limD = m.halfD - CONTENT_INSET;
     var dropped: usize = 0;
     for (clipProps[0..clipPropN]) |o| {
         if (m.obstacle_count >= world.MAX_OBSTACLES) {
@@ -678,8 +691,8 @@ fn moveSelection(g: *Game, delta: rl.Vector3) void {
     const ed = &g.ed;
     const s = ed.sel orelse return;
     const m = &g.map;
-    const limW = m.halfW - 1.2;
-    const limD = m.halfD - 1.2;
+    const limW = m.halfW - CONTENT_INSET;
+    const limD = m.halfD - CONTENT_INSET;
     for (m.obstacles[0..m.obstacle_count]) |*o| {
         if (s.contains(o.Pos.x, o.Pos.z)) {
             o.Pos.x = clampF(o.Pos.x + delta.x, -limW, limW);
@@ -711,14 +724,14 @@ fn moveSelection(g: *Game, delta: rl.Vector3) void {
 fn eraseFeatureAt(g: *Game, p: rl.Vector3) bool {
     const m = &g.map;
     for (m.ramps[0..m.ramp_count], 0..) |r, i| {
-        if (p.x >= r.minX and p.x <= r.maxX and p.z >= r.minZ and p.z <= r.maxZ) {
+        if (r.contains(p.x, p.z)) {
             m.removeRamp(i);
             markDirty(g);
             return true;
         }
     }
     for (m.ledges[0..m.ledge_count], 0..) |l, i| {
-        if (p.x >= l.minX and p.x <= l.maxX and p.z >= l.minZ and p.z <= l.maxZ) {
+        if (l.contains(p.x, p.z)) {
             m.removeLedge(i);
             markDirty(g);
             return true;
@@ -1069,7 +1082,7 @@ pub fn update(g: *Game, dt: f32) void {
         ed.setBrush(@intCast(@mod(cur + d, @as(i32, @intCast(n)))));
     }
     if (rl.isKeyPressed(.r) and !ctrl) { // Ctrl+R is recovery-restore, not rise
-        ed.rise = @enumFromInt((@intFromEnum(ed.rise) + 1) % 4);
+        ed.rise = @enumFromInt((@intFromEnum(ed.rise) + 1) % @typeInfo(world.RampRise).@"enum".fields.len);
         ed.status("ramp rises {s}", .{@tagName(ed.rise)});
     }
     if (rl.isKeyPressed(.m)) {
@@ -1448,12 +1461,12 @@ fn drawCursorAids(g: *Game) void {
         if (ed.layer == .floor) {
             // Highlight the feature rect the click would remove.
             for (g.map.ramps[0..g.map.ramp_count]) |r| {
-                if (raw.x >= r.minX and raw.x <= r.maxX and raw.z >= r.minZ and raw.z <= r.maxZ) {
+                if (r.contains(raw.x, raw.z)) {
                     rl.drawCubeWiresV(v3((r.minX + r.maxX) / 2, r.h / 2, (r.minZ + r.maxZ) / 2), v3(r.maxX - r.minX, r.h, r.maxZ - r.minZ), rgba(255, 80, 60, 230));
                 }
             }
             for (g.map.ledges[0..g.map.ledge_count]) |l| {
-                if (raw.x >= l.minX and raw.x <= l.maxX and raw.z >= l.minZ and raw.z <= l.maxZ) {
+                if (l.contains(raw.x, raw.z)) {
                     rl.drawCubeWiresV(v3((l.minX + l.maxX) / 2, l.h / 2, (l.minZ + l.maxZ) / 2), v3(l.maxX - l.minX, l.h, l.maxZ - l.minZ), rgba(255, 80, 60, 230));
                 }
             }
@@ -1486,11 +1499,10 @@ fn drawCursorAids(g: *Game) void {
 
     rl.drawCircle3D(v3(p.x, p.y + 0.05, p.z), 0.5, v3(1, 0, 0), 90, rgba(255, 245, 200, 200));
     if (p.x != raw.x or p.z != raw.z) {
-        const cx = @floor(raw.x / GRID) * GRID + GRID / 2;
-        const cz = @floor(raw.z / GRID) * GRID + GRID / 2;
-        rl.drawCubeWiresV(v3(cx, p.y + 0.03, cz), v3(GRID, 0.0, GRID), rgba(255, 245, 200, 120));
+        const c = snapCenter(raw);
+        rl.drawCubeWiresV(v3(c.x, p.y + 0.03, c.z), v3(GRID, 0.0, GRID), rgba(255, 245, 200, 120));
     }
-    if (ed.mirrorX and @abs(p.x) > 0.9) {
+    if (wantMirror(ed, p)) {
         const mp = mirrorOf(p);
         rl.drawCircle3D(v3(mp.x, g.w.groundY(mp.x, mp.z) + 0.05, mp.z), 0.5, v3(1, 0, 0), 90, rgba(160, 220, 255, 160));
     }
@@ -1584,14 +1596,14 @@ fn hoverWorldTip(g: *Game, ctx: *ui.Ctx) void {
         }
     }
     for (m.ramps[0..m.ramp_count]) |r| {
-        if (p.x >= r.minX and p.x <= r.maxX and p.z >= r.minZ and p.z <= r.maxZ) {
+        if (r.contains(p.x, p.z)) {
             const s = std.fmt.bufPrint(&buf, "ramp h {d:.1} rises {s} - RMB to re-height", .{ r.h, @tagName(r.rise) }) catch return;
             ctx.setTip(s);
             return;
         }
     }
     for (m.ledges[0..m.ledge_count]) |l| {
-        if (p.x >= l.minX and p.x <= l.maxX and p.z >= l.minZ and p.z <= l.maxZ) {
+        if (l.contains(p.x, p.z)) {
             const s = std.fmt.bufPrint(&buf, "ledge h {d:.1} - RMB to re-height", .{l.h}) catch return;
             ctx.setTip(s);
             return;
@@ -1760,13 +1772,13 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
 // Keep authored anchors AND terrain rects inside a shrunken arena; features that
 // collapse below a usable span are dropped rather than left as slivers.
 fn clampContents(m: *mapmod.Map) void {
-    const limW = m.halfW - 2;
-    const limD = m.halfD - 2;
+    const limW = m.halfW - ANCHOR_INSET;
+    const limD = m.halfD - ANCHOR_INSET;
     m.spawn = v3(clampF(m.spawn.x, -limW, limW), 0, clampF(m.spawn.z, -limD, limD));
     m.portal = v3(clampF(m.portal.x, -limW, limW), 0, clampF(m.portal.z, -limD, limD));
     m.bossPos = v3(clampF(m.bossPos.x, -limW, limW), 0, clampF(m.bossPos.z, -limD, limD));
-    const flimW = m.halfW - 1.2;
-    const flimD = m.halfD - 1.2;
+    const flimW = m.halfW - CONTENT_INSET;
+    const flimD = m.halfD - CONTENT_INSET;
     var i: usize = m.ledge_count;
     while (i > 0) {
         i -= 1;
@@ -1925,14 +1937,14 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
     var featKind: enum { none, ledge, ramp } = .none;
     var featIdx: usize = 0;
     for (m.ramps[0..m.ramp_count], 0..) |r0, i| {
-        if (p.x >= r0.minX and p.x <= r0.maxX and p.z >= r0.minZ and p.z <= r0.maxZ) {
+        if (r0.contains(p.x, p.z)) {
             featKind = .ramp;
             featIdx = i;
         }
     }
     if (featKind == .none) {
         for (m.ledges[0..m.ledge_count], 0..) |l, i| {
-            if (p.x >= l.minX and p.x <= l.maxX and p.z >= l.minZ and p.z <= l.maxZ) {
+            if (l.contains(p.x, p.z)) {
                 featKind = .ledge;
                 featIdx = i;
             }

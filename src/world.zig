@@ -48,12 +48,22 @@ pub const MAX_DECOR = 512;
 // Ramp is a sloped rectangle joining the floor to a ledge edge.
 pub const STEP_MAX = 0.6; // tallest height difference feet can walk over
 
+// Point-in-AABB in the XZ plane — the ledge/ramp footprint test that groundY,
+// onFeature, picking, and the editor's erase/hover/context all share.
+pub fn inRect(minX: f32, maxX: f32, minZ: f32, maxZ: f32, x: f32, z: f32) bool {
+    return x >= minX and x <= maxX and z >= minZ and z <= maxZ;
+}
+
 pub const Ledge = struct {
     minX: f32,
     maxX: f32,
     minZ: f32,
     maxZ: f32,
     h: f32,
+
+    pub fn contains(l: Ledge, x: f32, z: f32) bool {
+        return inRect(l.minX, l.maxX, l.minZ, l.maxZ, x, z);
+    }
 };
 
 // Which way a ramp's slope climbs: height is 0 at the opposite edge and h here.
@@ -68,13 +78,22 @@ pub const Ramp = struct {
     h: f32,
     rise: RampRise,
 
+    pub fn contains(r: Ramp, x: f32, z: f32) bool {
+        return inRect(r.minX, r.maxX, r.minZ, r.maxZ, x, z);
+    }
+
     // The ramp's top surface as y = kx*x + kz*z + c (it's a plane).
+    // A degenerate (zero-extent) rect on the rise axis would divide by zero and
+    // spread inf/NaN through groundY and picking — the editor enforces a min span,
+    // but a hand-edited map can't, so a collapsed ramp reads as a flat shelf at h.
     pub fn planeCoeffs(r: Ramp) [3]f32 {
+        const dx = r.maxX - r.minX;
+        const dz = r.maxZ - r.minZ;
         return switch (r.rise) {
-            .xpos => .{ r.h / (r.maxX - r.minX), 0, -r.h * r.minX / (r.maxX - r.minX) },
-            .xneg => .{ -r.h / (r.maxX - r.minX), 0, r.h * r.maxX / (r.maxX - r.minX) },
-            .zpos => .{ 0, r.h / (r.maxZ - r.minZ), -r.h * r.minZ / (r.maxZ - r.minZ) },
-            .zneg => .{ 0, -r.h / (r.maxZ - r.minZ), r.h * r.maxZ / (r.maxZ - r.minZ) },
+            .xpos => if (dx > 1e-4) .{ r.h / dx, 0, -r.h * r.minX / dx } else .{ 0, 0, r.h },
+            .xneg => if (dx > 1e-4) .{ -r.h / dx, 0, r.h * r.maxX / dx } else .{ 0, 0, r.h },
+            .zpos => if (dz > 1e-4) .{ 0, r.h / dz, -r.h * r.minZ / dz } else .{ 0, 0, r.h },
+            .zneg => if (dz > 1e-4) .{ 0, -r.h / dz, r.h * r.maxZ / dz } else .{ 0, 0, r.h },
         };
     }
 };
@@ -120,13 +139,13 @@ pub const World = struct {
     /// against a ledge edge), everything else is the flat floor at 0.
     pub fn groundY(self: *const World, x: f32, z: f32) f32 {
         for (self.rmp()) |r| {
-            if (x >= r.minX and x <= r.maxX and z >= r.minZ and z <= r.maxZ) {
+            if (r.contains(x, z)) {
                 const k = r.planeCoeffs();
                 return k[0] * x + k[1] * z + k[2];
             }
         }
         for (self.led()) |l| {
-            if (x >= l.minX and x <= l.maxX and z >= l.minZ and z <= l.maxZ) return l.h;
+            if (l.contains(x, z)) return l.h;
         }
         return 0;
     }
@@ -140,10 +159,10 @@ pub const World = struct {
     /// worldgen scatter off the terrain features).
     pub fn onFeature(self: *const World, x: f32, z: f32) bool {
         for (self.rmp()) |r| {
-            if (x >= r.minX and x <= r.maxX and z >= r.minZ and z <= r.maxZ) return true;
+            if (r.contains(x, z)) return true;
         }
         for (self.led()) |l| {
-            if (x >= l.minX and x <= l.maxX and z >= l.minZ and z <= l.maxZ) return true;
+            if (l.contains(x, z)) return true;
         }
         return false;
     }
@@ -208,7 +227,7 @@ pub const World = struct {
         }
         for (self.led()) |l| {
             if (rayAtPlane(ray, 0, 0, l.h)) |hit| {
-                if (hit.t < bestT and hit.p.x >= l.minX and hit.p.x <= l.maxX and hit.p.z >= l.minZ and hit.p.z <= l.maxZ) {
+                if (hit.t < bestT and l.contains(hit.p.x, hit.p.z)) {
                     bestT = hit.t;
                     best = hit.p;
                 }
@@ -217,7 +236,7 @@ pub const World = struct {
         for (self.rmp()) |r| {
             const k = r.planeCoeffs();
             if (rayAtPlane(ray, k[0], k[1], k[2])) |hit| {
-                if (hit.t < bestT and hit.p.x >= r.minX and hit.p.x <= r.maxX and hit.p.z >= r.minZ and hit.p.z <= r.maxZ) {
+                if (hit.t < bestT and r.contains(hit.p.x, hit.p.z)) {
                     bestT = hit.t;
                     best = hit.p;
                 }
