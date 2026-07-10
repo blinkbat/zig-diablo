@@ -19,11 +19,17 @@ pub const Projectile = struct {
 pub const fireboltSpeed = 19.0;
 pub const arrowSpeed = 13.0;
 
+// Muzzle height above the shooter's ground point. The SAME offset feeds the spawn
+// position below AND the caller's aimYVel (game.zig), so the arc is computed from
+// the exact height the bolt leaves — change it here and both move together.
+pub const fireboltMuzzleDY = 1.1;
+pub const arrowMuzzleDY = 1.2;
+
 // newFirebolt is the player's right-click spell. `from` carries the caster's
 // ground height; `yVel` slopes the flight toward a raised or sunken target.
 pub fn newFirebolt(from: rl.Vector3, dir: rl.Vector3, dmg: f32, yVel: f32) Projectile {
     return .{
-        .Pos = v3(from.x, from.y + 1.1, from.z),
+        .Pos = v3(from.x, from.y + fireboltMuzzleDY, from.z),
         .Vel = v3(dir.x * fireboltSpeed, yVel, dir.z * fireboltSpeed),
         .Damage = dmg,
         .Radius = 0.45,
@@ -36,7 +42,7 @@ pub fn newFirebolt(from: rl.Vector3, dir: rl.Vector3, dmg: f32, yVel: f32) Proje
 // newArrow is the skeleton archer's attack.
 pub fn newArrow(from: rl.Vector3, dir: rl.Vector3, dmg: f32, yVel: f32) Projectile {
     return .{
-        .Pos = v3(from.x, from.y + 1.2, from.z),
+        .Pos = v3(from.x, from.y + arrowMuzzleDY, from.z),
         .Vel = v3(dir.x * arrowSpeed, yVel, dir.z * arrowSpeed),
         .Damage = dmg,
         .Radius = 0.35,

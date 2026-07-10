@@ -593,7 +593,7 @@ fn castFirebolt(g: *Game) void {
     p.Mana -= p.spellCost;
     p.castCD = CAST_RATE;
     const dmg = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(8)));
-    g.projs.add(projectile.newFirebolt(p.Pos, dir, dmg, aimYVel(p.Pos.y + 1.1, g.mouseGround.y + 0.9, distXZ(p.Pos, g.mouseGround), projectile.fireboltSpeed)));
+    g.projs.add(projectile.newFirebolt(p.Pos, dir, dmg, aimYVel(p.Pos.y + projectile.fireboltMuzzleDY, g.mouseGround.y + 0.9, distXZ(p.Pos, g.mouseGround), projectile.fireboltSpeed)));
     g.rumble.play(rumble.cast);
 }
 
@@ -949,7 +949,7 @@ fn resolveMonsterAttack(g: *Game, m: *Monster) void {
     if (m.Ranged) {
         // Arrows angle up or down to the player's actual elevation — a rampart is
         // cover from the cliff side, never from an archer with a clean line.
-        g.projs.add(projectile.newArrow(m.Pos, dirXZ(m.Pos, g.p.Pos), dmg, aimYVel(m.Pos.y + 1.2, g.p.Pos.y + 1.0, distXZ(m.Pos, g.p.Pos), projectile.arrowSpeed)));
+        g.projs.add(projectile.newArrow(m.Pos, dirXZ(m.Pos, g.p.Pos), dmg, aimYVel(m.Pos.y + projectile.arrowMuzzleDY, g.p.Pos.y + 1.0, distXZ(m.Pos, g.p.Pos), projectile.arrowSpeed)));
         return;
     }
     // Use the module radius constant — the SAME source the drawn telegraph ring reads
@@ -2022,7 +2022,7 @@ pub fn run(shot: bool) void {
         g.spawn(monster.makeMonster(.zombie, 0, &g.rng, mathx.ground(23.5, 19)));
         const boltFrom = v3(31.5, 2.4, 20);
         const boltTo = v3(21, 0, 13.5);
-        g.projs.add(projectile.newFirebolt(boltFrom, dirXZ(boltFrom, boltTo), 20, aimYVel(2.4 + 1.1, 0.9, distXZ(boltFrom, boltTo), projectile.fireboltSpeed)));
+        g.projs.add(projectile.newFirebolt(boltFrom, dirXZ(boltFrom, boltTo), 20, aimYVel(2.4 + projectile.fireboltMuzzleDY, 0.9, distXZ(boltFrom, boltTo), projectile.fireboltSpeed)));
     }
     var frame: i32 = 0;
     var shotIdx: usize = 0;

@@ -353,11 +353,15 @@ pub const Editor = struct {
     }
 
     fn entityBrush(ed: *const Editor) EntityBrush {
-        return switch (ed.brush()) {
-            0, 1, 2, 3 => .pack,
-            4 => .boss,
-            5 => .spawn,
-            6 => .portal,
+        // The first N brushes are the N monster-kind packs; tie that boundary to the
+        // enum (not a literal 0..3) so adding a kind can't turn a pack into the boss.
+        const nPacks = @typeInfo(monster.MonsterKind).@"enum".fields.len;
+        const b = ed.brush();
+        if (b < nPacks) return .pack;
+        return switch (b - nPacks) {
+            0 => .boss,
+            1 => .spawn,
+            2 => .portal,
             else => .erase,
         };
     }
@@ -433,6 +437,25 @@ const GRID = 2.0;
 // a little closer to the wall than the spawn/portal/boss anchors do.
 const CONTENT_INSET = 1.2;
 const ANCHOR_INSET = 2.0;
+
+// Editor tuning ranges. Each min/max/step is a single source shared by the [ / ]
+// hotkeys AND the properties-panel stepper for the same value, so the two adjust
+// paths can never clamp to different bounds.
+const FEATURE_H_MIN = 1.2;
+const FEATURE_H_MAX = 4.0;
+const FEATURE_H_STEP = 0.4;
+const BRUSH_R_MIN = 0.5;
+const BRUSH_R_MAX = 4.0;
+const BRUSH_R_STEP = 0.5;
+// Arena half-extent authoring range (New Map + the width/depth steppers). Narrower
+// than map.sanitize's load-time tolerance on purpose: the loader accepts hand-edited
+// maps the UI won't author.
+const HALF_MIN = 18;
+const HALF_MAX = 48;
+const HALF_STEP = 4;
+// Members per pack (the PACK panel stepper and the pack-edit modal).
+const PACK_MIN = 1;
+const PACK_MAX = 8;
 
 fn freePlace() bool {
     return rl.isKeyDown(.left_alt) or rl.isKeyDown(.right_alt);
@@ -1093,19 +1116,19 @@ pub fn update(g: *Game, dt: f32) void {
     // everywhere else (crawler uses these for brush size too).
     if (rl.isKeyPressed(.left_bracket)) {
         if (ed.layer == .floor) {
-            ed.featureH = clampF(ed.featureH - 0.4, 1.2, 4.0);
+            ed.featureH = clampF(ed.featureH - FEATURE_H_STEP, FEATURE_H_MIN, FEATURE_H_MAX);
             ed.status("feature height {d:.1}", .{ed.featureH});
         } else {
-            ed.brushR = clampF(ed.brushR - 0.5, 0.5, 4.0);
+            ed.brushR = clampF(ed.brushR - BRUSH_R_STEP, BRUSH_R_MIN, BRUSH_R_MAX);
             ed.status("brush {d:.1}", .{ed.brushR});
         }
     }
     if (rl.isKeyPressed(.right_bracket)) {
         if (ed.layer == .floor) {
-            ed.featureH = clampF(ed.featureH + 0.4, 1.2, 4.0);
+            ed.featureH = clampF(ed.featureH + FEATURE_H_STEP, FEATURE_H_MIN, FEATURE_H_MAX);
             ed.status("feature height {d:.1}", .{ed.featureH});
         } else {
-            ed.brushR = clampF(ed.brushR + 0.5, 0.5, 4.0);
+            ed.brushR = clampF(ed.brushR + BRUSH_R_STEP, BRUSH_R_MIN, BRUSH_R_MAX);
             ed.status("brush {d:.1}", .{ed.brushR});
         }
     }
@@ -1693,7 +1716,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
     y += 30;
     ui.tipFor(ctx, ui.rect(px + 8, y - 2, PANEL_W - 16, 26), "East-west half-extent; shrinking clamps contents");
     var halfW = g.map.halfW;
-    if (ui.stepperF(ctx, px + 10, y, "width", &halfW, 4, 18, 48)) {
+    if (ui.stepperF(ctx, px + 10, y, "width", &halfW, HALF_STEP, HALF_MIN, HALF_MAX)) {
         bankUndo(g);
         g.map.halfW = halfW;
         clampContents(&g.map);
@@ -1702,7 +1725,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
     y += 28;
     ui.tipFor(ctx, ui.rect(px + 8, y - 2, PANEL_W - 16, 26), "North-south half-extent; shrinking clamps contents");
     var halfD = g.map.halfD;
-    if (ui.stepperF(ctx, px + 10, y, "depth", &halfD, 4, 18, 48)) {
+    if (ui.stepperF(ctx, px + 10, y, "depth", &halfD, HALF_STEP, HALF_MIN, HALF_MAX)) {
         bankUndo(g);
         g.map.halfD = halfD;
         clampContents(&g.map);
@@ -1740,17 +1763,17 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
             if (ed.entityBrush() == .pack) {
                 ui.panel(ui.rect(px, y, PANEL_W, 62), "PACK");
                 ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Members stamped per new pack");
-                _ = ui.stepperI(ctx, px + 10, y + 28, "members", &ed.packCount, 1, 8);
+                _ = ui.stepperI(ctx, px + 10, y + 28, "members", &ed.packCount, PACK_MIN, PACK_MAX);
             } else if (ed.entityBrush() == .erase) {
                 ui.panel(ui.rect(px, y, PANEL_W, 62), "ERASE");
                 ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Erase sweep radius ([ ] adjusts)");
-                _ = ui.stepperF(ctx, px + 10, y + 28, "radius", &ed.brushR, 0.5, 0.5, 4.0);
+                _ = ui.stepperF(ctx, px + 10, y + 28, "radius", &ed.brushR, BRUSH_R_STEP, BRUSH_R_MIN, BRUSH_R_MAX);
             }
         },
         .floor => {
             ui.panel(ui.rect(px, y, PANEL_W, 94), "TERRAIN");
             ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Height of NEW ledges/ramps; RMB a feature to apply");
-            _ = ui.stepperF(ctx, px + 10, y + 28, "height", &ed.featureH, 0.4, 1.2, 4.0);
+            _ = ui.stepperF(ctx, px + 10, y + 28, "height", &ed.featureH, FEATURE_H_STEP, FEATURE_H_MIN, FEATURE_H_MAX);
             if (ed.brush() == 1) {
                 var used: i32 = 0;
                 var cx = px + 10;
@@ -1764,7 +1787,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
         .decor, .props => {
             ui.panel(ui.rect(px, y, PANEL_W, 62), "BRUSH");
             ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Brush radius: decor spread + erase sweep ([ ])");
-            _ = ui.stepperF(ctx, px + 10, y + 28, "radius", &ed.brushR, 0.5, 0.5, 4.0);
+            _ = ui.stepperF(ctx, px + 10, y + 28, "radius", &ed.brushR, BRUSH_R_STEP, BRUSH_R_MIN, BRUSH_R_MAX);
         },
     }
 }
@@ -2093,8 +2116,8 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
             const mb = ui.beginModal(ctx, 420, 232, "New Map");
             hudx.text("name", mb.x + 24, mb.y + 46, 16, rgba(200, 190, 172, 230));
             ui.textField(ctx, ui.rect(mb.x + 24, mb.y + 66, 372, 30), &ed.field_buf, &ed.field_len, true, g.elapsed);
-            _ = ui.stepperF(ctx, mb.x + 24, mb.y + 106, "width", &ed.newHalfW, 4, 18, 48);
-            _ = ui.stepperF(ctx, mb.x + 24, mb.y + 138, "depth", &ed.newHalfD, 4, 18, 48);
+            _ = ui.stepperF(ctx, mb.x + 24, mb.y + 106, "width", &ed.newHalfW, HALF_STEP, HALF_MIN, HALF_MAX);
+            _ = ui.stepperF(ctx, mb.x + 24, mb.y + 138, "depth", &ed.newHalfD, HALF_STEP, HALF_MIN, HALF_MAX);
             if (ui.button(ctx, ui.rect(mb.x + 214, mb.y + 180, 88, 30), "Create", 17, false) or rl.isKeyPressed(.enter)) doNew(g);
             if (ui.button(ctx, ui.rect(mb.x + 310, mb.y + 180, 86, 30), "Cancel", 17, false)) ed.modal = .none;
         },
@@ -2156,7 +2179,7 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
                 cx += used;
             }
             var cnt = pk.count;
-            if (ui.stepperI(ctx, bx + 24, by + 104, "members", &cnt, 1, 8)) pk.count = cnt;
+            if (ui.stepperI(ctx, bx + 24, by + 104, "members", &cnt, PACK_MIN, PACK_MAX)) pk.count = cnt;
             if (ui.button(ctx, ui.rect(bx + 24, by + 172, 100, 30), "Delete", 17, false)) {
                 g.map = packEditBefore; // undo any live chip edits first
                 pushUndoFrom(&g.map);
