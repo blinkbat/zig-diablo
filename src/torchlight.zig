@@ -229,21 +229,27 @@ fn loadShadowmap(res: i32) rl.RenderTexture2D {
 }
 
 /// Everything the pipeline needs to place the torch this frame. The torch sits at
-/// `pos` (above the player); the ground is assumed at y=0. `radius` is how far the
-/// torch reaches before darkness.
+/// `pos` (above the player); `groundRef` is the walkable ground height under it
+/// (0 on the flat floor, the ledge height on a rampart) — the overhead shadow
+/// camera aims at and sizes its cone against THAT plane, so standing on raised
+/// ground doesn't shrink the shadowed footprint. `radius` is how far the torch
+/// reaches before darkness.
 pub const LightParams = struct {
     pos: rl.Vector3,
     radius: f32,
+    groundRef: f32 = 0,
 };
 
 /// A moving fireball light. `pos` sits above the projectile (like the torch, an
-/// overhead pool so its downward shadow map is well-oriented); `intensity` of 0
-/// disables it entirely (no light, no shadow, second depth pass skipped).
+/// overhead pool so its downward shadow map is well-oriented); `groundRef` as in
+/// LightParams; `intensity` of 0 disables it entirely (no light, no shadow,
+/// second depth pass skipped).
 pub const FireParams = struct {
     pos: rl.Vector3,
     radius: f32,
     color: rl.Vector3,
     intensity: f32,
+    groundRef: f32 = 0,
 };
 
 /// The fog-of-war memory layer sampled by the scene shader. `texId` is the GPU id of a
@@ -330,17 +336,20 @@ pub const Torch = struct {
     // with a cone FOV sized to just cover the light radius (verbatim demo math).
     // `up` must not be parallel to the view direction or MatrixLookAt goes NaN.
     fn shadowCamera(lp: LightParams) rl.Camera3D {
-        return overheadCamera(lp.pos, lp.radius);
+        return overheadCamera(lp.pos, lp.radius, lp.groundRef);
     }
 
     // Shared by the torch and the fireball: an overhead light looking straight down,
-    // its cone FOV sized to just cover `radius` on the ground (verbatim demo math).
-    fn overheadCamera(pos: rl.Vector3, radius: f32) rl.Camera3D {
+    // its cone FOV sized to just cover `radius` on the LOCAL ground plane (groundY)
+    // — sizing against absolute y=0 would shrink the covered disc whenever the
+    // light stands on raised terrain.
+    fn overheadCamera(pos: rl.Vector3, radius: f32, groundY: f32) rl.Camera3D {
         const coverTarget = radius * SHADOW_COVER_MARGIN;
-        const fovy = std.math.clamp(2.0 * std.math.atan(coverTarget / pos.y) * (180.0 / std.math.pi), 30.0, 150.0);
+        const height = @max(pos.y - groundY, 0.5);
+        const fovy = std.math.clamp(2.0 * std.math.atan(coverTarget / height) * (180.0 / std.math.pi), 30.0, 150.0);
         return .{
             .position = pos,
-            .target = .{ .x = pos.x, .y = 0, .z = pos.z },
+            .target = .{ .x = pos.x, .y = groundY, .z = pos.z },
             .up = .{ .x = 0, .y = 0, .z = -1 },
             .fovy = fovy,
             .projection = .perspective,
@@ -371,7 +380,7 @@ pub const Torch = struct {
     // Same structure as the torch pass, into the smaller fireMap from the fireball's
     // overhead camera. Draw the casters between this and endFireShadowPass().
     pub fn beginFireShadowPass(self: *Torch, fp: FireParams) void {
-        const cam = overheadCamera(fp.pos, fp.radius);
+        const cam = overheadCamera(fp.pos, fp.radius, fp.groundRef);
         self.saved_near = rl.gl.rlGetCullDistanceNear();
         self.saved_far = rl.gl.rlGetCullDistanceFar();
         rl.gl.rlSetClipPlanes(SHADOW_CLIP_NEAR, SHADOW_CLIP_FAR);

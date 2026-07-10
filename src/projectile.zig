@@ -14,12 +14,17 @@ pub const Projectile = struct {
     Color: rl.Color = rgba(255, 255, 255, 255),
 };
 
-// newFirebolt is the player's right-click spell.
-pub fn newFirebolt(from: rl.Vector3, dir: rl.Vector3, dmg: f32) Projectile {
-    const speed = 19.0;
+// Flight speeds, public so shooters can compute the vertical velocity that lands
+// a shot on a target at a different terrain height (yVel = dY / flight time).
+pub const fireboltSpeed = 19.0;
+pub const arrowSpeed = 13.0;
+
+// newFirebolt is the player's right-click spell. `from` carries the caster's
+// ground height; `yVel` slopes the flight toward a raised or sunken target.
+pub fn newFirebolt(from: rl.Vector3, dir: rl.Vector3, dmg: f32, yVel: f32) Projectile {
     return .{
-        .Pos = v3(from.x, 1.1, from.z),
-        .Vel = v3(dir.x * speed, 0, dir.z * speed),
+        .Pos = v3(from.x, from.y + 1.1, from.z),
+        .Vel = v3(dir.x * fireboltSpeed, yVel, dir.z * fireboltSpeed),
         .Damage = dmg,
         .Radius = 0.45,
         .Life = 2.0,
@@ -29,11 +34,10 @@ pub fn newFirebolt(from: rl.Vector3, dir: rl.Vector3, dmg: f32) Projectile {
 }
 
 // newArrow is the skeleton archer's attack.
-pub fn newArrow(from: rl.Vector3, dir: rl.Vector3, dmg: f32) Projectile {
-    const speed = 13.0;
+pub fn newArrow(from: rl.Vector3, dir: rl.Vector3, dmg: f32, yVel: f32) Projectile {
     return .{
-        .Pos = v3(from.x, 1.2, from.z),
-        .Vel = v3(dir.x * speed, 0, dir.z * speed),
+        .Pos = v3(from.x, from.y + 1.2, from.z),
+        .Vel = v3(dir.x * arrowSpeed, yVel, dir.z * arrowSpeed),
         .Damage = dmg,
         .Radius = 0.35,
         .Life = 2.5,

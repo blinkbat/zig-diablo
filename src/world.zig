@@ -41,6 +41,44 @@ pub const Decor = struct {
 
 pub const MAX_DECOR = 512;
 
+// TERRAIN — prototype "ledge" verticality. The world stays a SINGLE-VALUED
+// heightfield (one walkable height per XZ point, nothing walkable underneath
+// anything), which is exactly the constraint that keeps the overhead shadow rig
+// and the planar fog grid working. A Ledge is a raised axis-aligned platform; a
+// Ramp is a sloped rectangle joining the floor to a ledge edge.
+pub const STEP_MAX = 0.6; // tallest height difference feet can walk over
+
+pub const Ledge = struct {
+    minX: f32,
+    maxX: f32,
+    minZ: f32,
+    maxZ: f32,
+    h: f32,
+};
+
+pub const Ramp = struct {
+    minX: f32,
+    maxX: f32,
+    minZ: f32,
+    maxZ: f32,
+    h: f32,
+    // Which way the slope climbs: height is 0 at the opposite edge and h here.
+    rise: enum(u8) { xpos, xneg, zpos, zneg },
+
+    // The ramp's top surface as y = kx*x + kz*z + c (it's a plane).
+    pub fn planeCoeffs(r: Ramp) [3]f32 {
+        return switch (r.rise) {
+            .xpos => .{ r.h / (r.maxX - r.minX), 0, -r.h * r.minX / (r.maxX - r.minX) },
+            .xneg => .{ -r.h / (r.maxX - r.minX), 0, r.h * r.maxX / (r.maxX - r.minX) },
+            .zpos => .{ 0, r.h / (r.maxZ - r.minZ), -r.h * r.minZ / (r.maxZ - r.minZ) },
+            .zneg => .{ 0, -r.h / (r.maxZ - r.minZ), r.h * r.maxZ / (r.maxZ - r.minZ) },
+        };
+    }
+};
+
+pub const MAX_LEDGES = 4;
+pub const MAX_RAMPS = 4;
+
 // World holds the static level: extents, scenery, and the exit portal.
 pub const World = struct {
     Half: f32 = 0, // arena spans -Half..Half on X and Z
@@ -51,6 +89,10 @@ pub const World = struct {
     obstacle_count: usize = 0,
     decor: [MAX_DECOR]Decor = undefined,
     decor_count: usize = 0,
+    ledges: [MAX_LEDGES]Ledge = undefined,
+    ledge_count: usize = 0,
+    ramps: [MAX_RAMPS]Ramp = undefined,
+    ramp_count: usize = 0,
     PortalPos: rl.Vector3 = mathx.zero3,
     PortalOpen: bool = false,
     IsLast: bool = false,
@@ -63,6 +105,46 @@ pub const World = struct {
         return self.decor[0..self.decor_count];
     }
 
+    pub fn led(self: *const World) []const Ledge {
+        return self.ledges[0..self.ledge_count];
+    }
+
+    pub fn rmp(self: *const World) []const Ramp {
+        return self.ramps[0..self.ramp_count];
+    }
+
+    /// Walkable ground height at an XZ point. Ramps win over ledges (a ramp is cut
+    /// against a ledge edge), everything else is the flat floor at 0.
+    pub fn groundY(self: *const World, x: f32, z: f32) f32 {
+        for (self.rmp()) |r| {
+            if (x >= r.minX and x <= r.maxX and z >= r.minZ and z <= r.maxZ) {
+                const k = r.planeCoeffs();
+                return k[0] * x + k[1] * z + k[2];
+            }
+        }
+        for (self.led()) |l| {
+            if (x >= l.minX and x <= l.maxX and z >= l.minZ and z <= l.maxZ) return l.h;
+        }
+        return 0;
+    }
+
+    /// p with its y snapped onto the walkable ground.
+    pub fn snapY(self: *const World, p: rl.Vector3) rl.Vector3 {
+        return v3(p.x, self.groundY(p.x, p.z), p.z);
+    }
+
+    /// Whether an XZ point lies inside any ledge or ramp footprint (used to keep
+    /// worldgen scatter off the terrain features).
+    pub fn onFeature(self: *const World, x: f32, z: f32) bool {
+        for (self.rmp()) |r| {
+            if (x >= r.minX and x <= r.maxX and z >= r.minZ and z <= r.maxZ) return true;
+        }
+        for (self.led()) |l| {
+            if (x >= l.minX and x <= l.maxX and z >= l.minZ and z <= l.maxZ) return true;
+        }
+        return false;
+    }
+
     /// Whether a circle of the given radius at p hits scenery or leaves the arena.
     pub fn blocked(self: *const World, p: rl.Vector3, radius: f32) bool {
         if (@abs(p.x) > self.Half - radius or @abs(p.z) > self.Half - radius) return true;
@@ -73,28 +155,85 @@ pub const World = struct {
         return false;
     }
 
-    /// Move from pos by delta, sliding along obstacles (full, then X-only, then Z-only).
-    pub fn moveWithCollision(self: *const World, pos: rl.Vector3, delta: rl.Vector3, radius: f32) rl.Vector3 {
-        const tryPos = v3(pos.x + delta.x, 0, pos.z + delta.z);
-        if (!self.blocked(tryPos, radius)) return tryPos;
-        const xPos = v3(pos.x + delta.x, 0, pos.z);
-        if (!self.blocked(xPos, radius)) return xPos;
-        const zPos = v3(pos.x, 0, pos.z + delta.z);
-        if (!self.blocked(zPos, radius)) return zPos;
-        return pos;
+    // A step is passable when it's clear of scenery AND the ground doesn't rise or
+    // drop more than feet can manage — cliff faces are walls, ramps are gradual.
+    fn passable(self: *const World, p: rl.Vector3, radius: f32, fromY: f32) bool {
+        if (self.blocked(p, radius)) return false;
+        return @abs(self.groundY(p.x, p.z) - fromY) <= STEP_MAX;
     }
 
-    /// Whether a projectile at p struck scenery tall enough to block it.
+    /// Move from pos by delta, sliding along obstacles (full, then X-only, then
+    /// Z-only). The returned position carries the correct ground height in y.
+    pub fn moveWithCollision(self: *const World, pos: rl.Vector3, delta: rl.Vector3, radius: f32) rl.Vector3 {
+        const fromY = self.groundY(pos.x, pos.z);
+        const tryPos = v3(pos.x + delta.x, 0, pos.z + delta.z);
+        if (self.passable(tryPos, radius, fromY)) return self.snapY(tryPos);
+        const xPos = v3(pos.x + delta.x, 0, pos.z);
+        if (self.passable(xPos, radius, fromY)) return self.snapY(xPos);
+        const zPos = v3(pos.x, 0, pos.z + delta.z);
+        if (self.passable(zPos, radius, fromY)) return self.snapY(zPos);
+        return self.snapY(pos);
+    }
+
+    /// Whether a projectile at p struck scenery tall enough to block it (a shot
+    /// flying above an obstacle clears it), the arena edge, or terrain (cliff
+    /// faces are cover: a bolt below a ledge top splats against its side).
     pub fn rayHitsObstacle(self: *const World, p: rl.Vector3, radius: f32) bool {
         if (@abs(p.x) > self.Half or @abs(p.z) > self.Half) return true;
+        if (self.groundY(p.x, p.z) > p.y) return true;
         for (self.obs()) |o| {
             if (o.Height < 1.0) continue;
+            if (p.y > o.Pos.y + o.Height + 0.3) continue;
             const rr = o.Radius + radius;
             if (dist2XZ(o.Pos, p) < rr * rr) return true;
         }
         return false;
     }
+
+    /// Terrain-aware mouse picking: intersect the ray with the floor plane, every
+    /// ledge top, and every ramp plane; return the NEAREST hit that actually lies
+    /// on that surface (so a click on a rampart lands on the rampart, not on the
+    /// floor plane hidden beneath it).
+    pub fn pickGround(self: *const World, ray: rl.Ray) ?rl.Vector3 {
+        var best: ?rl.Vector3 = null;
+        var bestT: f32 = std.math.floatMax(f32);
+        if (rayAtPlane(ray, 0, 0, 0)) |hit| {
+            if (hit.t < bestT and self.groundY(hit.p.x, hit.p.z) < 0.01) {
+                bestT = hit.t;
+                best = hit.p;
+            }
+        }
+        for (self.led()) |l| {
+            if (rayAtPlane(ray, 0, 0, l.h)) |hit| {
+                if (hit.t < bestT and hit.p.x >= l.minX and hit.p.x <= l.maxX and hit.p.z >= l.minZ and hit.p.z <= l.maxZ) {
+                    bestT = hit.t;
+                    best = hit.p;
+                }
+            }
+        }
+        for (self.rmp()) |r| {
+            const k = r.planeCoeffs();
+            if (rayAtPlane(ray, k[0], k[1], k[2])) |hit| {
+                if (hit.t < bestT and hit.p.x >= r.minX and hit.p.x <= r.maxX and hit.p.z >= r.minZ and hit.p.z <= r.maxZ) {
+                    bestT = hit.t;
+                    best = hit.p;
+                }
+            }
+        }
+        return best;
+    }
 };
+
+// Intersect a ray with the plane y = kx*x + kz*z + c (horizontal when kx=kz=0).
+fn rayAtPlane(ray: rl.Ray, kx: f32, kz: f32, c: f32) ?struct { p: rl.Vector3, t: f32 } {
+    const denom = ray.direction.y - kx * ray.direction.x - kz * ray.direction.z;
+    if (@abs(denom) < 1e-6) return null;
+    const t = (kx * ray.position.x + kz * ray.position.z + c - ray.position.y) / denom;
+    if (t < 0) return null;
+    const x = ray.position.x + ray.direction.x * t;
+    const z = ray.position.z + ray.direction.z * t;
+    return .{ .p = v3(x, kx * x + kz * z + c, z), .t = t };
+}
 
 // areaDef is a template for a level. Difficulty scales with tier.
 pub const areaDef = struct {
@@ -141,6 +280,17 @@ pub fn buildWorld(def: areaDef, rng: *Rng, isLast: bool) World {
         .IsLast = isLast,
     };
 
+    // TERRAIN TEST (Blood Moor only for now): a rampart walkway along the east
+    // wall near the spawn, reached by a ramp on its south-west corner — high
+    // ground to rain firebolts from while the floor boils below. Defined BEFORE
+    // the scatter passes so obstacles and decor can stay off it.
+    if (def.tier == 0) {
+        w.ledges[0] = .{ .minX = 26, .maxX = def.half - 1.4, .minZ = 4, .maxZ = 30, .h = 2.4 };
+        w.ledge_count = 1;
+        w.ramps[0] = .{ .minX = 20.5, .maxX = 26, .minZ = 24, .maxZ = 29.5, .h = 2.4, .rise = .xpos };
+        w.ramp_count = 1;
+    }
+
     const spawn = startPos(w);
     const count: i32 = @intFromFloat(def.half * 0.9);
     var i: i32 = 0;
@@ -150,8 +300,11 @@ pub fn buildWorld(def: areaDef, rng: *Rng, isLast: bool) World {
             const x = (rng.float() * 2 - 1) * (def.half - 3);
             const z = (rng.float() * 2 - 1) * (def.half - 3);
             const p = ground(x, z);
-            // Keep scenery away from spawn and portal so neither gets walled in.
+            // Keep scenery away from spawn and portal so neither gets walled in,
+            // and off the terrain features (the rampart top stays a clear firing
+            // platform; nothing may straddle a cliff face or the ramp).
             if (distXZ(p, spawn) < 8 or distXZ(p, w.PortalPos) < 8) continue;
+            if (w.onFeature(x, z)) continue;
             const ob = randomObstacle(def, rng, p);
             if (obstacleOverlaps(w.obs(), ob)) continue;
             if (w.obstacle_count >= MAX_OBSTACLES) break;
@@ -169,6 +322,7 @@ pub fn buildWorld(def: areaDef, rng: *Rng, isLast: bool) World {
         if (w.decor_count >= MAX_DECOR) break;
         const p = ground((rng.float() * 2 - 1) * (def.half - 2), (rng.float() * 2 - 1) * (def.half - 2));
         if (w.blocked(p, 0.3)) continue;
+        if (w.onFeature(p.x, p.z)) continue;
         const roll = rng.float();
         w.decor[w.decor_count] = if (roll < 0.36) Decor{
             .Pos = p,

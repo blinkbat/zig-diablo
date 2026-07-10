@@ -168,25 +168,26 @@ fn sphere(pos: rl.Vector3, r: f32, col: rl.Color) void {
 
 // Scale the model-view stack up about the hero's feet, so every hero draw call
 // (body + FX, in every pass) renders HERO_SCALE bigger without touching its math.
-// Uniform scale only: rlgl doesn't re-transform normals, which is exactly correct
-// for a pure uniform scale (directions are unchanged).
+// The final translate carries base.y, lifting the whole (ground-relative) body
+// onto whatever terrain the hero stands on. Uniform scale only: rlgl doesn't
+// re-transform normals, which is exactly correct for a pure uniform scale.
 fn beginHeroScale(base: rl.Vector3) void {
     rl.gl.rlPushMatrix();
-    rl.gl.rlTranslatef(base.x, 0, base.z);
+    rl.gl.rlTranslatef(base.x, base.y, base.z);
     rl.gl.rlScalef(HERO_SCALE, HERO_SCALE, HERO_SCALE);
     rl.gl.rlTranslatef(-base.x, 0, -base.z);
 }
 
 // The carried torch's flame position in the world: off-hand side of the hero, at
-// flame height, in the SCALED body's frame. One source of truth shared by the
-// ember spitter and the LIGHT itself (the light's XZ anchors here — see
-// Game.torchXZ); the drawn flame lands here too via the beginHeroScale wrap.
+// flame height above his ground, in the SCALED body's frame. One source of truth
+// shared by the ember spitter and the LIGHT itself (the light's XZ anchors here —
+// see Game.torchXZ); the drawn flame lands here too via the beginHeroScale wrap.
 fn torchFlameWorld(p: *const Player) rl.Vector3 {
     const f = mathx.orFacing(p.Facing, 0, -1);
     const right = mathx.perpXZ(f);
     return v3(
         p.Pos.x + (-right.x * 0.45 + f.x * 0.05) * HERO_SCALE,
-        1.65 * HERO_SCALE,
+        p.Pos.y + 1.65 * HERO_SCALE,
         p.Pos.z + (-right.z * 0.45 + f.z * 0.05) * HERO_SCALE,
     );
 }
@@ -358,6 +359,7 @@ pub const Game = struct {
         while (attempt < 60) : (attempt += 1) {
             const p = mathx.ground((g.rng.float() * 2 - 1) * h, (g.rng.float() * 2 - 1) * h);
             if (distXZ(p, from) < minFrom) continue;
+            if (g.w.onFeature(p.x, p.z)) continue; // packs spawn on the floor, not the high ground
             if (!g.w.blocked(p, 1.0)) return p;
         }
         return mathx.ground(0, 0);
@@ -367,6 +369,7 @@ pub const Game = struct {
         var attempt: i32 = 0;
         while (attempt < 40) : (attempt += 1) {
             const p = mathx.ground(center.x + (g.rng.float() * 2 - 1) * spread, center.z + (g.rng.float() * 2 - 1) * spread);
+            if (g.w.onFeature(p.x, p.z)) continue;
             if (!g.w.blocked(p, 0.8)) return p;
         }
         return center;
@@ -549,8 +552,17 @@ fn castFirebolt(g: *Game) void {
     p.Mana -= p.spellCost;
     p.castCD = CAST_RATE;
     const dmg = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(8)));
-    g.projs.add(projectile.newFirebolt(p.Pos, dir, dmg));
+    g.projs.add(projectile.newFirebolt(p.Pos, dir, dmg, aimYVel(p.Pos.y + 1.1, g.mouseGround.y + 0.9, distXZ(p.Pos, g.mouseGround), projectile.fireboltSpeed)));
     g.rumble.play(rumble.cast);
+}
+
+// The vertical velocity that carries a shot from its muzzle height to the target
+// height over the horizontal flight — how a bolt rains DOWN off a rampart, or an
+// arrow climbs up at whoever is camping one. Clamped so degenerate point-blank
+// aims can't turn a shot into a mortar.
+fn aimYVel(fromY: f32, toY: f32, distH: f32, speed: f32) f32 {
+    const ft = maxF(distH, 2.0) / speed;
+    return clampF((toY - fromY) / ft, -9.0, 9.0);
 }
 
 // Attempt a dodge roll in dir, playing the shared feedback (rumble + popup) on
@@ -559,9 +571,9 @@ fn castFirebolt(g: *Game) void {
 fn doDodge(g: *Game, dir: rl.Vector3) void {
     if (g.p.startRoll(dir)) {
         g.rumble.play(rumble.dodge);
-        g.addPopup(v3(g.p.Pos.x, 2.6, g.p.Pos.z), "Dodge!", rgba(180, 220, 255, 255));
+        g.addPopup(v3(g.p.Pos.x, g.p.Pos.y + 2.6, g.p.Pos.z), "Dodge!", rgba(180, 220, 255, 255));
         // The tuck kicks a fan of scuffed dust out behind the launch point.
-        g.parts.burst(&g.rng, v3(g.p.Pos.x - dir.x * 0.3, 0.12, g.p.Pos.z - dir.z * 0.3), 7, 2.6, 0.07, 0.4, rgba(200, 172, 132, 110), 5);
+        g.parts.burst(&g.rng, v3(g.p.Pos.x - dir.x * 0.3, g.p.Pos.y + 0.12, g.p.Pos.z - dir.z * 0.3), 7, 2.6, 0.07, 0.4, rgba(200, 172, 132, 110), 5);
     }
 }
 
@@ -669,7 +681,9 @@ fn padStartPressed() bool {
 // updateAim refreshes the ground point under the cursor and the hovered monster.
 fn updateAim(g: *Game) void {
     const ray = rl.getScreenToWorldRay(rl.getMousePosition(), g.rig.cam);
-    if (mathx.rayGround(ray)) |pt| g.mouseGround = pt;
+    // Terrain-aware pick: a click on a rampart top lands ON the rampart (with its
+    // height), not on the floor plane hidden beneath it.
+    if (g.w.pickGround(ray)) |pt| g.mouseGround = pt;
 
     g.hoverMonster = -1;
     var best: f32 = std.math.floatMax(f32);
@@ -687,6 +701,8 @@ fn updateAim(g: *Game) void {
 
 fn updatePlayerMovement(g: *Game, dt: f32) void {
     const p = &g.p;
+    // Feet on the ground every frame (covers teleports and standing on a ramp).
+    p.Pos.y = g.w.groundY(p.Pos.x, p.Pos.z);
 
     // A dodge roll overrides all other movement and steering.
     if (p.rolling()) {
@@ -732,7 +748,7 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
             var i: usize = 0;
             while (i < 2) : (i += 1) {
                 g.parts.spawn(.{
-                    .Pos = v3(p.Pos.x - dir.x * 0.25 + (g.rng.float() - 0.5) * 0.3, 0.06, p.Pos.z - dir.z * 0.25 + (g.rng.float() - 0.5) * 0.3),
+                    .Pos = v3(p.Pos.x - dir.x * 0.25 + (g.rng.float() - 0.5) * 0.3, p.Pos.y + 0.06, p.Pos.z - dir.z * 0.25 + (g.rng.float() - 0.5) * 0.3),
                     .Vel = v3(-dir.x * 0.4 + (g.rng.float() - 0.5) * 0.5, 0.35 + g.rng.float() * 0.4, -dir.z * 0.4 + (g.rng.float() - 0.5) * 0.5),
                     .Life = 0.3 + g.rng.float() * 0.2,
                     .maxLife = 0.5,
@@ -757,7 +773,7 @@ fn updatePlayerAttack(g: *Game) void {
         p.targetMonster = -1;
         return;
     }
-    if (distXZ(p.Pos, m.Pos) <= playerReach(p.atkRange, m.Radius)) {
+    if (distXZ(p.Pos, m.Pos) <= playerReach(p.atkRange, m.Radius) and @abs(m.Pos.y - p.Pos.y) < 1.0) {
         var dmg = p.MinDmg + g.rng.float() * (p.MaxDmg - p.MinDmg);
         const crit = g.rng.float() < CRIT_CHANCE;
         if (crit) dmg *= CRIT_MULT;
@@ -778,7 +794,7 @@ fn damageMonster(g: *Game, m: *Monster, dmg: f32, crit: bool) void {
     const pp = v3(m.Pos.x, m.Pos.y + POPUP_HEIGHT, m.Pos.z);
     if (crit) g.addPopupFmt(pp, col, "{d}!", .{di}) else g.addPopupFmt(pp, col, "{d}", .{di});
     // Hit sparks: a few pale chips off the body; crits flare bigger and golder.
-    const hitAt = v3(m.Pos.x, MONSTER_TORSO_BASE + m.Height * 0.5, m.Pos.z);
+    const hitAt = v3(m.Pos.x, m.Pos.y + MONSTER_TORSO_BASE + m.Height * 0.5, m.Pos.z);
     if (crit) {
         g.parts.burst(&g.rng, hitAt, 12, 5.5, 0.11, 0.5, rgba(255, 215, 90, 255), 9);
     } else {
@@ -798,7 +814,7 @@ fn killMonster(g: *Game, m: *Monster) void {
     g.kills += 1;
     g.rumble.play(rumble.kill);
     // Death burst: the body's own color scattering out, with dark gore underneath.
-    const at = v3(m.Pos.x, MONSTER_TORSO_BASE + m.Height * 0.45, m.Pos.z);
+    const at = v3(m.Pos.x, m.Pos.y + MONSTER_TORSO_BASE + m.Height * 0.45, m.Pos.z);
     const n: usize = if (m.boss) 34 else 16;
     g.parts.burst(&g.rng, at, n, 6.0, 0.13, 0.7, lerpColor(m.Color, rl.Color.white, 0.25), 10);
     g.parts.burst(&g.rng, at, n / 2, 3.5, 0.16, 0.9, lerpColor(m.Color, rl.Color.black, 0.45), 12);
@@ -813,10 +829,10 @@ fn onLevelUp(g: *Game) void {
     g.setBanner(LEVELUP_BANNER_DUR, "Level {d}!", .{g.p.Level});
     g.rumble.play(rumble.level_up);
     g.shake = maxF(g.shake, 0.3);
-    g.addPopup(v3(g.p.Pos.x, 2.7, g.p.Pos.z), "LEVEL UP", rgba(255, 230, 120, 255));
+    g.addPopup(v3(g.p.Pos.x, g.p.Pos.y + 2.7, g.p.Pos.z), "LEVEL UP", rgba(255, 230, 120, 255));
     // A golden fountain out of the hero: slow, buoyant motes that hang in the air.
-    g.parts.burst(&g.rng, v3(g.p.Pos.x, 1.2, g.p.Pos.z), 30, 4.5, 0.12, 1.3, rgba(255, 225, 110, 255), -2);
-    g.parts.burst(&g.rng, v3(g.p.Pos.x, 0.5, g.p.Pos.z), 14, 2.0, 0.09, 1.6, rgba(255, 250, 210, 255), -3);
+    g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 1.2, g.p.Pos.z), 30, 4.5, 0.12, 1.3, rgba(255, 225, 110, 255), -2);
+    g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 0.5, g.p.Pos.z), 14, 2.0, 0.09, 1.6, rgba(255, 250, 210, 255), -3);
 }
 
 // ---- Monster AI ----
@@ -827,6 +843,7 @@ fn moveMonster(g: *Game, m: *Monster, dir: rl.Vector3, dt: f32) void {
 }
 
 fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
+    m.Pos.y = g.w.groundY(m.Pos.x, m.Pos.z); // feet on the ground (spawns, ramps)
     if (m.hitFlash > 0) m.hitFlash -= dt;
     if (m.atkCD > 0) m.atkCD -= dt;
     m.bob += dt * (m.Speed + 2);
@@ -877,8 +894,10 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
         return;
     }
 
-    // Melee: close the gap, then commit to a telegraphed swing.
-    if (toPlayer > m.atkRange + g.p.Radius) {
+    // Melee: close the gap, then commit to a telegraphed swing — but never wind up
+    // at someone standing a cliff above or below; keep pressing toward them (which
+    // funnels the pack to the ramp) instead of swinging at a wall of stone.
+    if (toPlayer > m.atkRange + g.p.Radius or @abs(m.Pos.y - g.p.Pos.y) >= 1.0) {
         moveMonster(g, m, dirXZ(m.Pos, g.p.Pos), dt);
     } else if (m.atkCD <= 0) {
         m.windup = m.windupTime;
@@ -889,12 +908,15 @@ fn resolveMonsterAttack(g: *Game, m: *Monster) void {
     if (!g.p.alive()) return;
     const dmg = m.MinDmg + g.rng.float() * (m.MaxDmg - m.MinDmg);
     if (m.Ranged) {
-        g.projs.add(projectile.newArrow(m.Pos, dirXZ(m.Pos, g.p.Pos), dmg));
+        // Arrows angle up or down to the player's actual elevation — a rampart is
+        // cover from the cliff side, never from an archer with a clean line.
+        g.projs.add(projectile.newArrow(m.Pos, dirXZ(m.Pos, g.p.Pos), dmg, aimYVel(m.Pos.y + 1.2, g.p.Pos.y + 1.0, distXZ(m.Pos, g.p.Pos), projectile.arrowSpeed)));
         return;
     }
     // Use the module radius constant — the SAME source the drawn telegraph ring reads
     // (drawMonstersFX) — so standing just outside the red ring is genuinely safe.
-    if (distXZ(m.Pos, g.p.Pos) <= meleeReach(m.atkRange, playermod.radius)) hitPlayer(g, dmg);
+    // Melee cannot land across a cliff: reach requires standing on comparable ground.
+    if (distXZ(m.Pos, g.p.Pos) <= meleeReach(m.atkRange, playermod.radius) and @abs(m.Pos.y - g.p.Pos.y) < 1.0) hitPlayer(g, dmg);
 }
 
 // Push overlapping monsters apart so a pack doesn't collapse into one point.
@@ -924,7 +946,7 @@ fn separateMonsters(g: *Game) void {
 fn hitPlayer(g: *Game, dmg: f32) void {
     // I-frames from a dodge roll negate the blow entirely.
     if (g.p.invulnerable()) {
-        g.addPopup(v3(g.p.Pos.x, 2.5, g.p.Pos.z), "dodged", rgba(180, 220, 255, 230));
+        g.addPopup(v3(g.p.Pos.x, g.p.Pos.y + 2.5, g.p.Pos.z), "dodged", rgba(180, 220, 255, 230));
         return;
     }
     g.p.takeDamage(dmg);
@@ -932,8 +954,8 @@ fn hitPlayer(g: *Game, dmg: f32) void {
     g.shake = maxF(g.shake, 0.25);
     g.rumble.play(rumble.hurt);
     const di: i32 = @intFromFloat(dmg);
-    g.addPopupFmt(v3(g.p.Pos.x, 2.5, g.p.Pos.z), rgba(255, 90, 90, 255), "-{d}", .{di});
-    g.parts.burst(&g.rng, v3(g.p.Pos.x, 1.35, g.p.Pos.z), 8, 4.5, 0.1, 0.45, rgba(220, 40, 40, 255), 9);
+    g.addPopupFmt(v3(g.p.Pos.x, g.p.Pos.y + 2.5, g.p.Pos.z), rgba(255, 90, 90, 255), "-{d}", .{di});
+    g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 1.35, g.p.Pos.z), 8, 4.5, 0.1, 0.45, rgba(220, 40, 40, 255), 9);
     if (!g.p.alive()) {
         g.rumble.play(rumble.death); // stronger than `hurt`, so it takes over the fade
         g.scene = .dead;
@@ -963,6 +985,7 @@ const SweepCtx = struct { g: *Game, dt: f32 };
 fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
     const g = c.g;
     pr.Pos.x += pr.Vel.x * c.dt;
+    pr.Pos.y += pr.Vel.y * c.dt;
     pr.Pos.z += pr.Vel.z * c.dt;
     pr.Life -= c.dt;
     // The firebolt sheds a spark trail as it flies (arrows fly clean).
@@ -982,15 +1005,18 @@ fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
         impactBurst(g, pr);
         return false;
     }
+    // Hits require the shot to actually pass through the body's height band — a
+    // bolt raining down from a rampart sails clean over the heads between it and
+    // its mark instead of clipping everything on the way.
     if (pr.FromPlayer) {
         for (g.liveMonsters()) |*m| {
-            if (m.alive() and distXZ(m.Pos, pr.Pos) < m.Radius + pr.Radius) {
+            if (m.alive() and distXZ(m.Pos, pr.Pos) < m.Radius + pr.Radius and @abs(pr.Pos.y - (m.Pos.y + m.Height * 0.55)) < m.Height * 0.55 + 0.7) {
                 damageMonster(g, m, pr.Damage, false);
                 impactBurst(g, pr);
                 return false;
             }
         }
-    } else if (g.p.alive() and distXZ(g.p.Pos, pr.Pos) < g.p.Radius + pr.Radius) {
+    } else if (g.p.alive() and distXZ(g.p.Pos, pr.Pos) < g.p.Radius + pr.Radius and @abs(pr.Pos.y - (g.p.Pos.y + 1.1)) < 1.7) {
         hitPlayer(g, pr.Damage);
         impactBurst(g, pr);
         return false;
@@ -1015,7 +1041,9 @@ fn updateProjectiles(g: *Game, dt: f32) void {
 // Loot: bob in place; collected (and dropped) when the player walks over it.
 fn keepLoot(c: SweepCtx, d: *LootDrop) bool {
     d.bob += c.dt * 3;
-    if (distXZ(d.Pos, c.g.p.Pos) < c.g.p.Radius + 1.3) {
+    // Same-level pickup only: standing on the rampart edge must not hoover the
+    // drops glittering on the floor below.
+    if (distXZ(d.Pos, c.g.p.Pos) < c.g.p.Radius + 1.3 and @abs(d.Pos.y - c.g.p.Pos.y) < 1.2) {
         collect(c.g, d.*);
         return false;
     }
@@ -1079,7 +1107,7 @@ fn updateAmbientFX(g: *Game, dt: f32) void {
             const dang = g.rng.float() * std.math.tau;
             const dr = (0.25 + 0.75 * g.rng.float()) * TORCH_RADIUS * 0.85;
             g.parts.spawn(.{
-                .Pos = v3(g.p.Pos.x + cosf(dang) * dr, 0.3 + g.rng.float() * 2.4, g.p.Pos.z + sinf(dang) * dr),
+                .Pos = v3(g.p.Pos.x + cosf(dang) * dr, g.p.Pos.y + 0.3 + g.rng.float() * 2.4, g.p.Pos.z + sinf(dang) * dr),
                 .Vel = v3((g.rng.float() - 0.5) * 0.5, 0.08 + g.rng.float() * 0.18, (g.rng.float() - 0.5) * 0.5),
                 .Life = 2.4 + g.rng.float() * 1.2,
                 .maxLife = 3.6,
@@ -1109,7 +1137,7 @@ fn updateAmbientFX(g: *Game, dt: f32) void {
             if (!m.boss or !m.alive()) continue;
             if (distXZ(m.Pos, g.p.Pos) > TORCH_RADIUS or g.rng.float() > 0.55) continue;
             g.parts.spawn(.{
-                .Pos = v3(m.Pos.x + (g.rng.float() - 0.5) * m.Radius * 1.7, MONSTER_TORSO_BASE + m.Height * (0.5 + g.rng.float() * 0.35), m.Pos.z + (g.rng.float() - 0.5) * m.Radius * 1.7),
+                .Pos = v3(m.Pos.x + (g.rng.float() - 0.5) * m.Radius * 1.7, m.Pos.y + MONSTER_TORSO_BASE + m.Height * (0.5 + g.rng.float() * 0.35), m.Pos.z + (g.rng.float() - 0.5) * m.Radius * 1.7),
                 .Vel = v3((g.rng.float() - 0.5) * 0.4, 0.9 + g.rng.float() * 0.8, (g.rng.float() - 0.5) * 0.4),
                 .Life = 0.7 + g.rng.float() * 0.4,
                 .maxLife = 1.1,
@@ -1139,7 +1167,7 @@ fn updateAmbientFX(g: *Game, dt: f32) void {
             const d = &g.lootList.items[@intCast(g.rng.intn(@intCast(g.lootList.items.len)))];
             if (d.Kind == .gold and distXZ(d.Pos, g.p.Pos) <= TORCH_RADIUS and g.rng.float() < 0.35) {
                 g.parts.spawn(.{
-                    .Pos = v3(d.Pos.x + (g.rng.float() - 0.5) * 0.4, 0.35 + g.rng.float() * 0.3, d.Pos.z + (g.rng.float() - 0.5) * 0.4),
+                    .Pos = v3(d.Pos.x + (g.rng.float() - 0.5) * 0.4, d.Pos.y + 0.35 + g.rng.float() * 0.3, d.Pos.z + (g.rng.float() - 0.5) * 0.4),
                     .Vel = v3(0, 0.8, 0),
                     .Life = 0.5,
                     .maxLife = 0.5,
@@ -1384,7 +1412,11 @@ fn monsterHeadFwd(m: *const Monster) f32 {
 
 // Body + per-kind silhouette. Every appendage is drawn here (not in the FX pass) so
 // it exists in BOTH the shadow depth pass and the lit pass: horns and arms cast.
+// The whole (ground-relative) body is lifted by the monster's terrain height.
 fn drawMonsterBody(m: *const Monster) void {
+    rl.gl.rlPushMatrix();
+    defer rl.gl.rlPopMatrix();
+    rl.gl.rlTranslatef(0, m.Pos.y, 0);
     const bob = monsterBob(m);
     var col = m.Color;
     var shrink: f32 = 1;
@@ -1569,10 +1601,15 @@ fn drawMonstersLit(ms: []const Monster, lightXZ: rl.Vector3, torchR: f32, fp: tl
 
 // Emissive pass (no shadow): glowing eyes + the red attack telegraph + boss ring +
 // the hover highlight under the monster the cursor (or pad aim) has picked out.
-fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams, hoverID: i32, t: f32) void {
+fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, torchR: f32, fp: tl.FireParams, hoverID: i32, t: f32) void {
     for (ms) |*m| {
         if (m.dying or !m.alive()) continue;
         if (!bodyVisible(m.Pos, lightXZ, torchR, fp)) continue;
+        // Lift this monster's FX (rings, glints, eyes) onto its terrain height;
+        // anything aimed at the PLAYER must compensate back out of this frame.
+        rl.gl.rlPushMatrix();
+        defer rl.gl.rlPopMatrix();
+        rl.gl.rlTranslatef(0, m.Pos.y, 0);
         if (m.id == hoverID) {
             const pulse = 0.12 * sinf(t * 6);
             rl.drawCircle3D(v3(m.Pos.x, 0.05, m.Pos.z), m.Radius + 0.3 + pulse, v3(1, 0, 0), 90, rgba(255, 245, 220, 210));
@@ -1585,7 +1622,9 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, torchR: f32, fp: tl.
             const tp = 1 - m.windup / m.windupTime;
             const a = mathx.u8f(clampF(110 + 130 * tp, 0, 255));
             if (m.Ranged) {
-                rl.drawCylinderEx(v3(m.Pos.x, 1.2, m.Pos.z), v3(lightXZ.x, 0.3, lightXZ.z), 0.05, 0.05, 4, rgba(255, 70, 50, a));
+                // Aim the threat beam at the player's true elevation (compensating
+                // for this monster's lifted frame), so it climbs up at a rampart.
+                rl.drawCylinderEx(v3(m.Pos.x, 1.2, m.Pos.z), v3(pPos.x, pPos.y - m.Pos.y + 0.3, pPos.z), 0.05, 0.05, 4, rgba(255, 70, 50, a));
             } else {
                 // The kill zone fills in as the blow comes down: a translucent red
                 // disc swelling to the true reach, ringed by the hard edge.
@@ -1619,17 +1658,20 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, torchR: f32, fp: tl.
 }
 
 // Pick the fireball that lights the scene: the first live player bolt. Its light is
-// modeled overhead (FIRE_HEIGHT) so the downward shadow map is well-oriented, with a
-// warm colour and a gentle flame flicker. intensity 0 => no fireball, light disabled.
-fn fireLight(projs: *ProjList, t: f32) tl.FireParams {
-    for (projs.items()) |*pr| {
+// modeled overhead (FIRE_HEIGHT above the terrain under the bolt) so the downward
+// shadow map is well-oriented, with a warm colour and a gentle flame flicker.
+// intensity 0 => no fireball, light disabled.
+fn fireLight(g: *Game, t: f32) tl.FireParams {
+    for (g.projs.items()) |*pr| {
         if (!pr.FromPlayer) continue;
         const flicker = 0.85 + 0.15 * sinf(t * 27);
+        const gy = g.w.groundY(pr.Pos.x, pr.Pos.z);
         return .{
-            .pos = v3(pr.Pos.x, FIRE_HEIGHT, pr.Pos.z),
+            .pos = v3(pr.Pos.x, gy + FIRE_HEIGHT, pr.Pos.z),
             .radius = FIRE_RADIUS,
             .color = v3(1.0, 0.55, 0.22),
             .intensity = 1.7 * flicker,
+            .groundRef = gy,
         };
     }
     return .{ .pos = mathx.zero3, .radius = FIRE_RADIUS, .color = mathx.zero3, .intensity = 0 };
@@ -1664,6 +1706,10 @@ fn drawProjectiles(projs: *ProjList, t: f32) void {
 fn drawLoot(lootList: *std.ArrayList(LootDrop), lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams) void {
     for (lootList.items) |*d| {
         if (!bodyVisible(d.Pos, lightXZ, torchR, fp)) continue;
+        // Lift each drop (beam, pool, ring, item) onto the ground it fell on.
+        rl.gl.rlPushMatrix();
+        defer rl.gl.rlPopMatrix();
+        rl.gl.rlTranslatef(0, d.Pos.y, 0);
         const y = 0.4 + 0.12 * sinf(d.bob);
         // The Diablo promise: a soft shaft of light stands over every drop, so loot
         // reads across the floor at a glance. Emissive pass — it glows, breathing
@@ -1803,12 +1849,14 @@ fn drawWorld(g: *Game) rl.Camera3D {
     // exactly TORCH_RADIUS can never sit outside the drawn light.
     const breath = 1.0 - 0.022 * (0.5 + 0.5 * sinf(t * 7.1)) - 0.014 * (0.5 + 0.5 * sinf(t * 13.7));
     // The light hangs over the CARRIED flame (g.torchXZ), not over the hero's head —
-    // shadows lean away from the torch hand and swing around as the hero turns.
-    const lp = tl.LightParams{ .pos = v3(g.torchXZ.x, TORCH_HEIGHT, g.torchXZ.z), .radius = TORCH_RADIUS * breath };
+    // shadows lean away from the torch hand and swing around as the hero turns. It
+    // rides the LOCAL walkable ground, so a rampart lifts the whole rig with you.
+    const pGroundY = g.w.groundY(g.p.Pos.x, g.p.Pos.z);
+    const lp = tl.LightParams{ .pos = v3(g.torchXZ.x, pGroundY + TORCH_HEIGHT, g.torchXZ.z), .radius = TORCH_RADIUS * breath, .groundRef = pGroundY };
     // Every body-draw gate measures from the light's own ground point, so the culled
     // set and the drawn light disc can never diverge.
     const lightGround = v3(g.torchXZ.x, 0, g.torchXZ.z);
-    const fp = fireLight(&g.projs, t);
+    const fp = fireLight(g, t);
     const ms = g.liveMonsters();
     const drawHero = g.p.alive();
 
@@ -1846,7 +1894,7 @@ fn drawWorld(g: *Game) rl.Camera3D {
     if (drawHero) drawHeroBody(&g.p);
     g.torch.endScene();
     if (drawHero) drawHeroFX(&g.p, t);
-    drawMonstersFX(ms, lightGround, lp.radius, fp, g.hoverMonster, t);
+    drawMonstersFX(ms, lightGround, g.p.Pos, lp.radius, fp, g.hoverMonster, t);
     drawLoot(&g.lootList, lightGround, lp.radius, fp);
     drawProjectiles(&g.projs, t);
     drawPortal(&g.w, t);
@@ -1871,12 +1919,13 @@ pub fn run(shot: bool) void {
     defer g.deinit();
     defer g.rumble.stop(); // never leave a motor latched on after the window closes
 
-    // Screenshot harness: skip the menu, sweep a few vantage points — spawn, arena
-    // center, and the (forced-open) portal so its FX show. The camera snaps to each
-    // teleport, then a dozen frames run so fog reveals, particles spawn, and the
-    // smoothed rig settles before the shutter clicks.
+    // Screenshot harness: skip the menu, sweep a few vantage points — the RAMPART
+    // (hero on high ground, monsters at the cliff base), arena center, and the
+    // (forced-open) portal so its FX show. The camera snaps to each teleport, then
+    // a dozen frames run so fog reveals, particles spawn, and the smoothed rig
+    // settles before the shutter clicks.
     const sweep = [_]rl.Vector3{
-        world.startPos(g.w),
+        mathx.ground(31.5, 20), // atop the Blood Moor rampart (ledge spans x 26.., z 4..30)
         mathx.ground(0, 0),
         mathx.ground(g.w.PortalPos.x, g.w.PortalPos.z + 5),
     };
@@ -1884,10 +1933,20 @@ pub fn run(shot: bool) void {
         g.scene = .playing;
         g.p.Pos = sweep[0];
         g.rig.snap(g.p.Pos);
+        g.torchXZ = torchFlameWorld(&g.p);
         // Drain the resources partway so the orbs photograph with a visible liquid
         // surface (a full orb hides the meniscus + fill line entirely).
         g.p.HP = g.p.MaxHP * 0.62;
         g.p.Mana = g.p.MaxMana * 0.45;
+        // Rampart tableau: a pack milling at the cliff base below the hero, and a
+        // firebolt frozen mid-descent — the "pew from the high ground" money shot.
+        g.p.Facing = dirXZ(g.p.Pos, v3(22, 0, 15));
+        g.spawn(monster.makeMonster(.fallen, 0, &g.rng, mathx.ground(22.5, 13.5)));
+        g.spawn(monster.makeMonster(.fallen, 0, &g.rng, mathx.ground(20.5, 17)));
+        g.spawn(monster.makeMonster(.zombie, 0, &g.rng, mathx.ground(23.5, 19)));
+        const boltFrom = v3(31.5, 2.4, 20);
+        const boltTo = v3(21, 0, 13.5);
+        g.projs.add(projectile.newFirebolt(boltFrom, dirXZ(boltFrom, boltTo), 20, aimYVel(2.4 + 1.1, 0.9, distXZ(boltFrom, boltTo), projectile.fireboltSpeed)));
     }
     var frame: i32 = 0;
     var shotIdx: usize = 0;
@@ -1971,7 +2030,7 @@ pub fn run(shot: bool) void {
                     g.monsters[g.monsterCount - 1].HP = 0;
                     g.monsters[g.monsterCount - 1].deathTimer = monster.monster_death_fade * 0.5;
                     // A firebolt frozen mid-flight, to verify the bolt + its trail.
-                    g.projs.add(projectile.newFirebolt(mathx.ground(px - 1.5, pz + 2.5), v3(-0.8, 0, 0.6), 20));
+                    g.projs.add(projectile.newFirebolt(mathx.ground(px - 1.5, pz + 2.5), v3(-0.8, 0, 0.6), 20, 0));
                     // Ground loot just out of pickup range, to verify the drop beams.
                     g.lootList.append(.{ .Kind = .gold, .Pos = mathx.ground(px - 0.4, pz + 4.0), .Amount = 25 }) catch {};
                     g.lootList.append(.{ .Kind = .health_potion, .Pos = mathx.ground(px - 2.6, pz + 2.0), .Amount = 1 }) catch {};

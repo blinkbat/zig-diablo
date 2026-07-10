@@ -273,6 +273,52 @@ fn bakeBone(b: *Builder, d: world.Decor) void {
     }
 }
 
+// ---- Terrain features (ledges + ramps; see world.zig TERRAIN) ----
+
+fn bakeLedge(b: *Builder, w: *const world.World, l: world.Ledge) void {
+    const cx = (l.minX + l.maxX) / 2;
+    const cz = (l.minZ + l.maxZ) / 2;
+    const sx = l.maxX - l.minX;
+    const sz = l.maxZ - l.minZ;
+    // Same masonry profile as the arena walls: body, paler overhanging capstone
+    // course (the walkable pavement), darker plinth at the foot.
+    const body = w.Accent;
+    // Barely paler than the floor: the walkway must read as GROUND you fight on
+    // (the output gamma blows bright albedos out under the torch).
+    const cap = lerpColor(w.Ground, rgba(126, 120, 110, 255), 0.22);
+    const plinth = lerpColor(body, rl.Color.black, 0.35);
+    b.addCube(v3(cx, l.h / 2, cz), v3(sx, l.h, sz), body);
+    b.addCube(v3(cx, l.h + 0.07, cz), v3(sx + 0.3, 0.14, sz + 0.3), cap);
+    b.addCube(v3(cx, 0.15, cz), v3(sx + 0.2, 0.3, sz + 0.2), plinth);
+}
+
+fn bakeRamp(b: *Builder, w: *const world.World, r: world.Ramp) void {
+    const k = r.planeCoeffs();
+    const worn = lerpColor(w.Accent, rgba(150, 145, 132, 255), 0.3);
+    const side = lerpColor(w.Accent, rl.Color.black, 0.2);
+    // The rect's corners, counter-clockwise seen from above, each at its true
+    // plane height (the ramp top is the plane y = kx*x + kz*z + c).
+    const cs = [_][2]f32{
+        .{ r.minX, r.minZ }, .{ r.maxX, r.minZ },
+        .{ r.maxX, r.maxZ }, .{ r.minX, r.maxZ },
+    };
+    var top: [4]rl.Vector3 = undefined;
+    for (cs, 0..) |c, i| {
+        top[i] = v3(c[0], k[0] * c[0] + k[1] * c[1] + k[2] + 0.02, c[1]);
+    }
+    // Top surface: one planar quad whose normal is the plane gradient.
+    b.quad(top[0], top[3], top[2], top[1], norm(v3(-k[0], 1, -k[1])), worn);
+    // Skirt walls down to the floor on all four sides (zero-height edges emit
+    // degenerate triangles, which cost nothing and keep this loop uniform).
+    const outN = [_]rl.Vector3{ v3(0, 0, -1), v3(1, 0, 0), v3(0, 0, 1), v3(-1, 0, 0) };
+    for (0..4) |i| {
+        const j = (i + 1) % 4;
+        const bi = v3(top[i].x, 0, top[i].z);
+        const bj = v3(top[j].x, 0, top[j].z);
+        b.quad(bi, bj, top[j], top[i], outN[i], side);
+    }
+}
+
 // The baked mesh plus the CPU arrays backing it. After uploadMesh copies the data to
 // GPU buffers we detach the CPU pointers from the mesh (raylib's unloadMesh frees with
 // libc free, which would corrupt the heap on our Zig-allocated memory) and free them
@@ -287,6 +333,8 @@ const Baked = struct {
 
 fn bakeMesh(w: *const world.World) Baked {
     var b = Builder.init();
+    for (w.led()) |l| bakeLedge(&b, w, l);
+    for (w.rmp()) |r| bakeRamp(&b, w, r);
     for (w.obs()) |o| {
         switch (o.Kind) {
             .rock => bakeBoulder(&b, o),
