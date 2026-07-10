@@ -404,16 +404,44 @@ fn sanitize(m: *Map) void {
     m.halfD = std.math.clamp(m.halfD, 12, 60);
     if (m.name.len == 0) m.name.set("Unnamed");
     if (m.boss.len == 0) m.boss.set("Champion");
+    // Bound every stored coordinate to the arena walls. nextF32 already rejected
+    // inf/NaN, but a finite-but-HUGE hand-edited value (e.g. `ledge: 1e18 ...`)
+    // would still ride through to an @intFromFloat in the editor minimap — illegal
+    // for an out-of-i32-range float — and would place content out in the void.
+    // Clamping to the walls closes both; it is a no-op for any in-arena map.
+    const hw = m.halfW;
+    const hd = m.halfD;
+    m.spawn = v3(std.math.clamp(m.spawn.x, -hw, hw), 0, std.math.clamp(m.spawn.z, -hd, hd));
+    m.portal = v3(std.math.clamp(m.portal.x, -hw, hw), 0, std.math.clamp(m.portal.z, -hd, hd));
+    m.bossPos = v3(std.math.clamp(m.bossPos.x, -hw, hw), 0, std.math.clamp(m.bossPos.z, -hd, hd));
     for (m.ledges[0..m.ledge_count]) |*l| {
         if (l.minX > l.maxX) std.mem.swap(f32, &l.minX, &l.maxX);
         if (l.minZ > l.maxZ) std.mem.swap(f32, &l.minZ, &l.maxZ);
+        l.minX = std.math.clamp(l.minX, -hw, hw);
+        l.maxX = std.math.clamp(l.maxX, -hw, hw);
+        l.minZ = std.math.clamp(l.minZ, -hd, hd);
+        l.maxZ = std.math.clamp(l.maxZ, -hd, hd);
     }
     for (m.ramps[0..m.ramp_count]) |*r| {
         if (r.minX > r.maxX) std.mem.swap(f32, &r.minX, &r.maxX);
         if (r.minZ > r.maxZ) std.mem.swap(f32, &r.minZ, &r.maxZ);
+        r.minX = std.math.clamp(r.minX, -hw, hw);
+        r.maxX = std.math.clamp(r.maxX, -hw, hw);
+        r.minZ = std.math.clamp(r.minZ, -hd, hd);
+        r.maxZ = std.math.clamp(r.maxZ, -hd, hd);
+    }
+    for (m.obstacles[0..m.obstacle_count]) |*o| {
+        o.Pos.x = std.math.clamp(o.Pos.x, -hw, hw);
+        o.Pos.z = std.math.clamp(o.Pos.z, -hd, hd);
+    }
+    for (m.decor[0..m.decor_count]) |*d| {
+        d.Pos.x = std.math.clamp(d.Pos.x, -hw, hw);
+        d.Pos.z = std.math.clamp(d.Pos.z, -hd, hd);
     }
     for (m.packs[0..m.pack_count]) |*p| {
         p.count = std.math.clamp(p.count, 1, 16);
+        p.x = std.math.clamp(p.x, -hw, hw);
+        p.z = std.math.clamp(p.z, -hd, hd);
     }
 }
 

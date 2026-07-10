@@ -167,7 +167,7 @@ const SelRect = struct {
     maxZ: f32,
 
     fn contains(s: SelRect, x: f32, z: f32) bool {
-        return x >= s.minX and x <= s.maxX and z >= s.minZ and z <= s.maxZ;
+        return world.inRect(s.minX, s.maxX, s.minZ, s.maxZ, x, z);
     }
 };
 
@@ -784,10 +784,11 @@ fn eraseFeatureAt(g: *Game, p: rl.Vector3) bool {
 fn finishDrag(g: *Game, a: rl.Vector3, b: rl.Vector3) bool {
     const ed = &g.ed;
     const m = &g.map;
-    const minX = @min(a.x, b.x);
-    const maxX = @max(a.x, b.x);
-    const minZ = @min(a.z, b.z);
-    const maxZ = @max(a.z, b.z);
+    const s = normRect(a, b);
+    const minX = s.minX;
+    const maxX = s.maxX;
+    const minZ = s.minZ;
+    const maxZ = s.maxZ;
     if (maxX - minX < FEATURE_MIN_SPAN or maxZ - minZ < FEATURE_MIN_SPAN) {
         ed.status("drag a bigger rectangle", .{});
         return false;
@@ -1033,6 +1034,7 @@ pub fn update(g: *Game, dt: f32) void {
 
     // A modal owns ALL input except its own keys (handled by the overlay).
     if (ed.modal != .none) {
+        releaseGrab(g); // a modal opened mid pack-drag must not leave the grab armed
         if (rl.isKeyPressed(.escape)) {
             // Esc = cancel: the pack modal edits live state, so restore it.
             if (ed.modal == .pack_edit) g.map = packEditBefore;
@@ -1221,6 +1223,7 @@ pub fn update(g: *Game, dt: f32) void {
         ed.selDrag = null;
         ed.selMove = null;
         if (ed.strokeActive) endStroke(ed);
+        releaseGrab(g); // a pack grab dragged onto chrome/a menu is released here too
         return;
     }
     const pt = mousePoint(g);
@@ -1360,6 +1363,23 @@ fn endStroke(ed: *Editor) void {
     ed.strokeChanged = false;
 }
 
+// Release a pack grab that was interrupted before its own mouse-up handler could
+// run — the pointer wandered onto chrome/a menu, or a modal opened mid-drag. The
+// grab persists across frames, so an early `return` in update() that forgot it
+// would leave grabIdx armed with the button already up, and the NEXT placement
+// click would silently teleport the grabbed pack instead. Commit the drag exactly
+// like a release-with-move, but only if the pack actually moved (a bare grab that
+// merely brushed chrome is a no-op — no phantom undo step, no phantom dirty flag).
+fn releaseGrab(g: *Game) void {
+    const ed = &g.ed;
+    const gi = ed.grabIdx orelse return;
+    ed.grabIdx = null;
+    if (gi < g.map.pack_count and !std.meta.eql(g.map.packs[gi], packEditBefore.packs[gi])) {
+        pushUndoFrom(&packEditBefore);
+        ed.dirty = true;
+    }
+}
+
 // ---- Drawing (world) ----
 
 // Render the world under an "editor sun": the same torch pipeline, but the light
@@ -1477,13 +1497,9 @@ fn drawMarkers(g: *Game) void {
     // Live drag rect preview for ledge/ramp (corners snapped like the commit).
     if (ed.dragStart) |a| {
         if (mousePoint(g)) |raw| {
-            const b = toolPoint(ed, raw);
-            const minX = @min(a.x, b.x);
-            const maxX = @max(a.x, b.x);
-            const minZ = @min(a.z, b.z);
-            const maxZ = @max(a.z, b.z);
+            const s = normRect(a, toolPoint(ed, raw));
             const col = if (ed.floorBrush() == .ledge) rgba(255, 220, 120, 220) else rgba(120, 255, 180, 220);
-            rl.drawCubeWiresV(v3((minX + maxX) / 2, ed.featureH / 2, (minZ + maxZ) / 2), v3(maxX - minX, ed.featureH, maxZ - minZ), col);
+            rl.drawCubeWiresV(v3((s.minX + s.maxX) / 2, ed.featureH / 2, (s.minZ + s.maxZ) / 2), v3(s.maxX - s.minX, ed.featureH, s.maxZ - s.minZ), col);
         }
     }
 

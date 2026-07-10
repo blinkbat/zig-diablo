@@ -544,7 +544,7 @@ fn drawHUD(g: *Game) void {
 // A little corked flask icon (bulb + neck + shine), used by the belt slots.
 fn flaskIcon(x: i32, y: i32, col: rl.Color) void {
     rl.drawRectangle(x + 4, y + 2, 6, 5, rgba(24, 20, 16, 255)); // neck
-    rl.drawRectangle(x + 3, y, 8, 3, rgba(150, 112, 70, 255)); // cork
+    rl.drawRectangle(x + 3, y, 8, 3, theme.corkColor); // cork
     rl.drawRectangleRounded(.{ .x = fi(x), .y = fi(y + 6), .width = 14, .height = 13 }, 0.7, 6, lerpColor(col, rl.Color.black, 0.25));
     rl.drawRectangleRounded(.{ .x = fi(x + 2), .y = fi(y + 8), .width = 10, .height = 9 }, 0.7, 6, col);
     rl.drawRectangle(x + 3, y + 9, 2, 5, withAlpha(rl.Color.white, 90)); // glass shine
@@ -714,7 +714,7 @@ fn drawVictory(g: *Game) void {
     const r = @sqrt(@as(f32, @floatFromInt(cx * cx + cy * cy))) * 1.05;
     rl.drawCircleGradient(cx, cy, r, rgba(0, 0, 0, 0), rgba(90, 60, 0, 160));
     emberField(g.elapsed, 26, rgba(255, 215, 90, 200), false);
-    glowCentered("VICTORY!", cy - 90, 80, rgba(255, 215, 80, 255), rgba(120, 80, 10, 130));
+    glowCentered("VICTORY!", cy - 90, 80, theme.goldColor, rgba(120, 80, 10, 130));
     centered("You have cleared the catacombs and triumphed over the darkness.", cy + 10, 22, rgba(230, 220, 200, 255));
     var buf: [96]u8 = undefined;
     const s = std.fmt.bufPrintZ(&buf, "Final level {d}  -  {d} gold  -  {d} kills", .{ g.p.Level, g.p.Gold, g.kills }) catch "";

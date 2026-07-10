@@ -1838,7 +1838,7 @@ fn drawLoot(lootList: *std.ArrayList(LootDrop), lightXZ: rl.Vector3, torchR: f32
                 const col = if (d.Kind == .health_potion) theme.healthColor else theme.manaColor;
                 rl.drawCapsule(v3(d.Pos.x, y - 0.08, d.Pos.z), v3(d.Pos.x, y + 0.1, d.Pos.z), 0.17, 8, 6, col);
                 rl.drawCylinderEx(v3(d.Pos.x, y + 0.1, d.Pos.z), v3(d.Pos.x, y + 0.28, d.Pos.z), 0.06, 0.05, 8, lerpColor(col, rl.Color.white, 0.4));
-                rl.drawCylinderEx(v3(d.Pos.x, y + 0.28, d.Pos.z), v3(d.Pos.x, y + 0.35, d.Pos.z), 0.075, 0.07, 8, rgba(150, 112, 70, 255));
+                rl.drawCylinderEx(v3(d.Pos.x, y + 0.28, d.Pos.z), v3(d.Pos.x, y + 0.35, d.Pos.z), 0.075, 0.07, 8, theme.corkColor);
             },
         }
     }

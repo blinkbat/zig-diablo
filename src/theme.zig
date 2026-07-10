@@ -17,6 +17,10 @@ pub const manaSocket = rgba(16, 22, 60, 255);
 // Gold (currency): coin drop, pickup popup, and belt total all read as one color.
 pub const goldColor = rgba(255, 215, 80, 255);
 
+// Cork: the stopper on a potion flask. One tone so the belt-slot icon and the
+// world drop's flask read as the same corked bottle.
+pub const corkColor = rgba(150, 112, 70, 255);
+
 // Brass trim: the thin warm liner on HUD sockets, bars, and panels — one metal
 // throughout so the interface reads as a single forged kit.
 pub const trimColor = rgba(150, 116, 60, 255);

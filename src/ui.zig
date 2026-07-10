@@ -113,16 +113,25 @@ pub fn stepperF(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *f32, step: f
     hudx.text(label, x, y + 3, 15, withAlpha(theme.labelColor, 230));
     const bx = x + 92;
     var changed = false;
+    // Only report a change when the CLAMPED value actually moved: pressing +/- at
+    // a bound must not bank a no-op undo step or raise the dirty flag (which would
+    // then pop a spurious "unsaved changes" confirm).
     if (button(ctx, rect(bx, y, 22, 22), "-", 16, false)) {
-        v.* = mathx.clampF(v.* - step, min, max);
-        changed = true;
+        const nv = mathx.clampF(v.* - step, min, max);
+        if (nv != v.*) {
+            v.* = nv;
+            changed = true;
+        }
     }
     var buf: [24]u8 = undefined;
     const s = std.fmt.bufPrintZ(&buf, "{d:.1}", .{v.*}) catch "";
     hudx.text(s, bx + 30 + @divTrunc(34 - hudx.textW(s, 16), 2), y + 3, 16, rgba(255, 240, 205, 255));
     if (button(ctx, rect(bx + 96, y, 22, 22), "+", 16, false)) {
-        v.* = mathx.clampF(v.* + step, min, max);
-        changed = true;
+        const nv = mathx.clampF(v.* + step, min, max);
+        if (nv != v.*) {
+            v.* = nv;
+            changed = true;
+        }
     }
     return changed;
 }
@@ -132,16 +141,23 @@ pub fn stepperI(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *i32, min: i3
     hudx.text(label, x, y + 3, 15, withAlpha(theme.labelColor, 230));
     const bx = x + 92;
     var changed = false;
+    // Same as stepperF: a press that clamps to no change is not a change.
     if (button(ctx, rect(bx, y, 22, 22), "-", 16, false)) {
-        v.* = mathx.clampI(v.* - 1, min, max);
-        changed = true;
+        const nv = mathx.clampI(v.* - 1, min, max);
+        if (nv != v.*) {
+            v.* = nv;
+            changed = true;
+        }
     }
     var buf: [16]u8 = undefined;
     const s = std.fmt.bufPrintZ(&buf, "{d}", .{v.*}) catch "";
     hudx.text(s, bx + 30 + @divTrunc(34 - hudx.textW(s, 16), 2), y + 3, 16, rgba(255, 240, 205, 255));
     if (button(ctx, rect(bx + 96, y, 22, 22), "+", 16, false)) {
-        v.* = mathx.clampI(v.* + 1, min, max);
-        changed = true;
+        const nv = mathx.clampI(v.* + 1, min, max);
+        if (nv != v.*) {
+            v.* = nv;
+            changed = true;
+        }
     }
     return changed;
 }
