@@ -15,6 +15,10 @@ pub const rollIframe = 0.34;
 // swingDur is the melee swing animation length (seconds).
 pub const swingDur = 0.22;
 
+// How long (seconds) the hero flashes white when struck. Owned here as a named const
+// (like monster_hitflash on the monster) rather than a bare literal in takeDamage.
+pub const hitflash = 0.25;
+
 pub const maxPots = 9;
 
 // The hero's collision radius — the single source of truth. Used for movement
@@ -128,7 +132,7 @@ pub const Player = struct {
     pub fn takeDamage(p: *Player, dmg: f32) void {
         p.HP -= dmg;
         if (p.HP < 0) p.HP = 0;
-        p.hitFlash = 0.25;
+        p.hitFlash = hitflash;
     }
 
     pub fn regen(p: *Player, dt: f32) void {

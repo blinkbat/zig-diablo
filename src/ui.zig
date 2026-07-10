@@ -110,7 +110,7 @@ pub fn chip(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, active: bool, usedW:
 
 // [-] value [+] stepper for a float. Returns true when the value changed.
 pub fn stepperF(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *f32, step: f32, min: f32, max: f32) bool {
-    hudx.text(label, x, y + 3, 15, rgba(200, 190, 172, 230));
+    hudx.text(label, x, y + 3, 15, withAlpha(theme.labelColor, 230));
     const bx = x + 92;
     var changed = false;
     if (button(ctx, rect(bx, y, 22, 22), "-", 16, false)) {
@@ -129,7 +129,7 @@ pub fn stepperF(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *f32, step: f
 
 // [-] value [+] stepper for an integer.
 pub fn stepperI(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *i32, min: i32, max: i32) bool {
-    hudx.text(label, x, y + 3, 15, rgba(200, 190, 172, 230));
+    hudx.text(label, x, y + 3, 15, withAlpha(theme.labelColor, 230));
     const bx = x + 92;
     var changed = false;
     if (button(ctx, rect(bx, y, 22, 22), "-", 16, false)) {

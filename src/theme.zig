@@ -24,3 +24,7 @@ pub const trimColor = rgba(150, 116, 60, 255);
 // Ink: the near-black backing every pill, bar and plaque sits on (used with
 // withAlpha at each site). One tone so the whole interface shares one shadow.
 pub const ink = rgba(8, 6, 5, 255);
+
+// Muted parchment label text: panel captions, stepper labels, modal field labels.
+// One hue (alpha varies per site via withAlpha) so every chrome label reads the same.
+pub const labelColor = rgba(200, 190, 172, 255);

@@ -12,6 +12,10 @@ pub const rgba = rl.Color.init;
 pub const zero3 = rl.Vector3{ .x = 0, .y = 0, .z = 0 };
 
 pub fn clampF(v: f32, lo: f32, hi: f32) f32 {
+    // NaN slips past ordered comparisons (both `<` and `>` are false), so a NaN
+    // would pass through unclamped and blow up any downstream @intFromFloat. Pin
+    // it to lo — a clamp has no meaningful position for NaN, and lo is safe.
+    if (std.math.isNan(v)) return lo;
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
@@ -144,6 +148,12 @@ pub const Rng = struct {
     /// [0,1) f64 — Go's rng.Float64().
     pub fn float64(self: *Rng) f64 {
         return self.rand().float(f64);
+    }
+
+    /// Uniform f32 in [lo, hi). Used for damage rolls (min..max) so player and
+    /// monster attacks share one roll expression.
+    pub fn range(self: *Rng, lo: f32, hi: f32) f32 {
+        return lo + self.float() * (hi - lo);
     }
 
     /// [0,n) — Go's rng.Intn(n). Returns 0 for n<=0 (Go would panic).

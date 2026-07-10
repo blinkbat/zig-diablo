@@ -6,10 +6,7 @@ const monster = @import("monster.zig");
 const v3 = mathx.v3;
 const rgba = mathx.rgba;
 const ground = mathx.ground;
-const distXZ = mathx.distXZ;
 const dist2XZ = mathx.dist2XZ;
-const lerpColor = mathx.lerpColor;
-const Rng = mathx.Rng;
 
 // Obstacle is a blocking piece of scenery. Collision is circular in the XZ plane.
 pub const ObstacleKind = enum(u8) { rock, tree, gravestone };

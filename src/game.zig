@@ -42,6 +42,10 @@ const CAST_RATE = 0.7; // firebolt cooldown (seconds)
 const CRIT_CHANCE = 0.15;
 const CRIT_MULT = 2.0;
 
+// Scuffed-earth dust kicked up by footsteps and dodges — one tint (alpha varies per
+// use) so the two effects read as the same dry road.
+const DUST_COLOR = rgba(200, 172, 132, 255);
+
 // Torch tuning. The light is anchored to the CARRIED torch: its XZ tracks the flame
 // in the hero's off-hand (smoothed — see torchXZ), so shadows fall away from the
 // torch side and swing around as the hero turns, instead of radiating from a lamp
@@ -138,6 +142,13 @@ pub const DisplayMode = enum { windowed, borderless, fullscreen };
 
 pub const menuRootItems = [_][:0]const u8{ "Adventure", "Editor", "Options", "Quit" };
 
+// "Options" is index 2 of menuRootItems: entering the options screen and every
+// return-from-options lands the cursor here, so the position lives in one place.
+pub const MENU_OPTIONS_IDX = 2;
+// The options screen has two rows — [display-mode cycler, Back] (see hudx) — and
+// key-nav wrap must agree with that count.
+pub const MENU_OPTIONS_COUNT = 2;
+
 // Switch the window's display mode, unwinding whatever mode is active first so
 // the raylib toggles never stack (each toggle is its own on/off latch).
 fn setDisplayMode(g: *Game, want: DisplayMode) void {
@@ -156,7 +167,7 @@ fn setDisplayMode(g: *Game, want: DisplayMode) void {
 }
 
 pub fn cycleDisplayMode(g: *Game, fwd: bool) void {
-    const n = 3;
+    const n: i32 = @typeInfo(DisplayMode).@"enum".fields.len; // add a mode and the cycle covers it
     const cur: i32 = @intFromEnum(g.displayMode);
     const next: DisplayMode = @enumFromInt(@mod(cur + (if (fwd) @as(i32, 1) else -1) + n, n));
     setDisplayMode(g, next);
@@ -169,7 +180,7 @@ pub fn menuActivate(g: *Game, idx: i32) void {
             0 => cycleDisplayMode(g, true),
             else => {
                 g.menuMode = .root;
-                g.menuSel = 2;
+                g.menuSel = MENU_OPTIONS_IDX;
             },
         }
         return;
@@ -177,7 +188,7 @@ pub fn menuActivate(g: *Game, idx: i32) void {
     switch (idx) {
         0 => g.startRun(),
         1 => editor.enter(g),
-        2 => {
+        MENU_OPTIONS_IDX => {
             g.menuMode = .options;
             g.menuSel = 0;
         },
@@ -198,6 +209,13 @@ fn meleeReach(atkRange: f32, targetRadius: f32) f32 {
 fn playerReach(atkRange: f32, targetRadius: f32) f32 {
     return atkRange + targetRadius;
 }
+
+// Max vertical gap at which two bodies count as "on comparable ground" for melee:
+// a strike (either direction) and a monster's decision to wind up all read this one
+// rule, so nobody can swing across a cliff/rampart edge. One source keeps the three
+// combat gates in lockstep. (Comfortably above world.STEP_MAX so a single step up a
+// ramp is still within reach.)
+const SAME_GROUND_DY = 1.0;
 
 // Low-poly sphere. raylib's drawSphere defaults to 16x16 and regenerates on the CPU
 // with per-vertex trig on every call — the scene is drawn twice a frame (shadow depth
@@ -435,7 +453,7 @@ pub const Game = struct {
     // inVision: within the torch's lit disc. Beyond it the world is black, so the hero
     // can't target, and health bars / popups there would float in darkness.
     pub fn inVision(g: *const Game, p: rl.Vector3) bool {
-        return distXZ(p, g.p.Pos) <= CULL;
+        return dist2XZ(p, g.p.Pos) <= CULL * CULL; // squared: pure threshold, called per monster/frame
     }
 
     pub fn objectCount(g: *Game) usize {
@@ -613,7 +631,7 @@ fn doDodge(g: *Game, dir: rl.Vector3) void {
     if (g.p.startRoll(dir)) {
         g.rumble.play(rumble.dodge);
         // The tuck kicks a fan of scuffed dust out behind the launch point.
-        g.parts.burst(&g.rng, v3(g.p.Pos.x - dir.x * 0.3, g.p.Pos.y + 0.12, g.p.Pos.z - dir.z * 0.3), 7, 2.6, 0.07, 0.4, rgba(200, 172, 132, 110), 5);
+        g.parts.burst(&g.rng, v3(g.p.Pos.x - dir.x * 0.3, g.p.Pos.y + 0.12, g.p.Pos.z - dir.z * 0.3), 7, 2.6, 0.07, 0.4, mathx.withAlpha(DUST_COLOR, 110), 5);
     }
 }
 
@@ -793,7 +811,7 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
                     .Life = 0.3 + g.rng.float() * 0.2,
                     .maxLife = 0.5,
                     .Size = 0.05 + g.rng.float() * 0.03,
-                    .Color = rgba(200, 172, 132, 80),
+                    .Color = mathx.withAlpha(DUST_COLOR, 80),
                     .grav = 1.2,
                     .drag = 2.2,
                 });
@@ -813,8 +831,8 @@ fn updatePlayerAttack(g: *Game) void {
         p.targetMonster = -1;
         return;
     }
-    if (distXZ(p.Pos, m.Pos) <= playerReach(p.atkRange, m.Radius) and @abs(m.Pos.y - p.Pos.y) < 1.0) {
-        var dmg = p.MinDmg + g.rng.float() * (p.MaxDmg - p.MinDmg);
+    if (distXZ(p.Pos, m.Pos) <= playerReach(p.atkRange, m.Radius) and @abs(m.Pos.y - p.Pos.y) < SAME_GROUND_DY) {
+        var dmg = g.rng.range(p.MinDmg, p.MaxDmg);
         const crit = g.rng.float() < CRIT_CHANCE;
         if (crit) dmg *= CRIT_MULT;
         p.Facing = dirXZ(p.Pos, m.Pos);
@@ -936,7 +954,7 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
     // Melee: close the gap, then commit to a telegraphed swing — but never wind up
     // at someone standing a cliff above or below; keep pressing toward them (which
     // funnels the pack to the ramp) instead of swinging at a wall of stone.
-    if (toPlayer > m.atkRange + g.p.Radius or @abs(m.Pos.y - g.p.Pos.y) >= 1.0) {
+    if (toPlayer > m.atkRange + playermod.radius or @abs(m.Pos.y - g.p.Pos.y) >= SAME_GROUND_DY) {
         moveMonster(g, m, m.Facing, dt); // == dirXZ(m.Pos, g.p.Pos), already set above
     } else if (m.atkCD <= 0) {
         m.windup = m.windupTime;
@@ -945,7 +963,7 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
 
 fn resolveMonsterAttack(g: *Game, m: *Monster) void {
     if (!g.p.alive()) return;
-    const dmg = m.MinDmg + g.rng.float() * (m.MaxDmg - m.MinDmg);
+    const dmg = g.rng.range(m.MinDmg, m.MaxDmg);
     if (m.Ranged) {
         // Arrows angle up or down to the player's actual elevation — a rampart is
         // cover from the cliff side, never from an archer with a clean line.
@@ -955,7 +973,7 @@ fn resolveMonsterAttack(g: *Game, m: *Monster) void {
     // Use the module radius constant — the SAME source the drawn telegraph ring reads
     // (drawMonstersFX) — so standing just outside the red ring is genuinely safe.
     // Melee cannot land across a cliff: reach requires standing on comparable ground.
-    if (distXZ(m.Pos, g.p.Pos) <= meleeReach(m.atkRange, playermod.radius) and @abs(m.Pos.y - g.p.Pos.y) < 1.0) hitPlayer(g, dmg);
+    if (distXZ(m.Pos, g.p.Pos) <= meleeReach(m.atkRange, playermod.radius) and @abs(m.Pos.y - g.p.Pos.y) < SAME_GROUND_DY) hitPlayer(g, dmg);
 }
 
 // Push overlapping monsters apart so a pack doesn't collapse into one point.
@@ -1032,7 +1050,7 @@ fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
             .Life = 0.28 + g.rng.float() * 0.22,
             .maxLife = 0.5,
             .Size = 0.09,
-            .Color = if (g.rng.float() < 0.6) rgba(255, 150, 40, 255) else rgba(255, 220, 120, 255),
+            .Color = if (g.rng.float() < 0.6) projectile.fireboltColor else rgba(255, 220, 120, 255),
             .grav = -1.5,
             .drag = 1.5,
         });
@@ -1046,13 +1064,13 @@ fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
     // its mark instead of clipping everything on the way.
     if (pr.FromPlayer) {
         for (g.liveMonsters()) |*m| {
-            if (m.alive() and distXZ(m.Pos, pr.Pos) < m.Radius + pr.Radius and @abs(pr.Pos.y - (m.Pos.y + m.Height * 0.55)) < m.Height * 0.55 + 0.7) {
+            if (m.alive() and dist2XZ(m.Pos, pr.Pos) < (m.Radius + pr.Radius) * (m.Radius + pr.Radius) and @abs(pr.Pos.y - (m.Pos.y + m.Height * 0.55)) < m.Height * 0.55 + 0.7) {
                 damageMonster(g, m, pr.Damage, false);
                 impactBurst(g, pr);
                 return false;
             }
         }
-    } else if (g.p.alive() and distXZ(g.p.Pos, pr.Pos) < g.p.Radius + pr.Radius and @abs(pr.Pos.y - (g.p.Pos.y + 1.1)) < 1.7) {
+    } else if (g.p.alive() and dist2XZ(g.p.Pos, pr.Pos) < (g.p.Radius + pr.Radius) * (g.p.Radius + pr.Radius) and @abs(pr.Pos.y - (g.p.Pos.y + 1.1)) < 1.7) {
         hitPlayer(g, pr.Damage);
         impactBurst(g, pr);
         return false;
@@ -1080,8 +1098,9 @@ fn keepLoot(c: SweepCtx, d: *LootDrop) bool {
     // Same-level pickup only: standing on the rampart edge must not hoover the
     // drops glittering on the floor below.
     if (distXZ(d.Pos, c.g.p.Pos) < c.g.p.Radius + 1.3 and @abs(d.Pos.y - c.g.p.Pos.y) < 1.2) {
-        collect(c.g, d.*);
-        return false;
+        // Only remove the drop if it was actually picked up; a full belt leaves the
+        // potion glittering on the ground instead of destroying it with a lying toast.
+        if (collect(c.g, d.*)) return false;
     }
     return true;
 }
@@ -1090,19 +1109,26 @@ fn updateLoot(g: *Game, dt: f32) void {
     g.lootList.shrinkRetainingCapacity(n);
 }
 
-fn collect(g: *Game, d: LootDrop) void {
+// Returns true if the drop was consumed (remove it), false if the pickup was
+// declined (e.g. belt already full) so the caller leaves it on the ground.
+fn collect(g: *Game, d: LootDrop) bool {
     switch (d.Kind) {
         .gold => {
             g.p.Gold += d.Amount;
             g.parts.burst(&g.rng, v3(d.Pos.x, d.Pos.y + 0.4, d.Pos.z), 8, 2.5, 0.07, 0.6, theme.goldColor, -1);
+            return true;
         },
         .health_potion => {
-            if (g.p.HealthPots < playermod.maxPots) g.p.HealthPots += 1;
+            if (g.p.HealthPots >= playermod.maxPots) return false;
+            g.p.HealthPots += 1;
             g.setToast("Picked up a Health Potion", .{});
+            return true;
         },
         .mana_potion => {
-            if (g.p.ManaPots < playermod.maxPots) g.p.ManaPots += 1;
+            if (g.p.ManaPots >= playermod.maxPots) return false;
+            g.p.ManaPots += 1;
             g.setToast("Picked up a Mana Potion", .{});
+            return true;
         },
     }
 }
@@ -1650,8 +1676,10 @@ pub fn drawMonsterBody(m: *const Monster) void {
 // memory in the "seen" band, never monsters or loot. The static scene mesh, by
 // contrast, is always drawn in full.
 fn bodyVisible(pos: rl.Vector3, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams) bool {
-    if (distXZ(pos, lightXZ) <= torchR) return true;
-    return fp.intensity > 0 and distXZ(pos, fp.pos) <= fp.radius;
+    // Squared compares: this is the most-called cull test (every monster/loot, in
+    // each of the 2-3 draw passes), and it's a pure threshold — no @sqrt needed.
+    if (dist2XZ(pos, lightXZ) <= torchR * torchR) return true;
+    return fp.intensity > 0 and dist2XZ(pos, fp.pos) <= fp.radius * fp.radius;
 }
 
 // Depth pass: living bodies visible this frame cast. Bodies neither near the torch
@@ -2039,14 +2067,14 @@ pub fn run(shot: bool) void {
 
         switch (g.scene) {
             .menu => {
-                const n: i32 = if (g.menuMode == .root) menuRootItems.len else 2;
+                const n: i32 = if (g.menuMode == .root) menuRootItems.len else MENU_OPTIONS_COUNT;
                 if (rl.isKeyPressed(.down) or rl.isKeyPressed(.s)) g.menuSel = @mod(g.menuSel + 1, n);
                 if (rl.isKeyPressed(.up) or rl.isKeyPressed(.w)) g.menuSel = @mod(g.menuSel - 1 + n, n);
                 if ((rl.isKeyPressed(.enter) and !altHeld) or rl.isKeyPressed(.space) or padStartPressed()) menuActivate(&g, g.menuSel);
                 if (g.menuMode == .options) {
                     if (rl.isKeyPressed(.escape)) {
                         g.menuMode = .root;
-                        g.menuSel = 2;
+                        g.menuSel = MENU_OPTIONS_IDX;
                     }
                     if (g.menuSel == 0 and (rl.isKeyPressed(.left) or rl.isKeyPressed(.right))) {
                         cycleDisplayMode(&g, rl.isKeyPressed(.right));

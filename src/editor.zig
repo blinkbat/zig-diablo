@@ -44,6 +44,10 @@ pub const Layer = enum(u8) {
     props,
     entities,
 
+    // Number of layers — derive the Tab-cycle span, the Alt-jump bound, and the
+    // per-layer brushSel[] size from this so a new layer can't skew any of them.
+    pub const N = @typeInfo(Layer).@"enum".fields.len;
+
     fn label(l: Layer) [:0]const u8 {
         return switch (l) {
             .floor => "Floor",
@@ -115,6 +119,7 @@ fn brushTipsFor(l: Layer) []const [:0]const u8 {
 }
 
 comptime {
+    std.debug.assert(layerTips.len == Layer.N); // indexed by layer ordinal in drawLayerStrip
     std.debug.assert(floorTips.len == floorBrushes.len);
     std.debug.assert(decorTips.len == decorBrushes.len);
     std.debug.assert(propTips.len == propBrushes.len);
@@ -125,10 +130,14 @@ comptime {
 // are parallel lists: pin their lengths so adding a kind can't silently skew the
 // index mapping.
 comptime {
+    std.debug.assert(floorBrushes.len == @typeInfo(FloorBrush).@"enum".fields.len);
     std.debug.assert(decorBrushes.len == @typeInfo(world.DecorKind).@"enum".fields.len + 1);
     std.debug.assert(propBrushes.len == @typeInfo(world.ObstacleKind).@"enum".fields.len + 1);
     std.debug.assert(entityBrushes.len == @typeInfo(monster.MonsterKind).@"enum".fields.len + 4);
 }
+
+// What a floor-layer brush index means (positional, matching floorBrushes).
+const FloorBrush = enum { ledge, ramp, erase };
 
 // What an entities-layer brush index means.
 const EntityBrush = enum { pack, boss, spawn, portal, erase };
@@ -187,7 +196,7 @@ var selBankPending = false; // selection-move undo banks on first movement only
 // ground, accent, and torch light together.
 const Preset = struct { name: [:0]const u8, ground: rl.Color, accent: rl.Color, light: [3]f32 };
 const presets = [_]Preset{
-    .{ .name = "Moor", .ground = rgba(92, 80, 62, 255), .accent = rgba(72, 62, 50, 255), .light = .{ 1.04, 0.94, 0.80 } },
+    .{ .name = "Moor", .ground = mapmod.DEFAULT_GROUND, .accent = mapmod.DEFAULT_ACCENT, .light = .{ 1.04, 0.94, 0.80 } },
     .{ .name = "Plains", .ground = rgba(108, 120, 138, 255), .accent = rgba(86, 96, 112, 255), .light = .{ 0.90, 0.97, 1.08 } },
     .{ .name = "Stony", .ground = rgba(96, 92, 80, 255), .accent = rgba(74, 70, 60, 255), .light = .{ 1.00, 0.96, 0.87 } },
     .{ .name = "Wood", .ground = rgba(62, 58, 48, 255), .accent = rgba(48, 46, 38, 255), .light = .{ 0.88, 1.00, 0.88 } },
@@ -230,7 +239,7 @@ fn pushUndoFrom(before: *const mapmod.Map) void {
 
 fn doUndo(g: *Game) void {
     const ed = &g.ed;
-    if (ed.dragStart != null or ed.grabIdx != null or ed.strokeActive) return; // never pop mid-drag
+    if (ed.dragStart != null or ed.grabIdx != null or ed.strokeActive or ed.selMove != null or ed.selDrag != null) return; // never pop mid-drag
     if (undoLen == 0) return ed.status("nothing to undo", .{});
     if (redoLen < UNDO_CAP) {
         redoStack[redoLen] = g.map;
@@ -244,7 +253,7 @@ fn doUndo(g: *Game) void {
 
 fn doRedo(g: *Game) void {
     const ed = &g.ed;
-    if (ed.dragStart != null or ed.grabIdx != null or ed.strokeActive) return;
+    if (ed.dragStart != null or ed.grabIdx != null or ed.strokeActive or ed.selMove != null or ed.selDrag != null) return;
     if (redoLen == 0) return ed.status("nothing to redo", .{});
     if (undoLen < UNDO_CAP) {
         undoStack[undoLen] = g.map;
@@ -258,7 +267,7 @@ fn doRedo(g: *Game) void {
 
 pub const Editor = struct {
     layer: Layer = .props,
-    brushSel: [4]usize = .{ 0, 0, 0, 0 }, // remembered selection per layer
+    brushSel: [Layer.N]usize = .{0} ** Layer.N, // remembered selection per layer
     rise: world.RampRise = .xpos,
     featureH: f32 = 2.4, // height stamped on new ledges/ramps
     packCount: i32 = 3, // members stamped per new pack
@@ -352,6 +361,10 @@ pub const Editor = struct {
         return @enumFromInt(@min(ed.brush(), lastVariant(world.ObstacleKind)));
     }
 
+    fn floorBrush(ed: *const Editor) FloorBrush {
+        return @enumFromInt(@min(ed.brush(), @typeInfo(FloorBrush).@"enum".fields.len - 1));
+    }
+
     fn entityBrush(ed: *const Editor) EntityBrush {
         // The first N brushes are the N monster-kind packs; tie that boundary to the
         // enum (not a literal 0..3) so adding a kind can't turn a pack into the boss.
@@ -437,6 +450,11 @@ const GRID = 2.0;
 // a little closer to the wall than the spawn/portal/boss anchors do.
 const CONTENT_INSET = 1.2;
 const ANCHOR_INSET = 2.0;
+
+// Smallest usable ledge/ramp footprint. A drag smaller than this is rejected at
+// commit, and a feature that a resize clamps below this is dropped — the same bound,
+// so you can never end up with a feature you couldn't have authored.
+const FEATURE_MIN_SPAN = 1.5;
 
 // Editor tuning ranges. Each min/max/step is a single source shared by the [ / ]
 // hotkeys AND the properties-panel stepper for the same value, so the two adjust
@@ -770,12 +788,12 @@ fn finishDrag(g: *Game, a: rl.Vector3, b: rl.Vector3) bool {
     const maxX = @max(a.x, b.x);
     const minZ = @min(a.z, b.z);
     const maxZ = @max(a.z, b.z);
-    if (maxX - minX < 1.5 or maxZ - minZ < 1.5) {
+    if (maxX - minX < FEATURE_MIN_SPAN or maxZ - minZ < FEATURE_MIN_SPAN) {
         ed.status("drag a bigger rectangle", .{});
         return false;
     }
-    switch (ed.brush()) {
-        0 => { // Ledge
+    switch (ed.floorBrush()) {
+        .ledge => {
             if (m.ledge_count >= world.MAX_LEDGES) {
                 ed.status("ledge limit reached", .{});
                 return false;
@@ -783,7 +801,7 @@ fn finishDrag(g: *Game, a: rl.Vector3, b: rl.Vector3) bool {
             m.ledges[m.ledge_count] = .{ .minX = minX, .maxX = maxX, .minZ = minZ, .maxZ = maxZ, .h = ed.featureH };
             m.ledge_count += 1;
         },
-        1 => { // Ramp
+        .ramp => {
             if (m.ramp_count >= world.MAX_RAMPS) {
                 ed.status("ramp limit reached", .{});
                 return false;
@@ -791,7 +809,7 @@ fn finishDrag(g: *Game, a: rl.Vector3, b: rl.Vector3) bool {
             m.ramps[m.ramp_count] = .{ .minX = minX, .maxX = maxX, .minZ = minZ, .maxZ = maxZ, .h = ed.featureH, .rise = ed.rise };
             m.ramp_count += 1;
         },
-        else => return false,
+        .erase => return false,
     }
     markDirty(g);
     return true;
@@ -1079,18 +1097,18 @@ pub fn update(g: *Game, dt: f32) void {
     // correction loop reads as jitter. Snap during the drag, glide otherwise.
     if (panning) g.rig.snap(ed.camTarget) else g.rig.follow(ed.camTarget, dt);
 
-    // Layers: Tab cycles (Shift reverses), Alt+1..4 jumps (crawler grammar).
+    // Layers: Tab cycles (Shift reverses), Alt+1..N jumps (crawler grammar).
     if (rl.isKeyPressed(.tab)) {
-        const n = 4;
+        const n: i32 = Layer.N;
         const cur: i32 = @intFromEnum(ed.layer);
         ed.layer = @enumFromInt(@mod(cur + (if (shift) @as(i32, -1) else 1) + n, n));
         ed.status("layer: {s}", .{ed.layer.label()});
     }
-    // Brushes: plain 1..9 within the layer; with Alt held the first four jump layers.
+    // Brushes: plain 1..9 within the layer; with Alt held the first N jump layers.
     const numKeys = [_]rl.KeyboardKey{ .one, .two, .three, .four, .five, .six, .seven, .eight, .nine };
     for (numKeys, 0..) |k, i| {
         if (rl.isKeyPressed(k)) {
-            if (alt and i < 4) {
+            if (alt and i < Layer.N) {
                 ed.layer = @enumFromInt(i);
                 ed.status("layer: {s}", .{ed.layer.label()});
             } else if (!alt and i < brushesFor(ed.layer).len) {
@@ -1133,7 +1151,7 @@ pub fn update(g: *Game, dt: f32) void {
         }
     }
     if (rl.isKeyPressed(.g)) ed.grid = !ed.grid;
-    if (rl.isKeyPressed(.x) and !ctrl) scatterDecor(g); // leave Ctrl+X for a future cut
+    if (rl.isKeyPressed(.x) and !ctrl and ed.layer == .decor) scatterDecor(g); // Decor-only, matches the Scatter button (Ctrl+X is cut, below)
 
     if (ctrl and shift and rl.isKeyPressed(.s)) {
         openModal(ed, .save_as);
@@ -1464,7 +1482,7 @@ fn drawMarkers(g: *Game) void {
             const maxX = @max(a.x, b.x);
             const minZ = @min(a.z, b.z);
             const maxZ = @max(a.z, b.z);
-            const col = if (ed.brush() == 0) rgba(255, 220, 120, 220) else rgba(120, 255, 180, 220);
+            const col = if (ed.floorBrush() == .ledge) rgba(255, 220, 120, 220) else rgba(120, 255, 180, 220);
             rl.drawCubeWiresV(v3((minX + maxX) / 2, ed.featureH / 2, (minZ + maxZ) / 2), v3(maxX - minX, ed.featureH, maxZ - minZ), col);
         }
     }
@@ -1732,7 +1750,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
         markDirty(g);
     }
     y += 28;
-    hudx.text("palette", px + 10, y + 3, 15, rgba(200, 190, 172, 230));
+    hudx.text("palette", px + 10, y + 3, 15, withAlpha(theme.labelColor, 230));
     var sx = px + 76;
     for (presets) |p| {
         ui.tipFor(ctx, ui.rect(sx, y, 24, 22), p.name);
@@ -1774,7 +1792,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
             ui.panel(ui.rect(px, y, PANEL_W, 94), "TERRAIN");
             ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Height of NEW ledges/ramps; RMB a feature to apply");
             _ = ui.stepperF(ctx, px + 10, y + 28, "height", &ed.featureH, FEATURE_H_STEP, FEATURE_H_MIN, FEATURE_H_MAX);
-            if (ed.brush() == 1) {
+            if (ed.floorBrush() == .ramp) {
                 var used: i32 = 0;
                 var cx = px + 10;
                 inline for (@typeInfo(world.RampRise).@"enum".fields) |f| {
@@ -1810,7 +1828,7 @@ fn clampContents(m: *mapmod.Map) void {
         l.maxX = clampF(l.maxX, -flimW, flimW);
         l.minZ = clampF(l.minZ, -flimD, flimD);
         l.maxZ = clampF(l.maxZ, -flimD, flimD);
-        if (l.maxX - l.minX < 1.5 or l.maxZ - l.minZ < 1.5) {
+        if (l.maxX - l.minX < FEATURE_MIN_SPAN or l.maxZ - l.minZ < FEATURE_MIN_SPAN) {
             m.removeLedge(i);
         }
     }
@@ -1822,9 +1840,25 @@ fn clampContents(m: *mapmod.Map) void {
         r.maxX = clampF(r.maxX, -flimW, flimW);
         r.minZ = clampF(r.minZ, -flimD, flimD);
         r.maxZ = clampF(r.maxZ, -flimD, flimD);
-        if (r.maxX - r.minX < 1.5 or r.maxZ - r.minZ < 1.5) {
+        if (r.maxX - r.minX < FEATURE_MIN_SPAN or r.maxZ - r.minZ < FEATURE_MIN_SPAN) {
             m.removeRamp(i);
         }
+    }
+    // Placed content rides in with the terrain: props, decor, and packs must be
+    // pulled inside the shrunken wall too (same CONTENT_INSET limits pasteAt uses),
+    // or they strand outside the arena — monsters spawning in the void, floating
+    // scenery. (These have no min-span collapse, so just clamp the point.)
+    for (m.obstacles[0..m.obstacle_count]) |*o| {
+        o.Pos.x = clampF(o.Pos.x, -flimW, flimW);
+        o.Pos.z = clampF(o.Pos.z, -flimD, flimD);
+    }
+    for (m.decor[0..m.decor_count]) |*d| {
+        d.Pos.x = clampF(d.Pos.x, -flimW, flimW);
+        d.Pos.z = clampF(d.Pos.z, -flimD, flimD);
+    }
+    for (m.packs[0..m.pack_count]) |*p| {
+        p.x = clampF(p.x, -flimW, flimW);
+        p.z = clampF(p.z, -flimD, flimD);
     }
 }
 
@@ -1900,7 +1934,7 @@ fn drawStatusBar(g: *Game, W: i32, H: i32) void {
     const ed = &g.ed;
     ui.panel(ui.rect(0, H - 30, W, 30), null);
     const hints: [:0]const u8 = "Tab layer   1-9 brush   LMB paint   Shift+drag select   Ctrl+C/X/V   Del   RMB menu/pan   M mirror   [ ] size   Ctrl+Z undo   Ctrl+S save   F5 playtest";
-    hudx.text(hints, 12, H - 25, 15, rgba(200, 190, 172, 220));
+    hudx.text(hints, 12, H - 25, 15, withAlpha(theme.labelColor, 220));
 
     var right: [96]u8 = undefined;
     var coord: [:0]const u8 = "";
@@ -1910,7 +1944,7 @@ fn drawStatusBar(g: *Game, W: i32, H: i32) void {
         }
     }
     if (coord.len > 0) {
-        hudx.text(coord, W - hudx.textW(coord, 13) - 12, H - 25, 15, rgba(200, 190, 172, 220));
+        hudx.text(coord, W - hudx.textW(coord, 13) - 12, H - 25, 15, withAlpha(theme.labelColor, 220));
     }
 
     if (ed.status_t > 0 and ed.status_len > 0) {
@@ -2084,7 +2118,7 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
         .none => {},
         .save_as => {
             const mb = ui.beginModal(ctx, 420, 188, "Save As");
-            hudx.text("file name", mb.x + 24, mb.y + 46, 16, rgba(200, 190, 172, 230));
+            hudx.text("file name", mb.x + 24, mb.y + 46, 16, withAlpha(theme.labelColor, 230));
             ui.textField(ctx, ui.rect(mb.x + 24, mb.y + 68, 372, 30), &ed.field_buf, &ed.field_len, true, g.elapsed);
             // Live path preview: exactly what doSaveAs will write (crawler's
             // "Will save to:" pattern, so sanitizing never surprises).
@@ -2097,11 +2131,17 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
                 (std.fmt.bufPrintZ(&pv, "Will save to: -", .{}) catch "");
             hudx.text(preview, mb.x + 24, mb.y + 106, 15, rgba(180, 170, 152, 220));
             if (ui.button(ctx, ui.rect(mb.x + 214, mb.y + 136, 88, 30), "Save", 17, false) or rl.isKeyPressed(.enter)) doSaveAs(g);
-            if (ui.button(ctx, ui.rect(mb.x + 310, mb.y + 136, 86, 30), "Cancel", 17, false)) ed.modal = .none;
+            // Cancelling Save-As abandons any guarded action that opened it (e.g. the
+            // exit/open confirm chained through saveCurrent's no-path branch); leaving
+            // `pending` set would fire it on the NEXT successful save.
+            if (ui.button(ctx, ui.rect(mb.x + 310, mb.y + 136, 86, 30), "Cancel", 17, false)) {
+                ed.pending = .none;
+                ed.modal = .none;
+            }
         },
         .rename => {
             const mb = ui.beginModal(ctx, 420, 168, "Rename Map");
-            hudx.text("shown on the area banner", mb.x + 24, mb.y + 46, 16, rgba(200, 190, 172, 230));
+            hudx.text("shown on the area banner", mb.x + 24, mb.y + 46, 16, withAlpha(theme.labelColor, 230));
             ui.textField(ctx, ui.rect(mb.x + 24, mb.y + 68, 372, 30), &ed.field_buf, &ed.field_len, true, g.elapsed);
             const ok = ui.button(ctx, ui.rect(mb.x + 214, mb.y + 116, 88, 30), "Rename", 17, false) or rl.isKeyPressed(.enter);
             if (ok and ed.field_len > 0) {
@@ -2114,7 +2154,7 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
         },
         .new_map => {
             const mb = ui.beginModal(ctx, 420, 232, "New Map");
-            hudx.text("name", mb.x + 24, mb.y + 46, 16, rgba(200, 190, 172, 230));
+            hudx.text("name", mb.x + 24, mb.y + 46, 16, withAlpha(theme.labelColor, 230));
             ui.textField(ctx, ui.rect(mb.x + 24, mb.y + 66, 372, 30), &ed.field_buf, &ed.field_len, true, g.elapsed);
             _ = ui.stepperF(ctx, mb.x + 24, mb.y + 106, "width", &ed.newHalfW, HALF_STEP, HALF_MIN, HALF_MAX);
             _ = ui.stepperF(ctx, mb.x + 24, mb.y + 138, "depth", &ed.newHalfD, HALF_STEP, HALF_MIN, HALF_MAX);
@@ -2170,7 +2210,7 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
             const pk = &g.map.packs[ed.packEditIdx];
             const bx = mb.x;
             const by = mb.y;
-            hudx.text("kind", bx + 24, by + 48, 16, rgba(200, 190, 172, 230));
+            hudx.text("kind", bx + 24, by + 48, 16, withAlpha(theme.labelColor, 230));
             var cx = bx + 24;
             var used: i32 = 0;
             inline for (@typeInfo(monster.MonsterKind).@"enum".fields) |f| {

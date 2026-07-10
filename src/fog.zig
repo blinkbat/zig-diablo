@@ -14,10 +14,11 @@ const mathx = @import("mathx.zig");
 // the disc under the hero is painted into a CPU grid (monotonic max, so a place once
 // seen never un-reveals), the grid is re-uploaded when it changed, and the scene shader
 // samples it at each fragment's ground position to choose unseen/seen/active. Vision is
-// per-area: buildWorld makes a fresh layout, so reset() clears the grid on area entry.
+// per-area: loading a map makes a fresh layout, so reset() clears the grid on area entry.
 
-// Grid resolution over the arena square. 128 => ~0.75 world-units/texel at the largest
-// area (Half=48); bilinear sampling turns the texel steps into a soft seen/unseen edge.
+// Grid resolution over the arena square. 128 => ~0.94 world-units/texel at the largest
+// area (half-extent clamps to 60 in map.sanitize); bilinear sampling turns the texel
+// steps into a soft seen/unseen edge.
 pub const RES = 128;
 
 pub const Fog = struct {

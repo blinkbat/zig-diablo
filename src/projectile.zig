@@ -25,6 +25,10 @@ pub const arrowSpeed = 13.0;
 pub const fireboltMuzzleDY = 1.1;
 pub const arrowMuzzleDY = 1.2;
 
+// The firebolt's core orange. Public so the bolt body and its spark trail (game.zig)
+// read as one flame — change it here and the trail follows.
+pub const fireboltColor = rgba(255, 150, 40, 255);
+
 // newFirebolt is the player's right-click spell. `from` carries the caster's
 // ground height; `yVel` slopes the flight toward a raised or sunken target.
 pub fn newFirebolt(from: rl.Vector3, dir: rl.Vector3, dmg: f32, yVel: f32) Projectile {
@@ -35,7 +39,7 @@ pub fn newFirebolt(from: rl.Vector3, dir: rl.Vector3, dmg: f32, yVel: f32) Proje
         .Radius = 0.45,
         .Life = 2.0,
         .FromPlayer = true,
-        .Color = rgba(255, 150, 40, 255),
+        .Color = fireboltColor,
     };
 }
 

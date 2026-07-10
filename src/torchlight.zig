@@ -30,6 +30,14 @@ pub const SHADOW_CLIP_FAR = 45.0;
 // second depth pass cheap while its soft PCF hides the lower resolution.
 pub const FIRE_SHADOWMAP_RESOLUTION = 1024;
 
+// GPU texture units the scene shader's samplers are pinned to. Each slot is set as a
+// uniform ONCE in init() and re-bound every frame in beginScene(); the upload and the
+// bind MUST use the same number or a sampler silently reads the wrong texture. Named
+// here so the two sites can't drift.
+const SLOT_SHADOW: i32 = 10;
+const SLOT_FIRE: i32 = 11;
+const SLOT_FOG: i32 = 12;
+
 const depthVS =
     \\#version 330
     \\in vec3 vertexPosition;
@@ -147,8 +155,8 @@ const sceneFS =
     \\    // mossy-cool and dry-warm across meters, so the arena floor reads as ground
     \\    // that weathered differently place to place, not one uniform carpet. Ground
     \\    // only (up-faces) so walls and bodies keep their true tints.
-    \\    float patch = vnoise(fragPosition.xz*0.11);
-    \\    vec3 patchTint = mix(vec3(0.90, 1.03, 0.90), vec3(1.08, 0.99, 0.90), patch);
+    \\    float dryPatch = vnoise(fragPosition.xz*0.11); // NOT 'patch' — reserved GLSL keyword (Intel rejects it)
+    \\    vec3 patchTint = mix(vec3(0.90, 1.03, 0.90), vec3(1.08, 0.99, 0.90), dryPatch);
     \\    albedo *= mix(vec3(1.0), patchTint, upMask);
     \\    // CRACKED EARTH: a ridged octave etches thin dark fissure lines into the
     \\    // floor, gated to the DRY patches (the mask keys off its own low-frequency
@@ -176,7 +184,7 @@ const sceneFS =
     \\    // fades to 0 at the torch radius (horizontal distance from the torch axis = you),
     \\    // so it reads as a disc of light. Everything above is the fully lit "active"
     \\    // look; past the disc we fall back to the fog-of-war memory below.
-    \\    float active = 1.0 - smoothstep(lightRadius*0.65, lightRadius, lightDist);
+    \\    float litDisc = 1.0 - smoothstep(lightRadius*0.65, lightRadius, lightDist); // NOT 'active' — reserved GLSL keyword
     \\    // COLOR TEMPERATURE: firelight is warmest at its heart and cools as it thins
     \\    // out, so the disc grades from golden center to blue-grey rim instead of one
     \\    // flat tone. Cheap, but it sells "torch" more than anything else here.
@@ -193,7 +201,7 @@ const sceneFS =
     \\    float luma = dot(finalColor.rgb, vec3(0.299, 0.587, 0.114));
     \\    vec3 memory = mix(vec3(luma), finalColor.rgb, 0.25)*vec3(0.55, 0.70, 1.0);
     \\    vec3 seenColor = memory*0.16*seen;
-    \\    finalColor.rgb = mix(seenColor, finalColor.rgb, active);
+    \\    finalColor.rgb = mix(seenColor, finalColor.rgb, litDisc);
     \\    // FIREBALL: a second moving light, added AFTER the fog blend so a fireball
     \\    // hurled into the dark still lights the walls + ground it flies past (even
     \\    // unexplored ground it has never revealed).
@@ -279,7 +287,7 @@ pub const Torch = struct {
     loc_fireIntensity: i32,
     lightVP: rl.Matrix = undefined,
     fireVP: rl.Matrix = undefined,
-    fogTexId: u32 = 0, // GPU id of the fog map to bind on slot 12; set by applyFogUniforms
+    fogTexId: u32 = 0, // GPU id of the fog map to bind on SLOT_FOG; set by applyFogUniforms
     saved_near: @TypeOf(rl.gl.rlGetCullDistanceNear()) = 0,
     saved_far: @TypeOf(rl.gl.rlGetCullDistanceFar()) = 0,
 
@@ -296,14 +304,11 @@ pub const Torch = struct {
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "ambient"), &amb, .vec4);
         const res: i32 = SHADOWMAP_RESOLUTION;
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "shadowMapResolution"), &res, .int);
-        const slot: i32 = 10;
-        rl.setShaderValue(scene, rl.getShaderLocation(scene, "shadowMap"), &slot, .int);
+        rl.setShaderValue(scene, rl.getShaderLocation(scene, "shadowMap"), &SLOT_SHADOW, .int);
         const fres: i32 = FIRE_SHADOWMAP_RESOLUTION;
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "fireMapResolution"), &fres, .int);
-        const fslot: i32 = 11;
-        rl.setShaderValue(scene, rl.getShaderLocation(scene, "fireMap"), &fslot, .int);
-        const fogslot: i32 = 12;
-        rl.setShaderValue(scene, rl.getShaderLocation(scene, "fogMap"), &fogslot, .int);
+        rl.setShaderValue(scene, rl.getShaderLocation(scene, "fireMap"), &SLOT_FIRE, .int);
+        rl.setShaderValue(scene, rl.getShaderLocation(scene, "fogMap"), &SLOT_FOG, .int);
 
         return .{
             .shadowMap = shadowMap,
@@ -444,11 +449,11 @@ pub const Torch = struct {
     // Wrap the lit geometry between beginScene()/endScene(), inside beginMode3D(cam).
     pub fn beginScene(self: *Torch) void {
         rl.beginShaderMode(self.scene);
-        rl.gl.rlActiveTextureSlot(10);
+        rl.gl.rlActiveTextureSlot(SLOT_SHADOW);
         rl.gl.rlEnableTexture(@intCast(self.shadowMap.depth.id));
-        rl.gl.rlActiveTextureSlot(11);
+        rl.gl.rlActiveTextureSlot(SLOT_FIRE);
         rl.gl.rlEnableTexture(@intCast(self.fireMap.depth.id));
-        rl.gl.rlActiveTextureSlot(12);
+        rl.gl.rlActiveTextureSlot(SLOT_FOG);
         rl.gl.rlEnableTexture(self.fogTexId);
     }
 

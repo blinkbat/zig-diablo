@@ -44,6 +44,11 @@ pub const MAX_MAPS = 16;
 pub const ext = ".map";
 pub const dir = "maps";
 
+// The default moor palette: the Map field defaults AND the editor's "Moor" preset
+// both read these, so a fresh map and the preset can't drift to different browns.
+pub const DEFAULT_GROUND = rgba(92, 80, 62, 255);
+pub const DEFAULT_ACCENT = rgba(72, 62, 50, 255);
+
 const alloc = std.heap.c_allocator;
 
 fn StrBuf(comptime cap: usize) type {
@@ -74,8 +79,8 @@ pub const Map = struct {
     boss: StrBuf(48) = .{},
     halfW: f32 = 30,
     halfD: f32 = 30,
-    ground: rl.Color = rgba(92, 80, 62, 255),
-    accent: rl.Color = rgba(72, 62, 50, 255),
+    ground: rl.Color = DEFAULT_GROUND,
+    accent: rl.Color = DEFAULT_ACCENT,
     light: [3]f32 = .{ 1.0, 0.95, 0.85 },
     spawn: rl.Vector3 = v3(0, 0, 24),
     portal: rl.Vector3 = v3(0, 0, -23),
@@ -97,27 +102,34 @@ pub const Map = struct {
 
     // Swap-remove helpers: the editor deletes from three parallel arrays in half
     // a dozen places (erase sweeps, context menu, pack modal) — one idiom, here.
+    // `i` must be a live index: on an empty collection the `_count -= 1` would
+    // wrap (usize) into a wild out-of-bounds swap, so assert the contract.
     pub fn removeObstacle(self: *Map, i: usize) void {
+        std.debug.assert(i < self.obstacle_count);
         self.obstacle_count -= 1;
         self.obstacles[i] = self.obstacles[self.obstacle_count];
     }
 
     pub fn removeDecor(self: *Map, i: usize) void {
+        std.debug.assert(i < self.decor_count);
         self.decor_count -= 1;
         self.decor[i] = self.decor[self.decor_count];
     }
 
     pub fn removePack(self: *Map, i: usize) void {
+        std.debug.assert(i < self.pack_count);
         self.pack_count -= 1;
         self.packs[i] = self.packs[self.pack_count];
     }
 
     pub fn removeLedge(self: *Map, i: usize) void {
+        std.debug.assert(i < self.ledge_count);
         self.ledge_count -= 1;
         self.ledges[i] = self.ledges[self.ledge_count];
     }
 
     pub fn removeRamp(self: *Map, i: usize) void {
+        std.debug.assert(i < self.ramp_count);
         self.ramp_count -= 1;
         self.ramps[i] = self.ramps[self.ramp_count];
     }
@@ -244,7 +256,10 @@ pub fn save(m: *const Map, path: []const u8) !void {
 
 // ---- Loading ----
 
-const LoadError = error{ BadHeader, BadLine, UnknownKey, TooMany, ReadFailed };
+// Every malformed-line case (unknown key, too-many-of-a-kind, bad payload) routes
+// through fail() -> BadLine with a descriptive log; callers fall back to defaultMap
+// regardless of which, so one line-error variant covers them all.
+const LoadError = error{ BadHeader, BadLine, ReadFailed };
 
 fn fail(lineNo: usize, line: []const u8, why: []const u8) LoadError {
     std.debug.print("map load error, line {d}: {s} -- \"{s}\"\n", .{ lineNo, why, line });
@@ -253,7 +268,12 @@ fn fail(lineNo: usize, line: []const u8, why: []const u8) LoadError {
 
 fn nextF32(it: *std.mem.TokenIterator(u8, .scalar)) !f32 {
     const tok = it.next() orelse return LoadError.BadLine;
-    return std.fmt.parseFloat(f32, tok) catch LoadError.BadLine;
+    const val = std.fmt.parseFloat(f32, tok) catch return LoadError.BadLine;
+    // parseFloat accepts "inf"/"nan"; a non-finite coordinate would ride through
+    // sanitize and detonate later (hash01(@sin(inf))->NaN->@intFromFloat in tint
+    // math). Reject at the door so every stored float is finite.
+    if (!std.math.isFinite(val)) return LoadError.BadLine;
+    return val;
 }
 
 fn nextU8(it: *std.mem.TokenIterator(u8, .scalar)) !u8 {
