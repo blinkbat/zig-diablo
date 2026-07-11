@@ -140,11 +140,19 @@ pub const Scene = enum { menu, playing, dead, victory, editor };
 pub const MenuMode = enum { root, options };
 pub const DisplayMode = enum { windowed, borderless, fullscreen };
 
+// The title menu's root rows. RootItem names each slot so the labels (drawn by
+// hudx) and the dispatch (menuActivate) can't drift out of order — reorder or add
+// a row and both follow the enum. The label array mirrors the enum 1:1; the
+// assert pins them to the same length so a lone edit is a compile error.
+pub const RootItem = enum(i32) { adventure, editor, options, quit };
 pub const menuRootItems = [_][:0]const u8{ "Adventure", "Editor", "Options", "Quit" };
+comptime {
+    std.debug.assert(menuRootItems.len == @typeInfo(RootItem).@"enum".fields.len);
+}
 
-// "Options" is index 2 of menuRootItems: entering the options screen and every
-// return-from-options lands the cursor here, so the position lives in one place.
-pub const MENU_OPTIONS_IDX = 2;
+// Entering the options screen and every return-from-options lands the cursor on
+// the Options row; its index derives from the enum so it tracks any reordering.
+pub const MENU_OPTIONS_IDX: i32 = @intFromEnum(RootItem.options);
 // The options screen has two rows — [display-mode cycler, Back] (see hudx) — and
 // key-nav wrap must agree with that count.
 pub const MENU_OPTIONS_COUNT = 2;
@@ -185,14 +193,16 @@ pub fn menuActivate(g: *Game, idx: i32) void {
         }
         return;
     }
-    switch (idx) {
-        0 => g.startRun(),
-        1 => editor.enter(g),
-        MENU_OPTIONS_IDX => {
+    // idx is a valid row (menuSel wraps mod menuRootItems.len; the mouse path passes
+    // the row it drew), so decode it back to the named slot and dispatch on that.
+    switch (@as(RootItem, @enumFromInt(idx))) {
+        .adventure => g.startRun(),
+        .editor => editor.enter(g),
+        .options => {
             g.menuMode = .options;
             g.menuSel = 0;
         },
-        else => g.quit = true,
+        .quit => g.quit = true,
     }
 }
 

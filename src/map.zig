@@ -452,7 +452,13 @@ pub fn listCampaign(paths: *[MAX_MAPS][96]u8, lens: *[MAX_MAPS]usize) usize {
     var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch return 0;
     defer d.close();
     var it = d.iterate();
-    while (it.next() catch return n) |entry| {
+    // A mid-scan readdir error must still fall through to the sort below: returning
+    // here would hand back the maps in raw directory order, and campaign order is
+    // load-bearing (difficulty tier = areaIndex, and IsLast/victory key off the
+    // sorted index). Stop collecting, keep what we have, sort it. (`break` can't
+    // live in the while-condition, so drive the iterator explicitly.)
+    while (true) {
+        const entry = (it.next() catch break) orelse break;
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ext)) continue;
         if (n >= MAX_MAPS) break;

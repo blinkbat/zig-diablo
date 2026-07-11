@@ -34,6 +34,15 @@ fn fi(v: i32) f32 {
     return @floatFromInt(v);
 }
 
+// Distance from screen center to a corner: the radius a full-screen radial wash
+// needs to reach the corners. One source for the vignette and every scene-screen
+// gradient, which previously each re-spelled @sqrt(cx*cx + cy*cy) by hand.
+fn screenDiag() f32 {
+    const cx = @divTrunc(sw(), 2);
+    const cy = @divTrunc(sh(), 2);
+    return @sqrt(fi(cx * cx + cy * cy));
+}
+
 // ---- UI font ----
 // IM Fell English (assets/, OFL license alongside) — antique book type for every
 // string the game draws. TWO rasterizations so neither end of the size range goes
@@ -447,7 +456,7 @@ fn drawHUD(g: *Game) void {
         const k = clampF(g.damageFlash / gamemod.DAMAGE_FLASH_DUR, 0, 1);
         const cx = @divTrunc(W, 2);
         const cy = @divTrunc(H, 2);
-        const r = @sqrt(fi(cx * cx + cy * cy)) * (1.25 - 0.15 * k);
+        const r = screenDiag() * (1.25 - 0.15 * k);
         rl.drawCircleGradient(cx, cy, r, rgba(180, 0, 0, 0), rgba(190, 10, 10, mathx.u8f(200 * k)));
     }
 
@@ -604,7 +613,7 @@ fn drawTopRight(g: *Game) void {
 fn vignette() void {
     const cx = @divTrunc(sw(), 2);
     const cy = @divTrunc(sh(), 2);
-    const r = @sqrt(@as(f32, @floatFromInt(cx * cx + cy * cy))) * 1.02;
+    const r = screenDiag() * 1.02;
     rl.drawCircleGradient(cx, cy, r, rgba(0, 0, 0, 0), rgba(0, 0, 0, 150));
 }
 
@@ -696,7 +705,7 @@ fn drawDeath(g: *Game) void {
     const cx = @divTrunc(sw(), 2);
     const cy = @divTrunc(sh(), 2);
     rl.drawRectangle(0, 0, sw(), sh(), rgba(20, 0, 0, 140));
-    const r = @sqrt(@as(f32, @floatFromInt(cx * cx + cy * cy))) * 1.05;
+    const r = screenDiag() * 1.05;
     rl.drawCircleGradient(cx, cy, r, rgba(0, 0, 0, 0), rgba(130, 0, 0, 210));
     emberField(g.elapsed, 14, rgba(200, 40, 30, 160), true);
     glowCentered("YOU HAVE DIED", cy - 80, 70, rgba(225, 45, 40, 255), rgba(70, 5, 5, 130));
@@ -711,7 +720,7 @@ fn drawVictory(g: *Game) void {
     const cx = @divTrunc(sw(), 2);
     const cy = @divTrunc(sh(), 2);
     rl.drawRectangle(0, 0, sw(), sh(), rgba(0, 0, 0, 170));
-    const r = @sqrt(@as(f32, @floatFromInt(cx * cx + cy * cy))) * 1.05;
+    const r = screenDiag() * 1.05;
     rl.drawCircleGradient(cx, cy, r, rgba(0, 0, 0, 0), rgba(90, 60, 0, 160));
     emberField(g.elapsed, 26, rgba(255, 215, 90, 200), false);
     glowCentered("VICTORY!", cy - 90, 80, theme.goldColor, rgba(120, 80, 10, 130));
