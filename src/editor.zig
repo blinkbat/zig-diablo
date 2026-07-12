@@ -19,25 +19,18 @@ const clampF = mathx.clampF;
 const withAlpha = mathx.withAlpha;
 const lerpColor = mathx.lerpColor;
 
-// EDITOR — an in-game scene (crawler-style, not a separate tool): same window,
-// same renderer, same terrain picking as play, so the map you edit is exactly
-// the map players see. Entered from the title menu. The current map lives in
-// `Game.map`; every edit re-materializes Game.w + the baked scene mesh, so the
-// world IS the live preview. F5 playtests the in-memory map (no disk round
-// trip; Ctrl+F5 starts at the cursor) and every playtest exit returns here.
+// EDITOR — an in-game scene: same window/renderer/terrain-picking as play, so the
+// edited map is exactly what players see. Current map is Game.map; every edit
+// re-materializes Game.w + the baked mesh, so the world IS the live preview. F5
+// playtests the in-memory map (Ctrl+F5 starts at the cursor); exit returns here.
 //
-// The workspace is organized in LAYERS, like the sibling editors:
-//   Floor    — terrain shaping: ledge + ramp drag-rects (and their eraser)
-//   Decor    — pebble/tuft/shroom/bone paint brushes + the scatter tool
-//   Props    — rock/tree/gravestone stamps
-//   Entities — foe packs, the boss, player spawn, the portal
-// Each layer ends in its own ERASE brush, scoped to that layer only — sweeping
-// erase through the underbrush can never eat your gravestones.
+// Workspace is organized in LAYERS: Floor (ledge/ramp drag-rects), Decor (paint
+// brushes + scatter), Props (stamps), Entities (packs/boss/spawn/portal). Each
+// layer ends in its own ERASE brush, scoped to that layer only.
 //
-// Interaction grammar follows the crawler editor: LEFT paints (drag to sweep;
-// one undo step per stroke), RIGHT-CLICK opens the context menu, RIGHT-DRAG
-// pans (4 px threshold splits them), wheel zooms, Tab cycles layers, 1..9 pick
-// brushes, Alt places off-grid, M mirrors painting across X.
+// Interaction grammar: LEFT paints (drag to sweep; one undo step/stroke),
+// RIGHT-CLICK opens the context menu, RIGHT-DRAG pans (4 px threshold splits
+// them), wheel zooms, Tab cycles layers, 1..9 pick brushes, Alt off-grid, M mirrors X.
 
 pub const Layer = enum(u8) {
     floor,
@@ -45,8 +38,7 @@ pub const Layer = enum(u8) {
     props,
     entities,
 
-    // Number of layers — derive the Tab-cycle span, the Alt-jump bound, and the
-    // per-layer brushSel[] size from this so a new layer can't skew any of them.
+    // Layer count: drives Tab-cycle span, Alt-jump bound, and brushSel[] size.
     pub const N = @typeInfo(Layer).@"enum".fields.len;
 
     fn label(l: Layer) [:0]const u8 {
@@ -59,7 +51,7 @@ pub const Layer = enum(u8) {
     }
 };
 
-// Brush tables (the last entry of every layer is its scoped eraser).
+// Brush tables (last entry of every layer is its scoped eraser).
 const floorBrushes = [_][:0]const u8{ "Ledge", "Ramp", "Erase" };
 const decorBrushes = [_][:0]const u8{ "pebble", "tuft", "shroom", "bone", "Erase" };
 const propBrushes = [_][:0]const u8{ "rock", "tree", "gravestone", "Erase" };
@@ -74,7 +66,7 @@ fn brushesFor(l: Layer) []const [:0]const u8 {
     };
 }
 
-// Hover blurbs (ui.buttonTip): the layer strip and every brush explain themselves.
+// Hover blurbs (ui.buttonTip) for the layer strip and every brush.
 const layerTips = [_][:0]const u8{
     "Terrain shaping: ledges + ramps (Tab cycles layers)",
     "Ground dressing: paint or scatter, never blocks",
@@ -120,55 +112,59 @@ fn brushTipsFor(l: Layer) []const [:0]const u8 {
 }
 
 comptime {
-    std.debug.assert(layerTips.len == Layer.N); // indexed by layer ordinal in drawLayerStrip
+    std.debug.assert(layerTips.len == Layer.N); // indexed by layer ordinal
     std.debug.assert(floorTips.len == floorBrushes.len);
     std.debug.assert(decorTips.len == decorBrushes.len);
     std.debug.assert(propTips.len == propBrushes.len);
     std.debug.assert(entityTips.len == entityBrushes.len);
 }
 
-// The brush tables and their semantic decoders (decorKind/propKind/entityBrush)
-// are parallel lists: pin their lengths so adding a kind can't silently skew the
-// index mapping.
+// Brush tables and their decoders (decorKind/propKind/entityBrush) are parallel
+// lists: pin lengths so adding a kind can't silently skew the index mapping.
 comptime {
     std.debug.assert(floorBrushes.len == @typeInfo(FloorBrush).@"enum".fields.len);
     std.debug.assert(decorBrushes.len == @typeInfo(world.DecorKind).@"enum".fields.len + 1);
     std.debug.assert(propBrushes.len == @typeInfo(world.ObstacleKind).@"enum".fields.len + 1);
-    // packs (one per MonsterKind) + the non-pack EntityBrush variants (all but .pack).
+    // packs (one per MonsterKind) + non-pack EntityBrush variants (all but .pack).
     std.debug.assert(entityBrushes.len == @typeInfo(monster.MonsterKind).@"enum".fields.len + @typeInfo(EntityBrush).@"enum".fields.len - 1);
 }
 
-// What a floor-layer brush index means (positional, matching floorBrushes).
+// Floor-layer brush index (positional, matching floorBrushes).
 const FloorBrush = enum { ledge, ramp, erase };
 
-// What an entities-layer brush index means.
+// Entities-layer brush index.
 const EntityBrush = enum { pack, boss, spawn, portal, erase };
 
-// Marker identity colors, shared by the 3D anchors and the minimap glyphs.
+// Marker identity colors, shared by 3D anchors and minimap glyphs.
 const SPAWN_COL = rgba(140, 200, 255, 255);
 const PORTAL_COL = rgba(190, 140, 255, 255);
 const BOSS_COL = rgba(255, 80, 80, 255);
 
-// Anchor marker ring radii, shared by the drawn ring AND its hover-pick zone so a
-// resized ring never lies about what's clickable (the PACK_GRAB_R discipline, for
-// the fixed anchors). The hover zone is the ring plus MARKER_HOVER_PAD.
+// Anchor ring radii, shared by the drawn ring AND its hover-pick zone so a resized
+// ring never lies about what's clickable. Hover zone = ring + MARKER_HOVER_PAD.
 const SPAWN_R = 1.0;
 const PORTAL_R = 1.4;
 const BOSS_R = 1.2;
 const MARKER_HOVER_PAD = 0.2;
 
-// Pack ring radius doubles as the grab pickup radius, so what looks clickable is.
+// Pack ring radius doubles as the grab pickup radius (clickable == visible).
 const PACK_GRAB_R = 1.6;
 
-// The editor sun: high over the camera target, wide enough to light any map.
+// Right-drag pan deadzone (px): a right-click only becomes a pan past this move, so a
+// click-in-place opens the context menu instead. The crawler-editor "4 px threshold".
+const RIGHT_DRAG_PX = 4;
+
+// Editor sun: high over the camera target, wide enough to light the view. Follows
+// camTarget (not arena center), so its radius spans the lit region around the focus
+// rather than the whole map — comfortable for any authored extent (HALF_MAX).
 const EDITOR_SUN_H = 38.0;
-const EDITOR_SUN_R = 110.0; // covers the corner diagonal of a 60x60 arena
+const EDITOR_SUN_R = 110.0;
 
 pub const Modal = enum { none, save_as, new_map, open_map, rename, confirm, pack_edit };
 pub const Pending = enum { none, open, new, exit };
 
-// ---- Marquee selection + clipboard (crawler: Shift+drag selects, drag inside
-// moves contents, Ctrl+C/X/V copy/cut/paste, Del deletes, Esc clears) ----
+// ---- Marquee selection + clipboard (Shift+drag selects, drag inside moves,
+// Ctrl+C/X/V copy/cut/paste, Del deletes, Esc clears) ----
 
 const SelRect = struct {
     minX: f32,
@@ -190,9 +186,8 @@ fn normRect(a: rl.Vector3, b: rl.Vector3) SelRect {
     };
 }
 
-// The clipboard holds objects RELATIVE to the copied rect's center, so a paste
-// lands the arrangement on the cursor. Terrain features are deliberately not
-// clipboard material — moving cliffs under an arrangement is a different job.
+// Clipboard holds objects RELATIVE to the copied rect's center, so a paste lands
+// the arrangement on the cursor. Terrain features are deliberately excluded.
 var clipProps: [world.MAX_OBSTACLES]world.Obstacle = undefined;
 var clipPropN: usize = 0;
 var clipDecor: [world.MAX_DECOR]world.Decor = undefined;
@@ -202,8 +197,7 @@ var clipPackN: usize = 0;
 var clipHas = false;
 var selBankPending = false; // selection-move undo banks on first movement only
 
-// Curated palette presets (the five classic area moods) applied as one click:
-// ground, accent, and torch light together.
+// Palette presets applied in one click: ground, accent, and torch light together.
 const Preset = struct { name: [:0]const u8, ground: rl.Color, accent: rl.Color, light: [3]f32 };
 const presets = [_]Preset{
     .{ .name = "Moor", .ground = mapmod.DEFAULT_GROUND, .accent = mapmod.DEFAULT_ACCENT, .light = .{ 1.04, 0.94, 0.80 } },
@@ -213,10 +207,10 @@ const presets = [_]Preset{
     .{ .name = "Crypt", .ground = rgba(54, 46, 60, 255), .accent = rgba(40, 34, 46, 255), .light = .{ 0.93, 0.87, 1.08 } },
 };
 
-// ---- Undo/redo (bg2-style eager whole-map snapshots, crawler's cap of 50) ----
-// The Map is a flat ~34 KB value, so a by-value history is trivial and immune to
-// aliasing bugs. Paint strokes bank ONE step (the pre-stroke state) and only if
-// the stroke changed something (crawler's lazy-commit idea). Static storage.
+// ---- Undo/redo: eager whole-map snapshots, cap 50 ----
+// Map is a flat ~34 KB value, so by-value history is trivial and aliasing-immune.
+// Paint strokes bank ONE step (pre-stroke state) only if the stroke changed
+// something (lazy-commit). Static storage.
 const UNDO_CAP = 50;
 var undoStack: [UNDO_CAP]mapmod.Map = undefined;
 var undoLen: usize = 0;
@@ -230,9 +224,9 @@ fn clearHistory() void {
     redoLen = 0;
 }
 
-// Bank the CURRENT map as the undo step for a mutation that is about to happen
-// unconditionally. Conditional mutations (placements that can hit a cap, drags
-// that can be too small) snapshot locally and bank only on success instead.
+// Bank the CURRENT map for a mutation about to happen unconditionally. Conditional
+// mutations (cap-hitting placements, too-small drags) snapshot locally and bank
+// only on success instead.
 fn bankUndo(g: *Game) void {
     pushUndoFrom(&g.map);
 }
@@ -249,7 +243,7 @@ fn pushUndoFrom(before: *const mapmod.Map) void {
 
 fn doUndo(g: *Game) void {
     const ed = &g.ed;
-    if (ed.dragStart != null or ed.grabIdx != null or ed.strokeActive or ed.selMove != null or ed.selDrag != null) return; // never pop mid-drag
+    if (ed.dragStart != null or ed.grabIdx != null or ed.strokeActive or ed.selMove != null or ed.selDrag != null) return; // never pop mid-gesture
     if (undoLen == 0) return ed.status("nothing to undo", .{});
     if (redoLen < UNDO_CAP) {
         redoStack[redoLen] = g.map;
@@ -289,7 +283,7 @@ pub const Editor = struct {
     camTarget: rl.Vector3 = mathx.zero3,
     dirty: bool = false,
     grid: bool = true,
-    uiHot: bool = false, // pointer was over chrome LAST frame: world clicks blocked
+    uiHot: bool = false, // pointer over chrome LAST frame: world clicks blocked
 
     // Paint stroke (LMB held on a paint layer): one undo step per stroke.
     strokeActive: bool = false,
@@ -301,25 +295,25 @@ pub const Editor = struct {
     selDrag: ?rl.Vector3 = null, // marquee anchor while Shift+LMB held
     selMove: ?rl.Vector3 = null, // last ground point while dragging contents
 
-    // Right-button click-vs-drag disambiguation (crawler: 4 px threshold).
+    // Right-button click-vs-drag disambiguation (4 px threshold).
     rightStart: rl.Vector2 = .{ .x = 0, .y = 0 },
     rightMoved: bool = false,
 
-    // Context menu (right-CLICK): screen anchor + the world point it acts on.
+    // Context menu (right-CLICK): screen anchor + world point it acts on.
     ctxOpen: bool = false,
     ctxAt: rl.Vector2 = .{ .x = 0, .y = 0 },
     ctxWorld: rl.Vector3 = mathx.zero3,
 
-    // Pack drag-move (crawler entity grammar): press on a pack grabs it; release
-    // in place opens its edit modal, release elsewhere moves it.
+    // Pack drag-move: press on a pack grabs it; release in place opens its edit
+    // modal, release elsewhere moves it.
     grabIdx: ?usize = null,
     grabStart: rl.Vector3 = mathx.zero3,
     packEditIdx: usize = 0,
 
     recovT: f32 = 0, // seconds since the last crash-recovery autosave while dirty
 
-    // Where Ctrl+S writes. Empty until the map has ever been saved (a New map),
-    // in which case Ctrl+S opens Save As instead of guessing a filename.
+    // Where Ctrl+S writes. Empty until the map's been saved; then Ctrl+S opens
+    // Save As instead of guessing a filename.
     path_buf: [mapmod.PATH_CAP]u8 = [_]u8{0} ** mapmod.PATH_CAP,
     path_len: usize = 0,
 
@@ -376,17 +370,14 @@ pub const Editor = struct {
     }
 
     fn entityBrush(ed: *const Editor) EntityBrush {
-        // The first N brushes are the N monster-kind packs (all decode to .pack);
-        // the tail maps 1:1 onto EntityBrush's non-pack variants IN ORDER. Deriving
-        // the ordinal (rather than a positional 0=>.boss switch with a silent else)
-        // means a new EntityBrush + brush entry decodes correctly instead of
-        // collapsing to .erase. EntityBrush's order must match entityBrushes' tail;
-        // the comptime assert on the tables pins both length and that contract.
+        // First N brushes are the N monster-kind packs (decode to .pack); the tail
+        // maps 1:1 onto EntityBrush's non-pack variants IN ORDER, so a new brush
+        // decodes correctly rather than collapsing to .erase. EntityBrush's order
+        // must match entityBrushes' tail; the comptime assert pins that contract.
         const nPacks = @typeInfo(monster.MonsterKind).@"enum".fields.len;
         const b = ed.brush();
         if (b < nPacks) return .pack;
-        // b is clamped to brushesFor(.entities).len-1 by setBrush, so b - nPacks + 1
-        // is always a valid EntityBrush ordinal (pack occupies 0).
+        // setBrush clamps b, so b - nPacks + 1 is always a valid ordinal (.pack is 0).
         return @enumFromInt(b - nPacks + 1);
     }
 
@@ -395,15 +386,15 @@ pub const Editor = struct {
     }
 };
 
-// Highest valid @intFromEnum for T — the brush tables end in a non-kind entry
-// (the eraser), so the raw brush index is clamped to a real kind through this
-// instead of a hand-copied max that drifts when a kind is added.
+// Highest valid @intFromEnum for T. Brush tables end in a non-kind entry (eraser),
+// so the raw brush index clamps to a real kind through this rather than a drifting
+// hand-copied max.
 fn lastVariant(comptime T: type) usize {
     return @typeInfo(T).@"enum".fields.len - 1;
 }
 
-// ---- Crash-recovery autosave (crawler: a non-.map extension so it never shows
-// in Open or the campaign; never touches the real file; cleared on save/exit) ----
+// ---- Crash-recovery autosave: non-.map extension so it never shows in Open or the
+// campaign; never touches the real file; cleared on save/exit ----
 
 const REC_PATH = mapmod.dir ++ "/recovery.autosave";
 const REC_INTERVAL = 20.0;
@@ -418,16 +409,20 @@ fn recoveryExists() bool {
     return true;
 }
 
-/// Enter the editor on the current campaign map (called from the menu).
-/// Opening a map is doOpen's job — enter only adds the recovery hint + scene.
+/// Enter the editor on the current campaign map. doOpen does the load; enter only
+/// adds the recovery hint + scene.
 pub fn enter(g: *Game) void {
+    // The editor destructively rebuilds the shared world/monsters/fog, so any paused
+    // adventure is no longer resumable — the menu must offer a fresh start, not a
+    // "Continue" into an emptied, editor-clobbered level.
+    g.canResume = false;
     doOpen(g, g.areaIndex);
     if (recoveryExists()) g.ed.status("crash recovery found - Ctrl+R restores it", .{});
     g.scene = .editor;
 }
 
-// Re-materialize the live world from the edited map: rebuild the baked mesh,
-// clear the fog (the author sees everything), and empty the dynamic lists.
+// Re-materialize the live world from the edited map: rebuild the baked mesh, clear
+// the fog (author sees everything), empty the dynamic lists.
 pub fn apply(g: *Game) void {
     g.w = mapmod.toWorld(&g.map, g.areaIndex == g.lastArea);
     g.sceneMesh.rebuild(&g.w);
@@ -446,44 +441,40 @@ fn markDirty(g: *Game) void {
     apply(g);
 }
 
-// The ground point under the mouse (terrain-aware, same picking as play).
+// Ground point under the mouse (terrain-aware, same picking as play).
 fn mousePoint(g: *Game) ?rl.Vector3 {
     const ray = rl.getScreenToWorldRay(rl.getMousePosition(), g.rig.cam);
     return g.w.pickGround(ray);
 }
 
-// Grid snapping (the drawn grid is GRID-spaced): props and entities land on CELL
-// CENTERS, terrain rects on the LINES. Decor never snaps (dressing shouldn't
-// march in rows), and holding Alt places anything freely.
+// Grid snapping (grid is GRID-spaced): props/entities land on CELL CENTERS, terrain
+// rects on LINES. Decor never snaps (dressing shouldn't march in rows); Alt places freely.
 const GRID = 2.0;
 
-// Keep placed content and the fixed anchors inside the arena wall when the arena
-// shrinks or a paste lands near the edge. Objects (props/decor/packs/features) sit
-// a little closer to the wall than the spawn/portal/boss anchors do.
+// Keep content and fixed anchors inside the arena wall on shrink or edge paste.
+// Objects sit a little closer to the wall than the spawn/portal/boss anchors.
 const CONTENT_INSET = 1.2;
 const ANCHOR_INSET = 2.0;
 
-// Smallest usable ledge/ramp footprint. A drag smaller than this is rejected at
-// commit, and a feature that a resize clamps below this is dropped — the same bound,
-// so you can never end up with a feature you couldn't have authored.
+// Smallest usable ledge/ramp footprint. Same bound rejects too-small drags at commit
+// and drops resize-collapsed features, so you can't end up with an un-authorable one.
 const FEATURE_MIN_SPAN = 1.5;
 
-// Editor tuning ranges. Each min/max/step is a single source shared by the [ / ]
-// hotkeys AND the properties-panel stepper for the same value, so the two adjust
-// paths can never clamp to different bounds.
+// Editor tuning ranges. Each min/max/step is the single source shared by the [ / ]
+// hotkeys AND the panel stepper, so the two paths can't clamp to different bounds.
 const FEATURE_H_MIN = 1.2;
 const FEATURE_H_MAX = 4.0;
 const FEATURE_H_STEP = 0.4;
 const BRUSH_R_MIN = 0.5;
 const BRUSH_R_MAX = 4.0;
 const BRUSH_R_STEP = 0.5;
-// Arena half-extent authoring range (New Map + the width/depth steppers). Narrower
-// than map.sanitize's load-time tolerance on purpose: the loader accepts hand-edited
-// maps the UI won't author.
+// Arena half-extent authoring range (New Map + width/depth steppers). Narrower than
+// map.sanitize's load tolerance on purpose: the loader accepts hand-edited maps the
+// UI won't author.
 const HALF_MIN = 18;
 const HALF_MAX = 48;
 const HALF_STEP = 4;
-// Members per pack (the PACK panel stepper and the pack-edit modal).
+// Members per pack (PACK panel stepper and pack-edit modal).
 const PACK_MIN = 1;
 const PACK_MAX = 8;
 
@@ -491,12 +482,10 @@ fn freePlace() bool {
     return rl.isKeyDown(.left_alt) or rl.isKeyDown(.right_alt);
 }
 
-// The pick plane is infinite, so a click past the arena wall picks a valid-looking
-// ground point out in the void. Clamp at placement time: out-of-wall content would
-// spawn unreachable monsters (playtest softlock) and be silently relocated by
-// map.sanitize on the next load — the saved map wouldn't match the authored one.
-// Same insets as clampContents/pasteAt: content sits closer to the wall than the
-// three anchors do.
+// The pick plane is infinite, so a click past the wall picks a ground point in the
+// void. Clamp at placement: out-of-wall content spawns unreachable monsters (playtest
+// softlock) and map.sanitize silently relocates it on next load (saved != authored).
+// Same insets as clampContents/pasteAt: content sits closer to the wall than anchors.
 fn clampContent(m: *const mapmod.Map, p: rl.Vector3) rl.Vector3 {
     const limW = m.halfW - CONTENT_INSET;
     const limD = m.halfD - CONTENT_INSET;
@@ -517,7 +506,7 @@ fn snapLine(p: rl.Vector3) rl.Vector3 {
     return v3(@round(p.x / GRID) * GRID, p.y, @round(p.z / GRID) * GRID);
 }
 
-// Where the active brush would actually put things for this mouse point.
+// Where the active brush would actually place things for this mouse point.
 fn toolPoint(ed: *const Editor, p: rl.Vector3) rl.Vector3 {
     if (freePlace() or ed.isEraseBrush()) return p;
     return switch (ed.layer) {
@@ -557,8 +546,7 @@ fn placeProp(g: *Game, p_in: rl.Vector3) bool {
     return true;
 }
 
-// One source for decor stamp sizes: the hand brush and the scatter tool must
-// agree or the same map paints two different vegetations.
+// One source for decor stamp sizes: hand brush and scatter tool must agree.
 fn decorSize(kind: world.DecorKind, h: f32) f32 {
     return switch (kind) {
         .pebble => 0.1 + h * 0.2,
@@ -575,7 +563,7 @@ fn placeDecor(g: *Game, p_in: rl.Vector3) bool {
         ed.status("decor limit reached", .{});
         return false;
     }
-    const p = clampContent(m, p_in); // covers the paint jitter too
+    const p = clampContent(m, p_in); // covers paint jitter too
     const kind = ed.decorKind();
     m.decor[m.decor_count] = .{
         .Kind = kind,
@@ -607,7 +595,7 @@ fn wantMirror(ed: *const Editor, p: rl.Vector3) bool {
     return ed.mirrorX and @abs(p.x) > 0.9;
 }
 
-// Remove everything of the ACTIVE layer within radius r of p (the erase sweep).
+// Remove everything of the ACTIVE layer within radius r of p (erase sweep).
 fn eraseWithin(g: *Game, p: rl.Vector3, r: f32) bool {
     const m = &g.map;
     var changed = false;
@@ -636,7 +624,7 @@ fn eraseWithin(g: *Game, p: rl.Vector3, r: f32) bool {
             var i: usize = m.pack_count;
             while (i > 0) {
                 i -= 1;
-                if (distXZ(v3(m.packs[i].x, 0, m.packs[i].z), p) < r) {
+                if (distXZ(m.packs[i].pos(), p) < r) {
                     m.removePack(i);
                     changed = true;
                 }
@@ -650,8 +638,8 @@ fn eraseWithin(g: *Game, p: rl.Vector3, r: f32) bool {
 
 // ---- Selection operations ----
 
-// Copy (optionally cut) everything inside the selection into the clipboard,
-// positions stored relative to the rect center.
+// Copy (optionally cut) the selection into the clipboard, positions relative to the
+// rect center.
 fn copySelection(g: *Game, cut: bool) void {
     const ed = &g.ed;
     const s = ed.sel orelse return ed.status("nothing selected (Shift+drag)", .{});
@@ -712,8 +700,8 @@ fn deleteSelection(g: *Game) void {
     markDirty(g);
 }
 
-// Paste the clipboard arrangement centered on `at`, clamped into the arena;
-// items past a cap are dropped (reported, never silent).
+// Paste the clipboard centered on `at`, clamped into the arena; items past a cap
+// are dropped (reported, never silent).
 fn pasteAt(g: *Game, at: rl.Vector3) void {
     const ed = &g.ed;
     if (!clipHas) return ed.status("clipboard is empty (Ctrl+C first)", .{});
@@ -758,9 +746,9 @@ fn pasteAt(g: *Game, at: rl.Vector3) void {
     }
 }
 
-// Shift everything inside the selection by delta, and the rect with it. Membership
-// is re-evaluated against the PRE-move rect each step; deltas are one frame small,
-// so contents and rect travel together.
+// Shift the selection's contents by delta, and the rect with it. Membership is
+// re-evaluated against the PRE-move rect each step; per-frame deltas are tiny, so
+// contents and rect travel together.
 fn moveSelection(g: *Game, delta: rl.Vector3) void {
     const ed = &g.ed;
     const s = ed.sel orelse return;
@@ -794,7 +782,7 @@ fn moveSelection(g: *Game, delta: rl.Vector3) void {
     markDirty(g);
 }
 
-// Floor-layer erase: remove the terrain feature whose rect contains the click.
+// Floor erase: remove the terrain feature whose rect contains the click.
 fn eraseFeatureAt(g: *Game, p: rl.Vector3) bool {
     const m = &g.map;
     for (m.ramps[0..m.ramp_count], 0..) |r, i| {
@@ -817,8 +805,8 @@ fn eraseFeatureAt(g: *Game, p: rl.Vector3) bool {
 fn finishDrag(g: *Game, a: rl.Vector3, b: rl.Vector3) bool {
     const ed = &g.ed;
     const m = &g.map;
-    // Corners clamp independently (same limits clampContents uses): a rect dragged
-    // past the wall shrinks to fit, and one squeezed under the min span is rejected.
+    // Corners clamp independently (clampContents' limits): a rect past the wall
+    // shrinks to fit, one under the min span is rejected.
     const s = normRect(clampContent(m, a), clampContent(m, b));
     const minX = s.minX;
     const maxX = s.maxX;
@@ -851,8 +839,8 @@ fn finishDrag(g: *Game, a: rl.Vector3, b: rl.Vector3) bool {
     return true;
 }
 
-// One step of a paint stroke: place/erase at the swept point, respecting per-
-// brush spacing so a sweep lays a trail instead of a solid wall.
+// One paint-stroke step: place/erase at the swept point, respecting per-brush
+// spacing so a sweep lays a trail, not a solid wall.
 fn paintStep(g: *Game, raw: rl.Vector3) void {
     const ed = &g.ed;
     switch (ed.layer) {
@@ -876,7 +864,7 @@ fn paintStep(g: *Game, raw: rl.Vector3) void {
                 return;
             }
             if (distXZ(raw, ed.lastPaint) < 0.8) return;
-            // Jitter within the brush radius: a sweep scatters, not strings.
+            // Jitter within brush radius: a sweep scatters, not strings.
             const j = v3(
                 raw.x + (g.rng.float() - 0.5) * ed.brushR,
                 0,
@@ -898,8 +886,8 @@ fn paintStep(g: *Game, raw: rl.Vector3) void {
     }
 }
 
-// The author-time scatter brush: repopulate the decor list over open floor.
-// This is the ONLY generator left in the game, and it writes into the map file.
+// Author-time scatter brush: repopulate the decor list over open floor. The ONLY
+// generator left in the game, and it writes into the map file.
 fn scatterDecor(g: *Game) void {
     bankUndo(g);
     const m = &g.map;
@@ -930,6 +918,9 @@ fn saveCurrent(g: *Game) void {
     }
     mapmod.save(&g.map, ed.path()) catch {
         ed.status("SAVE FAILED: {s}", .{ed.path()});
+        // The confirm modal that may have armed `pending` is already closed, so a
+        // stranded action would fire on the NEXT successful save. Abandon it here.
+        ed.pending = .none;
         return;
     };
     ed.dirty = false;
@@ -943,7 +934,7 @@ fn openModal(ed: *Editor, m: Modal) void {
     ed.field_len = 0;
 }
 
-// After a confirm-modal Save/Discard, carry out whatever the user was doing.
+// After a confirm-modal Save/Discard, carry out the guarded action.
 fn resumePending(g: *Game) void {
     const ed = &g.ed;
     const act = ed.pending;
@@ -975,7 +966,7 @@ fn requestAction(g: *Game, act: Pending, openIdx: usize) void {
 
 fn doOpen(g: *Game, idx: usize) void {
     const ed = &g.ed;
-    resetTransient(g); // no gesture may straddle two maps
+    resetTransient(g); // no gesture straddles two maps
     g.areaIndex = @min(idx, if (g.mapCount == 0) 0 else g.mapCount - 1);
     g.map = g.loadMapAt(g.areaIndex);
     apply(g);
@@ -991,7 +982,7 @@ fn doOpen(g: *Game, idx: usize) void {
 
 fn doNew(g: *Game) void {
     const ed = &g.ed;
-    resetTransient(g); // no gesture may straddle two maps
+    resetTransient(g); // no gesture straddles two maps
     g.map = mapmod.defaultMap();
     g.map.halfW = ed.newHalfW;
     g.map.halfD = ed.newHalfD;
@@ -1010,8 +1001,8 @@ fn doNew(g: *Game) void {
     ed.status("new map - Ctrl+S to name it", .{});
 }
 
-// Filename sanitizer shared by Save As commit AND its live preview line, so the
-// path shown is exactly the path written (crawler's "Will save to:" pattern).
+// Filename sanitizer shared by Save As commit AND its live preview, so the path
+// shown is exactly the path written.
 fn slugTo(dst: []u8, src: []const u8) []const u8 {
     var n: usize = 0;
     for (src) |c| {
@@ -1043,7 +1034,7 @@ fn doSaveAs(g: *Game) void {
     ed.dirty = false;
     ed.modal = .none;
     clearRecovery();
-    // The campaign may have gained a file: rescan and point areaIndex at it.
+    // Campaign may have gained a file: rescan and point areaIndex at it.
     g.mapCount = mapmod.listCampaign(&g.mapPaths, &g.mapPathLens);
     g.lastArea = if (g.mapCount > 0) g.mapCount - 1 else 0;
     for (0..g.mapCount) |i| {
@@ -1059,8 +1050,8 @@ pub fn update(g: *Game, dt: f32) void {
     const ed = &g.ed;
     if (ed.status_t > 0) ed.status_t -= dt;
 
-    // Crash-recovery autosave: while dirty, snapshot every REC_INTERVAL seconds
-    // to a side file that never shadows the real map (cleared on save/exit).
+    // Crash-recovery autosave: while dirty, snapshot every REC_INTERVAL s to a side
+    // file that never shadows the real map (cleared on save/exit).
     if (ed.dirty) {
         ed.recovT += dt;
         if (ed.recovT >= REC_INTERVAL) {
@@ -1076,8 +1067,7 @@ pub fn update(g: *Game, dt: f32) void {
             // Esc = cancel: the pack modal edits live state, so restore it.
             if (ed.modal == .pack_edit) g.map = packEditBefore;
             ed.modal = .none;
-            // Mirror the Cancel buttons: leaving `pending` set would fire the
-            // stale action (exit/new/open) on the NEXT successful save.
+            // Clear pending, or a stale action fires on the NEXT successful save.
             ed.pending = .none;
         }
         return;
@@ -1088,8 +1078,7 @@ pub fn update(g: *Game, dt: f32) void {
     const alt = freePlace();
 
     // Camera: WASD pans (not while Ctrl-chording, or Ctrl+S would lurch south);
-    // RIGHT-DRAG grabs the ground and drags it (crawler grammar — the right
-    // button never deletes); wheel zooms.
+    // RIGHT-DRAG grabs the ground and drags it (right button never deletes); wheel zooms.
     var pan = mathx.zero3;
     if (!ctrl) {
         if (rl.isKeyDown(.w) or rl.isKeyDown(.up)) pan.z -= 1;
@@ -1112,7 +1101,7 @@ pub fn update(g: *Game, dt: f32) void {
     var panning = false;
     if (rl.isMouseButtonDown(.right)) {
         const mp = rl.getMousePosition();
-        if (!ed.rightMoved and (@abs(mp.x - ed.rightStart.x) > 4 or @abs(mp.y - ed.rightStart.y) > 4)) ed.rightMoved = true;
+        if (!ed.rightMoved and (@abs(mp.x - ed.rightStart.x) > RIGHT_DRAG_PX or @abs(mp.y - ed.rightStart.y) > RIGHT_DRAG_PX)) ed.rightMoved = true;
         if (ed.rightMoved) {
             if (ed.panAnchor) |anchor| {
                 if (mousePoint(g)) |cur| {
@@ -1134,19 +1123,19 @@ pub fn update(g: *Game, dt: f32) void {
         }
         ed.panAnchor = null;
     }
-    // While the ground is GRABBED the camera must track it rigidly: the smoothed
-    // follow lags the target, so each frame's re-pick would overshoot and the
-    // correction loop reads as jitter. Snap during the drag, glide otherwise.
+    // While the ground is GRABBED, track rigidly: the smoothed follow lags, so each
+    // frame's re-pick overshoots and the correction reads as jitter. Snap while
+    // dragging, glide otherwise.
     if (panning) g.rig.snap(ed.camTarget) else g.rig.follow(ed.camTarget, dt);
 
-    // Layers: Tab cycles (Shift reverses), Alt+1..N jumps (crawler grammar).
+    // Layers: Tab cycles (Shift reverses), Alt+1..N jumps.
     if (rl.isKeyPressed(.tab)) {
         const n: i32 = Layer.N;
         const cur: i32 = @intFromEnum(ed.layer);
         ed.layer = @enumFromInt(@mod(cur + (if (shift) @as(i32, -1) else 1) + n, n));
         ed.status("layer: {s}", .{ed.layer.label()});
     }
-    // Brushes: plain 1..9 within the layer; with Alt held the first N jump layers.
+    // Brushes: plain 1..9 within the layer; Alt+first-N jump layers instead.
     const numKeys = [_]rl.KeyboardKey{ .one, .two, .three, .four, .five, .six, .seven, .eight, .nine };
     for (numKeys, 0..) |k, i| {
         if (rl.isKeyPressed(k)) {
@@ -1172,8 +1161,7 @@ pub fn update(g: *Game, dt: f32) void {
         ed.mirrorX = !ed.mirrorX;
         ed.status("mirror-X {s}", .{if (ed.mirrorX) @as([]const u8, "ON") else "off"});
     }
-    // [ ] tune the layer's live parameter: feature height on Floor, brush radius
-    // everywhere else (crawler uses these for brush size too).
+    // [ ] tune the layer's live parameter: feature height on Floor, brush radius elsewhere.
     if (rl.isKeyPressed(.left_bracket)) {
         if (ed.layer == .floor) {
             ed.featureH = clampF(ed.featureH - FEATURE_H_STEP, FEATURE_H_MIN, FEATURE_H_MAX);
@@ -1193,7 +1181,7 @@ pub fn update(g: *Game, dt: f32) void {
         }
     }
     if (rl.isKeyPressed(.g)) ed.grid = !ed.grid;
-    if (rl.isKeyPressed(.x) and !ctrl and ed.layer == .decor) scatterDecor(g); // Decor-only, matches the Scatter button (Ctrl+X is cut, below)
+    if (rl.isKeyPressed(.x) and !ctrl and ed.layer == .decor) scatterDecor(g); // Decor-only, matches Scatter button (Ctrl+X is cut)
 
     if (ctrl and shift and rl.isKeyPressed(.s)) {
         openModal(ed, .save_as);
@@ -1231,8 +1219,8 @@ pub fn update(g: *Game, dt: f32) void {
     if (rl.isKeyPressed(.minus) or rl.isKeyPressed(.kp_subtract)) g.rig.addZoom(-1);
 
     if (rl.isKeyPressed(.f5)) {
-        resetTransient(g); // an armed grab/stroke/marquee must not survive the round-trip
-        // Ctrl+F5 (crawler): playtest FROM THE CURSOR instead of the spawn.
+        resetTransient(g); // no armed grab/stroke/marquee survives the round-trip
+        // Ctrl+F5: playtest FROM THE CURSOR instead of the spawn.
         if (ctrl) {
             if (mousePoint(g)) |p| {
                 gamemod.startPlaytestAt(g, clampAnchor(&g.map, p));
@@ -1256,15 +1244,15 @@ pub fn update(g: *Game, dt: f32) void {
         return;
     }
 
-    // World interaction — blocked while the pointer is over chrome or a menu.
-    // Every in-flight drag is released here, or a marquee/stroke that ends over
-    // a panel would stay armed and resume by itself back over the world.
+    // World interaction — blocked while the pointer is over chrome or a menu. Release
+    // every in-flight drag here, or a marquee/stroke ending over a panel stays armed
+    // and resumes itself back over the world.
     if (ed.uiHot or ed.ctxOpen) {
         ed.dragStart = null;
         ed.selDrag = null;
         ed.selMove = null;
         if (ed.strokeActive) endStroke(ed);
-        releaseGrab(g); // a pack grab dragged onto chrome/a menu is released here too
+        releaseGrab(g); // a pack grab dragged onto chrome/a menu releases here too
         return;
     }
     const pt = mousePoint(g);
@@ -1305,6 +1293,17 @@ pub fn update(g: *Game, dt: f32) void {
         }
 
         const tp = toolPoint(ed, p);
+        // A layer/brush switch mid-drag (Tab, Alt+N, toolbar) leaves the current
+        // case unable to own an in-flight stroke, so its release would never bank
+        // undo AND strokeActive would stay set — silently blocking all undo/redo
+        // (L240/L254 guards) until the next stroke overwrites strokeBefore. Close
+        // the stroke here the moment the active tool can no longer own it.
+        const ownsStroke = switch (ed.layer) {
+            .decor, .props => true,
+            .entities => ed.entityBrush() == .erase,
+            else => false,
+        };
+        if (ed.strokeActive and !ownsStroke) endStroke(ed);
         switch (ed.layer) {
             .floor => {
                 if (rl.isMouseButtonPressed(.left)) {
@@ -1334,10 +1333,10 @@ pub fn update(g: *Game, dt: f32) void {
             .entities => switch (ed.entityBrush()) {
                 .pack => {
                     if (rl.isMouseButtonPressed(.left)) {
-                        // Press ON an existing pack grabs it (drag to move,
-                        // release in place to edit) instead of stamping another.
+                        // Press ON an existing pack grabs it (drag to move, release
+                        // in place to edit) instead of stamping another.
                         for (g.map.packs[0..g.map.pack_count], 0..) |pk, i| {
-                            if (distXZ(v3(pk.x, 0, pk.z), p) < PACK_GRAB_R) {
+                            if (distXZ(pk.pos(), p) < PACK_GRAB_R) {
                                 ed.grabIdx = i;
                                 ed.grabStart = p;
                                 packEditBefore = g.map;
@@ -1376,7 +1375,7 @@ pub fn update(g: *Game, dt: f32) void {
                 .boss, .spawn, .portal => {
                     if (rl.isMouseButtonPressed(.left)) {
                         bankUndo(g);
-                        const ap = clampAnchor(&g.map, tp); // anchors keep the deeper inset
+                        const ap = clampAnchor(&g.map, tp); // anchors use the deeper inset
                         switch (ed.entityBrush()) {
                             .boss => g.map.bossPos = v3(ap.x, 0, ap.z),
                             .spawn => g.map.spawn = v3(ap.x, 0, ap.z),
@@ -1398,10 +1397,9 @@ pub fn update(g: *Game, dt: f32) void {
             },
         }
     } else if (rl.isMouseButtonReleased(.left)) {
-        // The pick can fail mid-gesture (a cliff face returns no ground point —
-        // everyday over Blood Moor's rampart): a release there must still tear
-        // down like the chrome path above, or the armed grab/marquee/stroke
-        // replays itself on the next press and its undo banking is lost.
+        // The pick can fail mid-gesture (a cliff face returns no ground point): a
+        // release there must still tear down like the chrome path above, or the armed
+        // grab/marquee/stroke replays on the next press and its undo banking is lost.
         ed.dragStart = null;
         ed.selDrag = null;
         ed.selMove = null;
@@ -1416,11 +1414,10 @@ fn endStroke(ed: *Editor) void {
     ed.strokeChanged = false;
 }
 
-// Close out every in-flight gesture (rect drag, paint stroke, pack grab, marquee,
-// pan) so nothing stays armed across a map swap or a playtest round-trip: a grab
-// or selection surviving doOpen would act on the NEW map with the OLD map's
-// indices/rect, and its undo snapshot would restore the wrong map wholesale.
-// Work that already changed the map banks its undo exactly like a normal release.
+// Close out every in-flight gesture (rect drag, stroke, grab, marquee, pan) so
+// nothing stays armed across a map swap or playtest round-trip: a grab/selection
+// surviving doOpen would act on the NEW map with OLD indices/rect and its snapshot
+// would restore the wrong map. Already-committed work banks undo like a release.
 fn resetTransient(g: *Game) void {
     const ed = &g.ed;
     ed.dragStart = null;
@@ -1428,17 +1425,17 @@ fn resetTransient(g: *Game) void {
     ed.sel = null;
     ed.selDrag = null;
     ed.selMove = null;
+    ed.ctxOpen = false; // F5 can playtest with the context menu open; don't let it
+    // survive the round-trip and redraw actionable at the stale ctxAt/ctxWorld.
     if (ed.strokeActive) endStroke(ed);
     releaseGrab(g);
 }
 
-// Release a pack grab that was interrupted before its own mouse-up handler could
-// run — the pointer wandered onto chrome/a menu, or a modal opened mid-drag. The
-// grab persists across frames, so an early `return` in update() that forgot it
-// would leave grabIdx armed with the button already up, and the NEXT placement
-// click would silently teleport the grabbed pack instead. Commit the drag exactly
-// like a release-with-move, but only if the pack actually moved (a bare grab that
-// merely brushed chrome is a no-op — no phantom undo step, no phantom dirty flag).
+// Release a pack grab interrupted before its own mouse-up (pointer wandered onto
+// chrome/a menu, or a modal opened mid-drag). grabIdx persists across frames, so a
+// forgotten early return would leave it armed with the button up and the NEXT click
+// would teleport the pack. Commit like a release-with-move, but only if the pack
+// actually moved (a bare grab is a no-op: no phantom undo step or dirty flag).
 fn releaseGrab(g: *Game) void {
     const ed = &g.ed;
     const gi = ed.grabIdx orelse return;
@@ -1452,8 +1449,8 @@ fn releaseGrab(g: *Game) void {
 // ---- Drawing (world) ----
 
 // Render the world under an "editor sun": the same torch pipeline, but the light
-// hangs high over the camera target with a huge radius, so the whole map is lit
-// and shadowed like the game (the map you see is the map they get).
+// hangs high over the camera target with a huge radius, so the whole map is lit and
+// shadowed like the game.
 pub fn draw(g: *Game) void {
     const ed = &g.ed;
     const cam = g.rig.cam;
@@ -1487,14 +1484,13 @@ pub fn draw(g: *Game) void {
     rl.endMode3D();
 }
 
-// Live monster silhouettes on every pack (arranged in the deploy ring) plus the
-// boss at its post — the ENCOUNTER reads at a glance instead of abstract rings.
-// Statuesque: no bob, facing outward. Drawn in both passes so they cast shadows
-// like the real bodies will. makeMonster ignores its rng, so previews are
-// deterministic and free to rebuild every frame.
+// Live monster silhouettes on every pack (in the deploy ring) plus the boss at its
+// post, so the ENCOUNTER reads at a glance. Statuesque: no bob, facing outward.
+// Drawn in both passes so they cast shadows. makeMonster ignores its rng, so
+// previews are deterministic and free to rebuild every frame.
 fn drawEncounterPreviews(g: *Game) void {
     for (g.map.packList()) |pk| {
-        const c = g.w.snapY(v3(pk.x, 0, pk.z));
+        const c = g.w.snapY(pk.pos());
         const n: i32 = @max(pk.count, 1);
         var i: i32 = 0;
         while (i < n) : (i += 1) {
@@ -1509,8 +1505,8 @@ fn drawEncounterPreviews(g: *Game) void {
     gamemod.drawMonsterBody(&boss);
 }
 
-// rl.drawGrid only draws square grids, so clip GRID-spaced lines to the arena
-// rect ourselves. Sits a hair above the floor to avoid z-fighting.
+// rl.drawGrid only draws square grids, so clip GRID-spaced lines to the arena rect
+// ourselves. Sits a hair above the floor to avoid z-fighting.
 fn drawRectGrid(m: *const mapmod.Map) void {
     const col = rgba(255, 255, 255, 40);
     const y = 0.01;
@@ -1534,17 +1530,17 @@ fn drawMarkers(g: *Game) void {
     marker(g, m.portal, PORTAL_COL, PORTAL_R);
     marker(g, m.bossPos, BOSS_COL, BOSS_R);
 
-    // Packs: the LIVE silhouettes (drawEncounterPreviews) show the encounter;
-    // here just the grab ring in the kind's color over a dark puck.
+    // Packs: silhouettes show the encounter; here just the grab ring in the kind's
+    // color over a dark puck.
     for (m.packList()) |pk| {
         const col = packColor(pk.kind);
-        const c = g.w.snapY(v3(pk.x, 0, pk.z));
+        const c = g.w.snapY(pk.pos());
         rl.drawCylinderEx(v3(c.x, c.y + 0.01, c.z), v3(c.x, c.y + 0.03, c.z), PACK_GRAB_R + 0.3, PACK_GRAB_R + 0.3, 20, withAlpha(theme.ink, 120));
         rl.drawCircle3D(v3(c.x, c.y + 0.06, c.z), PACK_GRAB_R, v3(1, 0, 0), 90, col);
         rl.drawCircle3D(v3(c.x, c.y + 0.06, c.z), PACK_GRAB_R - 0.15, v3(1, 0, 0), 90, withAlpha(col, 150));
     }
 
-    // Marquee selection: the live drag rect, then the committed one.
+    // Marquee: the live drag rect, then the committed one.
     if (ed.selDrag) |a| {
         if (mousePoint(g)) |cur| {
             const s = normRect(a, cur);
@@ -1556,7 +1552,7 @@ fn drawMarkers(g: *Game) void {
         rl.drawCylinderEx(v3((s.minX + s.maxX) / 2, 0.01, (s.minZ + s.maxZ) / 2), v3((s.minX + s.maxX) / 2, 0.02, (s.minZ + s.maxZ) / 2), 0.3, 0.3, 12, rgba(255, 220, 120, 90));
     }
 
-    // Prop footprints (their collision circles) so spacing reads at a glance.
+    // Prop collision circles so spacing reads at a glance.
     for (m.obstacles[0..m.obstacle_count]) |o| {
         rl.drawCircle3D(v3(o.Pos.x, g.w.groundY(o.Pos.x, o.Pos.z) + 0.04, o.Pos.z), o.Radius, v3(1, 0, 0), 90, rgba(255, 255, 255, 50));
     }
@@ -1574,8 +1570,8 @@ fn drawMarkers(g: *Game) void {
     if (!ed.uiHot and !ed.ctxOpen and ed.selDrag == null and ed.selMove == null) drawCursorAids(g);
 }
 
-// Cursor affordances: the snapped puck + cell, the erase brush circle with its
-// victims highlighted before you commit, and the mirror twin when mirroring.
+// Cursor affordances: snapped puck + cell, erase circle with its victims
+// highlighted pre-commit, and the mirror twin when mirroring.
 fn drawCursorAids(g: *Game) void {
     const ed = &g.ed;
     const raw = mousePoint(g) orelse return;
@@ -1595,7 +1591,7 @@ fn drawCursorAids(g: *Game) void {
                 }
             }
         } else {
-            // The sweep circle, plus a ring on everything it would take.
+            // Sweep circle, plus a ring on everything it would take.
             rl.drawCircle3D(v3(raw.x, raw.y + 0.06, raw.z), ed.brushR, v3(1, 0, 0), 90, rgba(255, 90, 70, 200));
             const m = &g.map;
             switch (ed.layer) {
@@ -1610,8 +1606,8 @@ fn drawCursorAids(g: *Game) void {
                     }
                 },
                 .entities => for (m.packList()) |pk| {
-                    if (distXZ(v3(pk.x, 0, pk.z), raw) < ed.brushR) {
-                        const c = g.w.snapY(v3(pk.x, 0, pk.z));
+                    if (distXZ(pk.pos(), raw) < ed.brushR) {
+                        const c = g.w.snapY(pk.pos());
                         rl.drawCircle3D(v3(c.x, c.y + 0.1, c.z), PACK_GRAB_R + 0.2, v3(1, 0, 0), 90, rgba(255, 60, 40, 255));
                     }
                 },
@@ -1634,8 +1630,8 @@ fn drawCursorAids(g: *Game) void {
 
 fn marker(g: *Game, at: rl.Vector3, col: rl.Color, r: f32) void {
     const p = g.w.snapY(at);
-    // Dark puck + doubled ring + a tall banner post with a haloed head: these are
-    // the map's fixed anchors and must never be lost against the terrain.
+    // Dark puck + doubled ring + a tall haloed banner post: the map's fixed anchors,
+    // never to be lost against the terrain.
     rl.drawCylinderEx(v3(p.x, p.y + 0.01, p.z), v3(p.x, p.y + 0.03, p.z), r + 0.35, r + 0.35, 20, withAlpha(theme.ink, 150));
     rl.drawCircle3D(v3(p.x, p.y + 0.06, p.z), r, v3(1, 0, 0), 90, col);
     rl.drawCircle3D(v3(p.x, p.y + 0.06, p.z), r - 0.14, v3(1, 0, 0), 90, withAlpha(col, 150));
@@ -1659,7 +1655,7 @@ const TOPBAR_H = 40;
 const PALETTE_W = 148;
 const PANEL_W = 224;
 const MM_S = 150; // minimap side
-const LAYER_ROW_H = 30; // vertical stride of a layer/brush button row
+const LAYER_ROW_H = 30; // stride of a layer/brush button row
 
 pub fn drawOverlay(g: *Game) void {
     const ed = &g.ed;
@@ -1667,10 +1663,9 @@ pub fn drawOverlay(g: *Game) void {
     const W = rl.getScreenWidth();
     const H = rl.getScreenHeight();
 
-    // A modal owns the pointer WHOLESALE, but the chrome under it is processed
-    // first in this same frame (immediate mode hit-tests as it draws): silence
-    // the mouse for those widgets or Undo/Playtest/the steppers keep firing
-    // through the dim backdrop and desync packEditBefore under pack_edit.
+    // A modal owns the pointer WHOLESALE, but immediate-mode chrome under it hit-tests
+    // as it draws this same frame: silence the mouse for those widgets or Undo/
+    // Playtest/steppers fire through the backdrop and desync packEditBefore.
     const modalOpen = ed.modal != .none;
     const livePressed = ctx.pressed;
     const liveDown = ctx.down;
@@ -1692,23 +1687,23 @@ pub fn drawOverlay(g: *Game) void {
     hoverWorldTip(g, &ctx);
     ui.drawTip(&ctx); // whatever earned a tooltip this frame, drawn over it all
 
-    // Chrome owns the pointer wherever a widget was hot; world input reads this
-    // next frame (one-frame lag, imperceptible).
+    // Chrome owns the pointer wherever a widget was hot; world input reads this next
+    // frame (one-frame lag, imperceptible).
     ed.uiHot = ctx.anyHot;
 }
 
-// When the pointer is over the WORLD, name what's under it: packs, the three
-// anchors, props, decor, terrain — the map explains itself on hover.
+// When the pointer is over the WORLD, name what's under it: packs, anchors, props,
+// decor, terrain.
 fn hoverWorldTip(g: *Game, ctx: *ui.Ctx) void {
     const ed = &g.ed;
     if (ctx.anyHot or ed.modal != .none or ed.ctxOpen) return;
-    // Tips only at rest: mid-paint / mid-drag they'd flicker under the brush.
+    // Tips only at rest: mid-paint/drag they'd flicker under the brush.
     if (rl.isMouseButtonDown(.left) or rl.isMouseButtonDown(.right)) return;
     const p = mousePoint(g) orelse return;
     var buf: [96]u8 = undefined;
     const m = &g.map;
     for (m.packList()) |pk| {
-        if (distXZ(v3(pk.x, 0, pk.z), p) < PACK_GRAB_R) {
+        if (distXZ(pk.pos(), p) < PACK_GRAB_R) {
             const s = std.fmt.bufPrint(&buf, "{s} pack x{d} - grab to move, click in place to edit", .{ @tagName(pk.kind), pk.count }) catch return;
             ctx.setTip(s);
             return;
@@ -1753,7 +1748,7 @@ fn hoverWorldTip(g: *Game, ctx: *ui.Ctx) void {
 
 fn drawTopbar(g: *Game, ctx: *ui.Ctx, W: i32) void {
     const ed = &g.ed;
-    ui.claimedPanel(ctx, ui.rect(0, 0, W, TOPBAR_H), null); // dead space between buttons is still chrome
+    ui.claimedPanel(ctx, ui.rect(0, 0, W, TOPBAR_H), null); // dead space is still chrome
     var x: i32 = 8;
     if (ui.buttonTip(ctx, ui.rect(x, 7, 54, 26), "New", 17, false, "Start a blank map (Ctrl+N)")) requestAction(g, .new, 0);
     x += 60;
@@ -1786,8 +1781,8 @@ fn drawPalette(g: *Game, ctx: *ui.Ctx) void {
     const px = 8;
     var y: i32 = TOPBAR_H + 8;
 
-    // LAYERS: the workspace switch (Tab cycles; Alt+1..4 jumps). Height derived
-    // from Layer.N (like BRUSHES below) so a new layer can't outgrow the panel.
+    // LAYERS: the workspace switch (Tab cycles; Alt+1..4 jumps). Height derived from
+    // Layer.N so a new layer can't outgrow the panel.
     ui.claimedPanel(ctx, ui.rect(px, y, PALETTE_W, 26 + @as(i32, Layer.N) * LAYER_ROW_H + 6), "LAYERS");
     y += 26;
     inline for (@typeInfo(Layer).@"enum".fields, 0..) |f, li| {
@@ -1799,7 +1794,7 @@ fn drawPalette(g: *Game, ctx: *ui.Ctx) void {
     }
     y += 8;
 
-    // BRUSHES: the active layer's kit, numbered like its hotkeys.
+    // BRUSHES: active layer's kit, numbered like its hotkeys.
     const brushes = brushesFor(ed.layer);
     const tips = brushTipsFor(ed.layer);
     const extraRows: i32 = if (ed.layer == .decor) 2 else 0;
@@ -1912,7 +1907,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
 }
 
 // Keep authored anchors AND terrain rects inside a shrunken arena; features that
-// collapse below a usable span are dropped rather than left as slivers.
+// collapse below a usable span are dropped, not left as slivers.
 fn clampContents(m: *mapmod.Map) void {
     const limW = m.halfW - ANCHOR_INSET;
     const limD = m.halfD - ANCHOR_INSET;
@@ -1945,10 +1940,9 @@ fn clampContents(m: *mapmod.Map) void {
             m.removeRamp(i);
         }
     }
-    // Placed content rides in with the terrain: props, decor, and packs must be
-    // pulled inside the shrunken wall too (same CONTENT_INSET limits pasteAt uses),
-    // or they strand outside the arena — monsters spawning in the void, floating
-    // scenery. (These have no min-span collapse, so just clamp the point.)
+    // Placed content rides in with the terrain: props/decor/packs pulled inside the
+    // shrunken wall too (pasteAt's CONTENT_INSET limits), or they strand outside —
+    // void-spawned monsters, floating scenery. No min-span collapse, so just clamp.
     for (m.obstacles[0..m.obstacle_count]) |*o| {
         o.Pos.x = clampF(o.Pos.x, -flimW, flimW);
         o.Pos.z = clampF(o.Pos.z, -flimD, flimD);
@@ -1963,8 +1957,8 @@ fn clampContents(m: *mapmod.Map) void {
     }
 }
 
-// The minimap (crawler: bottom-right, click-drag recenters): terrain footprint,
-// props, packs, the three markers, and the camera's view square.
+// Minimap (bottom-right, click-drag recenters): terrain footprint, props, packs,
+// the three markers, and the camera's view square.
 fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     const ed = &g.ed;
     const mx = W - MM_S - 14;
@@ -2015,7 +2009,7 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     rl.drawRectangle(@intFromFloat(ox + (g.map.spawn.x + halfW) * scale - 2), @intFromFloat(oy + (g.map.spawn.z + halfD) * scale - 2), 4, 4, SPAWN_COL);
     rl.drawRectangle(@intFromFloat(ox + (g.map.portal.x + halfW) * scale - 2), @intFromFloat(oy + (g.map.portal.z + halfD) * scale - 2), 4, 4, PORTAL_COL);
 
-    // The camera's approximate view square, and click/drag-to-travel.
+    // Approximate view square, and click/drag-to-travel.
     const viewHalf = 24.0 / g.rig.zoom;
     const vx: i32 = @intFromFloat(ox + (ed.camTarget.x - viewHalf + halfW) * scale);
     const vy: i32 = @intFromFloat(oy + (ed.camTarget.z - viewHalf + halfD) * scale);
@@ -2033,7 +2027,7 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
 
 fn drawStatusBar(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     const ed = &g.ed;
-    ui.claimedPanel(ctx, ui.rect(0, H - 30, W, 30), null); // the whole bar is chrome
+    ui.claimedPanel(ctx, ui.rect(0, H - 30, W, 30), null); // whole bar is chrome
     const hints: [:0]const u8 = "Tab layer   1-9 brush   LMB paint   Shift+drag select   Ctrl+C/X/V   Del   RMB menu/pan   M mirror   [ ] size   Ctrl+Z undo   Ctrl+S save   F5 playtest";
     hudx.text(hints, 12, H - 25, 15, withAlpha(theme.labelColor, 220));
 
@@ -2056,7 +2050,7 @@ fn drawStatusBar(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     }
 }
 
-// ---- Context menu (right-CLICK; crawler grammar) ----
+// ---- Context menu (right-CLICK) ----
 
 fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
     const ed = &g.ed;
@@ -2064,8 +2058,8 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
     const p = ed.ctxWorld;
     const m = &g.map;
 
-    // What's under the click? (Cross-layer on purpose: the menu is the "act on
-    // exactly this thing" tool, whatever layer it lives on.)
+    // What's under the click? Cross-layer on purpose: the menu acts on exactly this
+    // thing, whatever layer it lives on.
     var nearKind: enum { none, ob, dec, pack } = .none;
     var nearIdx: usize = 0;
     var bestD: f32 = 2.0;
@@ -2084,14 +2078,14 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
         }
     }
     for (m.packs[0..m.pack_count], 0..) |pk, i| {
-        if (distXZ(v3(pk.x, 0, pk.z), p) < bestD) {
-            bestD = distXZ(v3(pk.x, 0, pk.z), p);
+        if (distXZ(pk.pos(), p) < bestD) {
+            bestD = distXZ(pk.pos(), p);
             nearKind = .pack;
             nearIdx = i;
         }
     }
 
-    // A terrain feature under the click gets a re-height row (current featureH).
+    // A terrain feature under the click gets a re-height row (to current featureH).
     var featKind: enum { none, ledge, ramp } = .none;
     var featIdx: usize = 0;
     for (m.ramps[0..m.ramp_count], 0..) |r0, i| {
@@ -2204,7 +2198,7 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
     y += rowH;
     if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Cancel", 16, false)) ed.ctxOpen = false;
 
-    // A click anywhere off the menu dismisses it.
+    // A click off the menu dismisses it.
     if (ed.ctxOpen and ctx.pressed and !rl.checkCollisionPointRec(ctx.mouse, ui.rect(mx, my, menuW, rows * rowH + 12))) {
         ed.ctxOpen = false;
     }
@@ -2221,8 +2215,8 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
             const mb = ui.beginModal(ctx, 420, 188, "Save As");
             hudx.text("file name", mb.x + 24, mb.y + 46, 16, withAlpha(theme.labelColor, 230));
             ui.textField(ctx, ui.rect(mb.x + 24, mb.y + 68, 372, 30), &ed.field_buf, &ed.field_len, true, g.elapsed);
-            // Live path preview: exactly what doSaveAs will write (crawler's
-            // "Will save to:" pattern, so sanitizing never surprises).
+            // Live path preview: exactly what doSaveAs will write, so sanitizing
+            // never surprises.
             var slug: [40]u8 = undefined;
             var pv: [96]u8 = undefined;
             const s = slugTo(&slug, ed.field_buf[0..ed.field_len]);
@@ -2233,8 +2227,8 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
             hudx.text(preview, mb.x + 24, mb.y + 106, 15, rgba(180, 170, 152, 220));
             if (ui.button(ctx, ui.rect(mb.x + 214, mb.y + 136, 88, 30), "Save", 17, false) or rl.isKeyPressed(.enter)) doSaveAs(g);
             // Cancelling Save-As abandons any guarded action that opened it (e.g. the
-            // exit/open confirm chained through saveCurrent's no-path branch); leaving
-            // `pending` set would fire it on the NEXT successful save.
+            // exit/open confirm via saveCurrent's no-path branch); a leftover `pending`
+            // would fire on the NEXT successful save.
             if (ui.button(ctx, ui.rect(mb.x + 310, mb.y + 136, 86, 30), "Cancel", 17, false)) {
                 ed.pending = .none;
                 ed.modal = .none;

@@ -15,8 +15,7 @@ pub const LootDrop = struct {
     bob: f32 = 0,
 };
 
-// rollLoot decides what (if anything) a slain monster drops, appending to `out`.
-// (Go returned a slice; here we append directly into the game's loot list.)
+// Decides what a slain monster drops, appending into `out`.
 pub fn rollLoot(m: *const monster.Monster, rng: *mathx.Rng, out: *std.ArrayList(LootDrop)) void {
     // Gold almost always drops.
     if (m.GoldDrop > 0 and rng.float() < 0.85) {

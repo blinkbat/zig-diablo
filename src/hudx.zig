@@ -4,6 +4,7 @@ const mathx = @import("mathx.zig");
 const gamemod = @import("game.zig");
 const playermod = @import("player.zig");
 const monster = @import("monster.zig");
+const stats = @import("stats.zig");
 const theme = @import("theme.zig");
 
 const Game = gamemod.Game;
@@ -15,12 +16,11 @@ const lerpColor = mathx.lerpColor;
 const sinf = mathx.sinf;
 const v3 = mathx.v3;
 
-// HUD + world overlays + scene screens for the game (game.zig). 2D only — drawn after
-// endMode3D, so it never touches the torch lighting.
+// HUD + world overlays + scene screens. 2D only — drawn after endMode3D, so it
+// never touches the torch lighting.
 
-// Height (px) of the bottom band the HUD occupies (orbs, belt, XP bar). The single
-// source of truth for how tall the HUD is; game.zig reads it to ignore world clicks
-// that land on the HUD, so the two can't drift apart.
+// Height (px) of the bottom HUD band (orbs, belt, XP bar). Single source of truth;
+// game.zig reads it to ignore world clicks that land on the HUD.
 pub const bottomBandHeight: i32 = 140;
 
 fn sw() i32 {
@@ -34,9 +34,8 @@ fn fi(v: i32) f32 {
     return @floatFromInt(v);
 }
 
-// Distance from screen center to a corner: the radius a full-screen radial wash
-// needs to reach the corners. One source for the vignette and every scene-screen
-// gradient, which previously each re-spelled @sqrt(cx*cx + cy*cy) by hand.
+// Center-to-corner distance: radius a full-screen radial wash needs. Shared by the
+// vignette and every scene-screen gradient.
 fn screenDiag() f32 {
     const cx = @divTrunc(sw(), 2);
     const cy = @divTrunc(sh(), 2);
@@ -44,11 +43,10 @@ fn screenDiag() f32 {
 }
 
 // ---- UI font ----
-// IM Fell English (assets/, OFL license alongside) — antique book type for every
-// string the game draws. TWO rasterizations so neither end of the size range goes
-// mushy: a big display cut for titles/banners (>= 40 px) and a text cut for HUD
-// chrome. Falls back to raylib's default font if the asset can't be found (the
-// path is CWD-relative — run from the repo root).
+// IM Fell English (assets/, OFL license alongside) — antique book type for all UI
+// text. TWO rasterizations so neither size extreme goes mushy: a display cut for
+// titles/banners (>= 40 px) and a text cut for HUD chrome. Falls back to raylib's
+// default if the asset is missing (path is CWD-relative — run from repo root).
 var fontsLoaded = false;
 var haveFont = false;
 var fontDisplay: rl.Font = undefined;
@@ -59,9 +57,8 @@ const FONT_PATH = "assets/IMFellEnglish-Regular.ttf";
 fn ensureFonts() void {
     if (fontsLoaded) return;
     fontsLoaded = true;
-    // Atlas sizes leave DOWNSCALE-only headroom for every draw size in the game
-    // (after the 1.18 x-height factor): upscaling a glyph atlas is what makes
-    // text look blurry, and mild bilinear downscales stay crisp.
+    // Atlas sizes leave downscale-only headroom for every draw size (after the 1.18
+    // x-height factor): upscaling a glyph atlas blurs; mild bilinear downscales stay crisp.
     if (rl.loadFontEx(FONT_PATH, 120, null)) |big| {
         fontDisplay = big;
         rl.setTextureFilter(fontDisplay.texture, .bilinear);
@@ -75,7 +72,7 @@ fn ensureFonts() void {
     } else |_| {}
 }
 
-// Free the font atlases with the GL context still live (called from Game.deinit).
+// Free font atlases while the GL context is still live (called from Game.deinit).
 fn unloadFonts() void {
     if (haveFont) {
         rl.unloadFont(fontDisplay);
@@ -85,30 +82,26 @@ fn unloadFonts() void {
 }
 
 fn uiFont(size: i32) rl.Font {
-    // Select on the EFFECTIVE render size (after the 1.18 x-height factor), not
-    // the requested one: sizes 35-39 render above the 40 px text atlas and must
-    // take the display atlas or they upscale into blur.
+    // Select on the effective render size (after 1.18x), not the requested one:
+    // sizes 35-39 render above the 40 px text atlas and must use the display atlas.
     return if (fsize(size) > 40) fontDisplay else fontText;
 }
 
-// IM Fell's x-height is far smaller than the old pixel font's, so at equal point
-// size it reads ~20% smaller. Drawing at 1.18x restores the intended presence;
-// textW uses the SAME factor, so every measured layout stays glyph-accurate.
-// ROUNDED to whole pixels: fractional render sizes resample every glyph and read
-// as blur, especially at UI sizes.
+// IM Fell's small x-height reads ~20% under the point size; 1.18x restores presence.
+// textW uses the SAME factor so layouts stay glyph-accurate. Rounded to whole pixels:
+// fractional render sizes resample glyphs into blur.
 fn fsize(size: i32) f32 {
     return @round(fi(size) * 1.18);
 }
 
-// Width of s at the given size in the UI font. ALL layout must measure through
-// this (never rl.measureText) or centering drifts off the drawn glyphs.
-// (pub: the editor overlay reuses the HUD's type + helpers.)
+// Width of s at the given size in the UI font. ALL layout must measure through this
+// (never rl.measureText) or centering drifts. (pub: editor overlay reuses it.)
 pub fn textW(s: [:0]const u8, size: i32) i32 {
     if (!haveFont) return rl.measureText(s, size);
     return @intFromFloat(rl.measureTextEx(uiFont(size), s, fsize(size), 0).x);
 }
 
-// Bare string draw in the UI font (no shadow) — the primitive under text().
+// Bare UI-font string draw (no shadow) — the primitive under text().
 fn drawStr(s: [:0]const u8, x: i32, y: i32, size: i32, col: rl.Color) void {
     if (!haveFont) {
         rl.drawText(s, x, y, size, col);
@@ -128,8 +121,8 @@ fn centered(s: [:0]const u8, cy: i32, size: i32, col: rl.Color) void {
     text(s, @divTrunc(sw(), 2) - @divTrunc(w, 2), cy, size, col);
 }
 
-// Big display text with a warm halo behind it: the text redrawn at the four
-// diagonals in a low-alpha ember tone, under a hard shadow, under the face.
+// Big display text with a warm halo: redrawn at four diagonals in a low-alpha ember
+// tone, under a hard shadow, under the face.
 fn glowCentered(s: [:0]const u8, cy: i32, size: i32, col: rl.Color, halo: rl.Color) void {
     const w = textW(s, size);
     const x = @divTrunc(sw(), 2) - @divTrunc(w, 2);
@@ -145,10 +138,8 @@ pub fn pill(x: i32, y: i32, w: i32, h: i32, col: rl.Color) void {
     rl.drawRectangleRounded(.{ .x = fi(x), .y = fi(y), .width = fi(w), .height = fi(h) }, 0.9, 8, col);
 }
 
-// The "measured bar" chrome shared by the enemy plate and the XP channel — the ink
-// backing behind the bar, and the tick dividers + brass frame over it. The caller
-// draws its own fill (and any sweep) between the two, so a retune of the PoE-style
-// bar look happens in one place instead of two hand-tuned copies.
+// "Measured bar" chrome shared by the enemy plate and XP channel: ink backing under
+// the bar, tick dividers + brass frame over it. Caller draws its fill between them.
 fn barBacking(x: i32, y: i32, w: i32, h: i32) void {
     rl.drawRectangle(x - 2, y - 2, w + 4, h + 4, withAlpha(theme.ink, 235));
 }
@@ -171,6 +162,7 @@ pub fn draw(g: *Game) void {
         .playing => {
             vignette();
             drawHUD(g);
+            if (g.sheetOpen) drawStatSheet(g);
             if (g.paused) drawPauseOverlay();
         },
         .dead => {
@@ -182,13 +174,12 @@ pub fn draw(g: *Game) void {
             vignette();
             drawVictory(g);
         },
-        .editor => {}, // the editor draws its own overlay (editor.drawOverlay)
+        .editor => {}, // editor draws its own overlay (editor.drawOverlay)
     }
 }
 
-// Which foe owns the top-center plate this frame: the one under the cursor first,
-// else the one the hero is attacking, else an aggro'd champion in vision — so a boss
-// fight keeps its bar up even while the cursor wanders.
+// Foe owning the top-center plate: cursor target first, else attack target, else an
+// aggro'd boss in vision — so a boss fight keeps its bar up as the cursor wanders.
 fn pickEnemyPlate(g: *Game) ?*const monster.Monster {
     if (g.monsterByID(g.hoverMonster)) |m| {
         if (m.alive() and g.inVision(m.Pos)) return m;
@@ -202,8 +193,8 @@ fn pickEnemyPlate(g: *Game) ?*const monster.Monster {
     return null;
 }
 
-// Top-center enemy plate, PoE/D2 style: the foe's name over one wide thin bar at the
-// top of the screen — never floating bars over heads cluttering the battlefield.
+// Top-center enemy plate (PoE/D2 style): foe's name over one wide thin bar — never
+// floating bars over heads.
 fn drawEnemyPlate(g: *Game) void {
     const m = pickEnemyPlate(g) orelse return;
     const W = sw();
@@ -214,8 +205,13 @@ fn drawEnemyPlate(g: *Game) void {
     const cx = @divTrunc(W, 2);
     const bx = cx - @divTrunc(bw, 2);
     const by = 16 + size + 6;
-    // One soft backing behind name + bar so both read over any scene.
-    pill(bx - 18, 8, bw + 36, by - 8 + bh + 10, withAlpha(theme.ink, 165));
+    // Heavy-stun meter: a thin channel under the HP bar, only for kinds that can be
+    // heavy-stunned and only once there's something to show.
+    const showStun = m.heavyStunMax > 0 and (m.stunFill > 0 or m.stunned());
+    const sbh: i32 = if (boss) 6 else 4;
+    const stunPad: i32 = if (showStun) sbh + 3 else 0;
+    // Soft backing behind name + bar(s) so they read over any scene.
+    pill(bx - 18, 8, bw + 36, by - 8 + bh + 10 + stunPad, withAlpha(theme.ink, 165));
     var nbuf: [64]u8 = undefined;
     const name = std.fmt.bufPrintZ(&nbuf, "{s}", .{m.name()}) catch "";
     centered(name, 14, size, if (boss) rgba(255, 185, 205, 255) else rgba(240, 225, 205, 255));
@@ -227,20 +223,163 @@ fn drawEnemyPlate(g: *Game) void {
         rl.drawRectangleGradientH(bx, by, fw, bh, lerpColor(fillCol, rl.Color.black, 0.3), fillCol);
         rl.drawRectangle(bx, by, fw, 2, withAlpha(lerpColor(fillCol, rl.Color.white, 0.5), 210));
     }
-    // Quarter ticks + a thin brass frame: the PoE signature of a "measured" bar.
+    // Quarter ticks + thin brass frame: the PoE "measured bar" signature.
     barTicksFrame(bx, by, bw, bh, 4, 140);
+
+    // Fills amber as stun damage accumulates; flashes bright white while locked down.
+    if (showStun) {
+        const sy = by + bh + 3;
+        barBacking(bx, sy, bw, sbh);
+        if (m.stunned()) {
+            // Pulsing white fill for the locked-down window.
+            const pulse = 0.6 + 0.4 * sinf(g.elapsed * 12);
+            rl.drawRectangle(bx, sy, bw, sbh, withAlpha(rgba(255, 250, 220, 255), mathx.u8f(clampF(pulse * 255, 0, 255))));
+        } else {
+            const sfrac = clampF(m.stunFill, 0, 1);
+            const sfw: i32 = @intFromFloat(fi(bw) * sfrac);
+            const stunCol = rgba(240, 205, 90, 255);
+            if (sfw > 0) rl.drawRectangleGradientH(bx, sy, sfw, sbh, lerpColor(stunCol, rl.Color.black, 0.35), stunCol);
+        }
+        rl.drawRectangleLines(bx - 2, sy - 2, bw + 4, sbh + 4, withAlpha(theme.trimColor, 110));
+    }
 }
 
-// (Floating combat text is gone by owner decree: no damage numbers, no "Dodge!" —
-// hit sparks, gore, the orbs, and the enemy plate carry all combat feedback.)
+// No floating combat text (owner decree): hit sparks, gore, orbs, and the enemy
+// plate carry all combat feedback.
+
+// ---- Character stat sheet ----
+// Opened with C / Select (freezes the world). Left column: six attributes then three
+// skills, both allocatable via the cursor (d-pad/arrows + confirm). Right column:
+// derived stats (read-only). SHEET_DR_REF is a fixed reference hit size for the armor
+// %DR readout — PoE2 armor is hit-size dependent, so a flat % would lie.
+const SHEET_DR_REF: f32 = 40; // "% vs a 40-damage physical hit"
+
+const sheetGold = rgba(224, 190, 120, 255);
+const sheetInk = rgba(232, 222, 202, 255);
+
+// Allocatable row: label left, value right, green "+" when a point can be spent,
+// warm highlight box when it's the cursor.
+fn sheetAllocRow(x: i32, y: i32, w: i32, label: [:0]const u8, val: [:0]const u8, selected: bool, canAlloc: bool) void {
+    if (selected) {
+        rl.drawRectangle(x - 8, y - 4, w + 16, 25, withAlpha(rgba(180, 140, 70, 255), 70));
+        rl.drawRectangleLines(x - 8, y - 4, w + 16, 25, withAlpha(theme.trimColor, 150));
+    }
+    text(label, x, y, 18, sheetInk);
+    const showPlus = selected and canAlloc;
+    const vw = textW(val, 18);
+    const plusGap: i32 = if (showPlus) 24 else 0;
+    text(val, x + w - vw - plusGap, y, 18, rgba(245, 235, 210, 255));
+    if (showPlus) text("+", x + w - 16, y - 1, 20, rgba(150, 230, 150, 255));
+}
+
+// One read-only derived-stat row.
+fn sheetStatRow(x: i32, y: i32, w: i32, label: [:0]const u8, val: [:0]const u8) void {
+    text(label, x, y, 18, rgba(196, 186, 168, 255));
+    const vw = textW(val, 18);
+    text(val, x + w - vw, y, 18, sheetInk);
+}
+
+fn drawStatSheet(g: *Game) void {
+    const p = &g.p;
+    const W = sw();
+    const H = sh();
+    // Dim the frozen world behind the panel.
+    rl.drawRectangle(0, 0, W, H, withAlpha(rgba(6, 4, 8, 255), 200));
+
+    const pw: i32 = 760;
+    const ph: i32 = 540;
+    const px = @divTrunc(W - pw, 2);
+    const py = @divTrunc(H - ph, 2);
+    pill(px, py, pw, ph, withAlpha(theme.ink, 244));
+    rl.drawRectangleLines(px, py, pw, ph, withAlpha(theme.trimColor, 170));
+
+    centered("Character", py + 20, 34, rgba(240, 225, 205, 255));
+    var hbuf: [128]u8 = undefined;
+    const head = std.fmt.bufPrintZ(&hbuf, "Level {d}    Attribute Points: {d}    Skill Points: {d}", .{ p.Level, p.attrPoints, p.skillPoints }) catch "";
+    centered(head, py + 62, 18, rgba(214, 199, 178, 255));
+
+    const colY = py + 104;
+    const leftX = px + 44;
+    const colW = @divTrunc(pw, 2) - 72;
+    const rightX = px + @divTrunc(pw, 2) + 28;
+    const rowH: i32 = 30;
+
+    // ── Left: attributes, then skills (allocatable) ──
+    text("Attributes", leftX, colY, 22, sheetGold);
+    var vbuf: [24]u8 = undefined;
+    for (stats.Attribs.order, 0..) |k, i| {
+        const y = colY + 32 + @as(i32, @intCast(i)) * rowH;
+        const sel = g.sheetSel == @as(i32, @intCast(i));
+        const val = std.fmt.bufPrintZ(&vbuf, "{d}", .{p.attribs.get(k)}) catch "";
+        sheetAllocRow(leftX, y, colW, stats.Attribs.label(k), val, sel, p.attrPoints > 0);
+    }
+
+    const skHdrY = colY + 32 + 6 * rowH + 14;
+    text("Skills", leftX, skHdrY, 22, sheetGold);
+    // Iterate gamemod.sheetSkills (the sheet's skill order); label + rank come from
+    // the Skill enum / Player, so there is no parallel label/rank list to drift.
+    for (gamemod.sheetSkills, 0..) |sk, i| {
+        const y = skHdrY + 32 + @as(i32, @intCast(i)) * rowH;
+        const sel = g.sheetSel == gamemod.SHEET_ATTR_COUNT + @as(i32, @intCast(i));
+        var rbuf: [24]u8 = undefined;
+        const val = std.fmt.bufPrintZ(&rbuf, "Rank {d}", .{p.skillRank(sk)}) catch "";
+        sheetAllocRow(leftX, y, colW, sk.label(), val, sel, p.skillPoints > 0);
+    }
+
+    // Effect note for the selected attribute, in the left column's whitespace below
+    // Skills (skill rows have no note).
+    if (g.sheetSel < gamemod.SHEET_ATTR_COUNT) {
+        const k = stats.Attribs.order[@intCast(g.sheetSel)];
+        const noteY = skHdrY + 32 + @as(i32, @intCast(gamemod.sheetSkills.len)) * rowH + 14;
+        text(stats.Attribs.note(k), leftX, noteY, 16, rgba(206, 194, 172, 235));
+    }
+
+    // ── Right: derived stats (read-only totals) ──
+    text("Defense", rightX, colY, 22, sheetGold);
+    var b: [40]u8 = undefined;
+    var yy = colY + 32;
+    sheetStatRow(rightX, yy, colW, "Life", std.fmt.bufPrintZ(&b, "{d:.0}", .{p.MaxHP}) catch "");
+    yy += rowH;
+    var b2: [40]u8 = undefined;
+    sheetStatRow(rightX, yy, colW, "Mana", std.fmt.bufPrintZ(&b2, "{d:.0}", .{p.MaxMana}) catch "");
+    yy += rowH;
+    var b3: [48]u8 = undefined;
+    const drPct = stats.physReduction(p.def.armor, SHEET_DR_REF) * 100;
+    sheetStatRow(rightX, yy, colW, "Armor", std.fmt.bufPrintZ(&b3, "{d:.0}  ({d:.0}% vs {d:.0})", .{ p.def.armor, drPct, SHEET_DR_REF }) catch "");
+    yy += rowH;
+    // Four resists, driven by the one canonical elemental list + its label.
+    for (stats.DamageType.elementals) |rk| {
+        var lb: [24]u8 = undefined;
+        var pb: [16]u8 = undefined;
+        const ll = std.fmt.bufPrintZ(&lb, "{s} Res", .{rk.label()}) catch rk.label();
+        sheetStatRow(rightX, yy, colW, ll, std.fmt.bufPrintZ(&pb, "{d:.0}%", .{p.def.resFor(rk) * 100}) catch "");
+        yy += rowH;
+    }
+
+    yy += 12;
+    text("Offense", rightX, yy, 22, sheetGold);
+    yy += 32;
+    var o1: [40]u8 = undefined;
+    sheetStatRow(rightX, yy, colW, "Melee", std.fmt.bufPrintZ(&o1, "{d:.0}-{d:.0}", .{ p.MinDmg, p.MaxDmg }) catch "");
+    yy += rowH;
+    var o2: [40]u8 = undefined;
+    sheetStatRow(rightX, yy, colW, "Spell", std.fmt.bufPrintZ(&o2, "{d:.0}", .{p.spellDmg}) catch "");
+    yy += rowH;
+    var o3: [40]u8 = undefined;
+    sheetStatRow(rightX, yy, colW, "Crit", std.fmt.bufPrintZ(&o3, "{d:.0}%", .{p.derived.critChance * 100}) catch "");
+    yy += rowH;
+    var o4: [40]u8 = undefined;
+    sheetStatRow(rightX, yy, colW, "Cooldown Red.", std.fmt.bufPrintZ(&o4, "{d:.0}%", .{p.derived.cdrFrac * 100}) catch "");
+
+    // Footer hint (controller + keyboard).
+    centered("[Up/Down] select   [Confirm/+] spend   [Select/C] close", py + ph - 32, 15, rgba(176, 166, 150, 220));
+}
 
 // ---- 3D liquid orbs ----
-// Each orb is a REAL lit 3D scene rendered offscreen once per frame: a sphere mesh
-// shaded by its own little shader — N-dot-L liquid whose fill plane is clipped IN
-// THE SHADER (the cut line laps around the glass wall), a true elliptical meniscus
-// disc under a perspective camera, rising bubbles, and a fresnel glass shell with a
-// hard specular window — composited into the iron socket. One shared RT + sphere
-// mesh + shader serves both orbs.
+// Each orb is a real lit 3D scene rendered offscreen once per frame: a sphere mesh
+// with an N-dot-L liquid clipped at its fill plane IN THE SHADER, an elliptical
+// meniscus disc under a perspective camera, rising bubbles, and a fresnel glass
+// shell — composited into the iron socket. One shared RT + mesh + shader for both.
 
 const ORB_RT_SIZE = 256;
 const ORB_R = 0.95;
@@ -328,10 +467,9 @@ fn ensureOrbAssets() ?rl.RenderTexture2D {
     return orbRT;
 }
 
-// Called from Game.deinit so the GPU assets (orb RT/shader/mesh + font atlases)
-// don't outlive the GL context. The orb material only wraps orbShader (freed
-// here); its tiny default-map array is left to the OS rather than risk a
-// double-free — same policy as SceneMesh.
+// Called from Game.deinit so GPU assets (orb RT/shader/mesh + font atlases) don't
+// outlive the GL context. The orb material only wraps orbShader (freed here); its
+// tiny default-map array is left to the OS to avoid a double-free (same as SceneMesh).
 pub fn unloadOrbRT() void {
     if (orbRT) |rt| {
         rl.unloadRenderTexture(rt);
@@ -354,7 +492,7 @@ fn setOrbLiquid(c: rl.Color) void {
 
 fn renderOrbScene(rt: rl.RenderTexture2D, frac: f32, full: rl.Color, empty: rl.Color, t: f32, phase: f32) void {
     const cam = rl.Camera3D{
-        .position = v3(0, 0.9, 4.3), // matches the hardcoded V in orbFS
+        .position = v3(0, 0.9, 4.3), // must match hardcoded V in orbFS
         .target = v3(0, 0, 0),
         .up = v3(0, 1, 0),
         .fovy = 26.0,
@@ -369,8 +507,8 @@ fn renderOrbScene(rt: rl.RenderTexture2D, frac: f32, full: rl.Color, empty: rl.C
 
     rl.setShaderValue(orbShader, orbLocTime, &t, .float);
 
-    // Drained interior: the same lit shader pouring a near-black liquid to the brim,
-    // slightly shrunken so the real liquid shell wins the depth test over it.
+    // Drained interior: near-black liquid to the brim, slightly shrunken so the
+    // real liquid shell wins the depth test over it.
     var mode: i32 = 0;
     var fill: f32 = 2.0;
     rl.setShaderValue(orbShader, orbLocMode, &mode, .int);
@@ -384,7 +522,7 @@ fn renderOrbScene(rt: rl.RenderTexture2D, frac: f32, full: rl.Color, empty: rl.C
         setOrbLiquid(full);
         rl.drawMesh(orbMesh, orbMat, rl.math.matrixIdentity());
 
-        // Surface + bubbles read THROUGH the front of the liquid: painter's order.
+        // Surface + bubbles read through the liquid front: painter's order.
         rl.gl.rlDisableDepthTest();
         if (frac < 0.996) {
             rl.drawCylinderEx(v3(0, yl - 0.015, 0), v3(0, yl + 0.015, 0), chord * 0.99, chord * 0.99, 32, lerpColor(full, rl.Color.white, 0.30));
@@ -414,13 +552,13 @@ fn renderOrbScene(rt: rl.RenderTexture2D, frac: f32, full: rl.Color, empty: rl.C
     rl.endTextureMode();
 }
 
-// A liquid-filled glass globe in an iron-and-brass socket, rendered as a real 3D
-// scene (renderOrbScene) and composited here. Pulses an alarm glow when low.
+// Liquid glass globe in an iron-and-brass socket (renderOrbScene composited here).
+// Pulses an alarm glow when low.
 fn drawOrb(cx: i32, cy: i32, radius: i32, frac_in: f32, full: rl.Color, empty: rl.Color, t: f32) void {
     const frac = clampF(frac_in, 0, 1);
     const rf = fi(radius);
 
-    // Low-resource alarm: a soft pulsing halo outside the socket.
+    // Low-resource alarm: soft pulsing halo outside the socket.
     if (frac < 0.28) {
         const pa = mathx.u8f(50 + 45 * sinf(t * 6));
         rl.drawCircle(cx, cy, rf + 9, withAlpha(lerpColor(full, rl.Color.white, 0.15), pa));
@@ -431,7 +569,7 @@ fn drawOrb(cx: i32, cy: i32, radius: i32, frac_in: f32, full: rl.Color, empty: r
     if (ensureOrbAssets()) |rt| {
         renderOrbScene(rt, frac, full, empty, t, fi(cx) * 0.017);
         // Scale so the sphere's projected radius (~123 px of the 256 RT under the
-        // 26-degree camera) lands exactly on the socket rim.
+        // 26-deg camera) lands on the socket rim.
         const S = rf * 2.09 + 2;
         rl.drawTexturePro(
             rt.texture,
@@ -442,7 +580,7 @@ fn drawOrb(cx: i32, cy: i32, radius: i32, frac_in: f32, full: rl.Color, empty: r
             rl.Color.white,
         );
     } else {
-        // Render-target fallback: a flat fill so the HUD still reports the resource.
+        // RT fallback: flat fill so the HUD still reports the resource.
         rl.drawCircle(cx, cy, rf, empty);
         const fillH: i32 = @intFromFloat(fi(radius * 2) * frac);
         if (fillH > 0) {
@@ -465,11 +603,9 @@ fn drawHUD(g: *Game) void {
     const H = sh();
     const t = g.elapsed;
 
-    // Damage flash: red pain pressed into the screen RIM — a border vignette that
-    // leaves the scene's own lighting alone. The old near-screen-sized circle
-    // gradient tinted the ENTIRE frame; over the fog's black, every arrow hit
-    // from an unseen archer read as the torch radius blowing out red for a beat
-    // ("the light keeps glitching"), not as pain. The center must stay untouched.
+    // Damage flash: red pain in the screen RIM only — a border vignette that leaves
+    // the scene lighting alone. A center wash over the fog's black read as the torch
+    // radius glitching red, not pain; the center must stay untouched.
     if (g.damageFlash > 0) {
         const k = clampF(g.damageFlash / gamemod.DAMAGE_FLASH_DUR, 0, 1);
         const a = mathx.u8f(150 * k);
@@ -482,9 +618,8 @@ fn drawHUD(g: *Game) void {
         rl.drawRectangleGradientH(W - band, 0, band, H, clear, red);
     }
 
-    // One fixed-width command cluster, centered on the bottom edge: the two orbs
-    // bracket a single bound panel (flasks, dodge, gold, XP channel), so combat
-    // vitals live in ONE gaze instead of splitting your vision across the corners.
+    // One fixed-width command cluster centered on the bottom edge: two orbs bracket
+    // a bound panel (flasks, dodge, gold, XP), keeping combat vitals in one gaze.
     const hudW: i32 = @min(W - 24, 840);
     const hudX = @divTrunc(W - hudW, 2);
     const orbR: i32 = 56;
@@ -502,8 +637,8 @@ fn drawHUD(g: *Game) void {
     const mp = std.fmt.bufPrintZ(&b2, "{d}/{d}", .{ @as(i32, @intFromFloat(p.Mana)), @as(i32, @intFromFloat(p.MaxMana)) }) catch "";
     text(mp, manaCX - @divTrunc(textW(mp, 16), 2), orbY - 8, 16, rl.Color.white);
 
-    // XP: a burnished-gold channel spanning orb to orb, notched at each tenth, with
-    // a slow light sweep over the fill.
+    // XP: burnished-gold channel orb to orb, notched at each tenth, with a slow
+    // light sweep over the fill.
     const xpX = healthCX + orbR + 18;
     const xpW = manaCX - orbR - 18 - xpX;
     const xpY = H - 24;
@@ -529,8 +664,8 @@ fn drawHUD(g: *Game) void {
 
     drawBelt(p, @divTrunc(W, 2), H - 58);
 
-    // Dodge readiness: an arc that sweeps back around as the roll recharges, then
-    // settles to a steady bright ring when the escape is available again.
+    // Dodge readiness: arc sweeps around as the roll recharges, then settles to a
+    // steady bright ring when the escape is available.
     const dodgeC = rl.Vector2.init(fi(@divTrunc(W, 2)), fi(H - 90));
     rl.drawRing(dodgeC, 5, 8, 0, 360, 24, rgba(30, 30, 38, 220));
     if (p.rollCD > 0) {
@@ -544,7 +679,7 @@ fn drawHUD(g: *Game) void {
     drawTopRight(g);
     drawEnemyPlate(g);
 
-    // Transient status toast (top-center pill, tucked under the enemy plate zone).
+    // Transient status toast (top-center pill, under the enemy plate zone).
     if (g.toast.active()) {
         const a = mathx.u8f(clampF(g.toast.time / gamemod.TOAST_DUR * 255, 0, 255));
         const toastW = textW(g.toast.text(), 22);
@@ -552,7 +687,7 @@ fn drawHUD(g: *Game) void {
         centered(g.toast.text(), 84, 22, withAlpha(rgba(255, 245, 210, 255), a));
     }
 
-    // Area-name banner: big glowing title flanked by fading gold rules.
+    // Area-name banner: glowing title flanked by fading gold rules.
     if (g.banner.active()) {
         const a = clampF(g.banner.time, 0, 1);
         const a8 = mathx.u8f(a * 255);
@@ -568,7 +703,7 @@ fn drawHUD(g: *Game) void {
     }
 }
 
-// A little corked flask icon (bulb + neck + shine), used by the belt slots.
+// Corked flask icon (bulb + neck + shine), used by the belt slots.
 fn flaskIcon(x: i32, y: i32, col: rl.Color) void {
     rl.drawRectangle(x + 4, y + 2, 6, 5, rgba(24, 20, 16, 255)); // neck
     rl.drawRectangle(x + 3, y, 8, 3, theme.corkColor); // cork
@@ -577,14 +712,14 @@ fn flaskIcon(x: i32, y: i32, col: rl.Color) void {
     rl.drawRectangle(x + 3, y + 9, 2, 5, withAlpha(rl.Color.white, 90)); // glass shine
 }
 
-// A framed belt slot (PoE-style socket): dark well, brass liner, flask, count badge,
-// and its hotkey on a little key chip above. Greys out when the belt runs dry.
+// Framed belt slot: dark well, brass liner, flask, count badge, and its hotkey on a
+// chip above. Greys out when the belt runs dry.
 fn flaskSlot(x: i32, y: i32, col: rl.Color, count: i32, key: [:0]const u8) void {
     const have = count > 0;
     rl.drawRectangleRounded(.{ .x = fi(x), .y = fi(y), .width = 30, .height = 36 }, 0.3, 6, rgba(12, 9, 8, 215));
     rl.drawRectangleRoundedLinesEx(.{ .x = fi(x), .y = fi(y), .width = 30, .height = 36 }, 0.3, 6, 1, withAlpha(theme.trimColor, if (have) 170 else 70));
     flaskIcon(x + 8, y + 5, if (have) col else lerpColor(col, rgba(40, 40, 44, 255), 0.75));
-    // Count badge, bottom-right of the well.
+    // Count badge, bottom-right.
     var cb: [8]u8 = undefined;
     const ct = std.fmt.bufPrintZ(&cb, "{d}", .{count}) catch "";
     text(ct, x + 28 - textW(ct, 14), y + 22, 14, if (have) rl.Color.white else rgba(140, 130, 125, 200));
@@ -594,7 +729,7 @@ fn flaskSlot(x: i32, y: i32, col: rl.Color, count: i32, key: [:0]const u8) void 
     drawStr(key, x + 12, y - 14, 10, rgba(215, 195, 160, 235));
 }
 
-// The centered belt cluster: two flask slots flanking the gold purse readout.
+// Centered belt cluster: two flask slots flanking the gold readout.
 fn drawBelt(p: *const Player, cx: i32, y: i32) void {
     var b3: [24]u8 = undefined;
     const goldTxt = std.fmt.bufPrintZ(&b3, "{d} g", .{p.Gold}) catch "";
@@ -603,9 +738,8 @@ fn drawBelt(p: *const Player, cx: i32, y: i32) void {
     text(goldTxt, cx - @divTrunc(textW(goldTxt, 16), 2), y, 16, theme.goldColor);
 }
 
-// Top-right iron plaque: the enemy count behind a little skull pip, with the
-// FPS / frame-time / object readout tucked small and grey beneath it — one framed
-// corner instead of two lines of bare debug text floating over the world.
+// Top-right iron plaque: enemy count behind a skull pip, with the FPS / frame-time /
+// object readout small and grey beneath it.
 fn drawTopRight(g: *Game) void {
     const W = sw();
     var b1: [32]u8 = undefined;
@@ -616,7 +750,7 @@ fn drawTopRight(g: *Game) void {
     const x = W - w - 10;
     pill(x, 8, w, 50, withAlpha(theme.ink, 175));
     rl.drawRectangleRoundedLinesEx(.{ .x = fi(x), .y = 8, .width = fi(w), .height = 50 }, 0.9, 8, 1, withAlpha(theme.trimColor, 110));
-    // Skull pip: cranium, hanging jaw, hollow sockets.
+    // Skull pip: cranium, jaw, hollow sockets.
     const px = x + 14;
     const bone = rgba(222, 208, 188, 255);
     rl.drawCircle(px + 6, 22, 6, bone);
@@ -635,9 +769,9 @@ fn vignette() void {
     rl.drawCircleGradient(cx, cy, r, rgba(0, 0, 0, 0), rgba(0, 0, 0, 150));
 }
 
-// A stateless field of drifting screen embers: each mote's path is a pure function of
-// time and its index, so the scene screens get living air with zero bookkeeping.
-// `upward` embers rise (menu, death); otherwise they fall like gold rain (victory).
+// Stateless drifting screen embers: each mote's path is a pure function of time and
+// index, so scene screens get living air with zero bookkeeping. `upward` embers rise
+// (menu, death); otherwise they fall like gold rain (victory).
 fn emberField(t: f32, n: i32, col: rl.Color, upward: bool) void {
     const W = fi(sw());
     const H = fi(sh());
@@ -660,9 +794,9 @@ fn drawPauseOverlay() void {
     centered("Press P to resume", @divTrunc(sh(), 2) + 40, 24, rgba(220, 220, 220, 255));
 }
 
-// The start menu: title + a short column of selectable items. Keyboard owns
-// `menuSel` from the run loop; here the mouse hovers to select and clicks to
-// activate (gamemod.menuActivate is the single activation path for both).
+// Start menu: title + a column of selectable items. Keyboard owns `menuSel` from the
+// run loop; here mouse hover selects and click activates (gamemod.menuActivate is the
+// single activation path for both).
 fn drawMenu(g: *Game) void {
     const t = g.elapsed;
     const W = sw();
@@ -670,8 +804,8 @@ fn drawMenu(g: *Game) void {
     rl.drawRectangle(0, 0, W, H, rgba(4, 3, 6, 175));
     emberField(t, 22, rgba(255, 140, 50, 200), true);
 
-    // A smoldering backglow breathes behind the title. (Size 76 keeps the render
-    // size inside the 120 px display atlas — never upscale the title.)
+    // Smoldering backglow breathes behind the title. (Size 76 keeps the render size
+    // inside the 120 px display atlas — never upscale the title.)
     rl.drawCircleGradient(@divTrunc(W, 2), @divTrunc(H, 2) - 125, 320, rgba(120, 16, 8, mathx.u8f(60 + 25 * sinf(t * 1.8))), rgba(120, 16, 8, 0));
     glowCentered("ZIG DIABLO", @divTrunc(H, 2) - 180, 76, rgba(210, 45, 40, 255), withAlpha(rgba(90, 8, 8, 255), mathx.u8f(95 + 35 * sinf(t * 1.8))));
     const ruleW: i32 = 340;
@@ -685,14 +819,15 @@ fn drawMenu(g: *Game) void {
         .fullscreen => "Fullscreen",
     }}) catch "Display";
 
-    // The Debug Log row shows its live state, same pattern as the display cycler.
+    // Debug Log row (under Options) shows its live state, like the display cycler.
     var dbgBuf: [32]u8 = undefined;
     const dbgLabel: [:0]const u8 = std.fmt.bufPrintZ(&dbgBuf, "Debug Log: {s}", .{if (g.debugLog) @as([]const u8, "On") else "Off"}) catch "Debug Log";
+    // Top row reads "Continue" while a run is paused behind the menu, else "Adventure".
     var rootItems = gamemod.menuRootItems;
-    rootItems[@intFromEnum(gamemod.RootItem.debug)] = dbgLabel;
-    // 1:1 with gamemod.OptionsItem (display, back) — pinned so a new options row
-    // can't leave the labels and the dispatch out of step.
-    const optItems = [_][:0]const u8{ dispLabel, "Back" };
+    rootItems[@intFromEnum(gamemod.RootItem.adventure)] = if (g.canResume) "Continue" else "Adventure";
+    // 1:1 with gamemod.OptionsItem (display, debug, back) — asserted below so labels
+    // and dispatch can't drift.
+    const optItems = [_][:0]const u8{ dispLabel, dbgLabel, "Back" };
     comptime std.debug.assert(optItems.len == @typeInfo(gamemod.OptionsItem).@"enum".fields.len);
     const items: []const [:0]const u8 = if (g.menuMode == .root) &rootItems else &optItems;
 
@@ -709,7 +844,7 @@ fn drawMenu(g: *Game) void {
             if (rl.isMouseButtonPressed(.left)) gamemod.menuActivate(g, idx);
         }
         if (selected) {
-            // Gold daggers flank the chosen line, breathing gently.
+            // Gold daggers flank the chosen line, breathing.
             const flare = mathx.u8f(180 + 60 * sinf(t * 3));
             const gap = @divTrunc(w, 2) + 34;
             text("-", @divTrunc(W, 2) - gap - 14, y + 6, 28, withAlpha(theme.goldColor, flare));

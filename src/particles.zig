@@ -8,13 +8,10 @@ const rgba = mathx.rgba;
 const sinf = mathx.sinf;
 const cosf = mathx.cosf;
 
-// PARTICLES — one fixed-capacity pool of emissive motes for every transient effect:
-// impact sparks, death bursts, the firebolt's trail, portal motes, level-up rings.
-// Drawn AFTER endScene with the default shader (like the torch flame and monster
-// eyes), so they glow in the dark and never touch the lighting pipeline.
-//
-// The pool deliberately overwrites its oldest slot when full: a dropped year-old
-// spark is invisible, a skipped death burst is not.
+// PARTICLES — one fixed-capacity pool of emissive motes for every transient effect
+// (sparks, bursts, firebolt trail, portal motes, level-up rings). Drawn after endScene
+// with the default shader, so they glow in the dark and bypass the lighting pipeline.
+// When full, the pool overwrites its oldest slot (a dropped old spark is invisible).
 
 pub const MAX_PARTICLES = 768;
 
@@ -49,8 +46,8 @@ pub const Particles = struct {
         self.next = 0;
     }
 
-    /// A radial burst of `n` motes at `pos`: random directions, speeds in
-    /// [speed*0.35, speed], slight upward bias so bursts bloom rather than pancake.
+    /// Radial burst of `n` motes at `pos`: random dirs, speeds in [speed*0.35, speed],
+    /// slight upward bias so bursts bloom rather than pancake.
     pub fn burst(self: *Particles, rng: *mathx.Rng, pos: rl.Vector3, n: usize, speed: f32, size: f32, life: f32, col: rl.Color, grav: f32) void {
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -91,19 +88,18 @@ pub const Particles = struct {
             p.Pos.x += p.Vel.x * dt;
             p.Pos.y += p.Vel.y * dt;
             p.Pos.z += p.Vel.z * dt;
-            // Rest on the LOCAL floor (the world is a heightfield — sparks on a
-            // rampart must not fall through its top). Only catch a mote crossing
-            // the floor from above: one that drifted sideways under a ledge is
-            // already inside the cliff and invisible; snapping it up to the ledge
-            // top would read as a teleport.
+            // Rest on the LOCAL floor (heightfield world — sparks on a rampart mustn't
+            // fall through its top). Only catch a mote crossing the floor from above;
+            // one that drifted sideways under a ledge is already inside the cliff, and
+            // snapping it up would read as a teleport.
             const floorY = w.groundY(p.Pos.x, p.Pos.z) + 0.02;
             if (p.Pos.y < floorY and prevY >= floorY) p.Pos.y = floorY;
             i += 1;
         }
     }
 
-    /// Emissive pass: call between endScene and endMode3D. Motes shrink and fade
-    /// out over their lifetime. 4x4 spheres: at mote sizes they read as round glow.
+    /// Emissive pass: call between endScene and endMode3D. Motes shrink/fade over
+    /// their lifetime. 4x4 spheres read as round glow at mote sizes.
     pub fn draw(self: *const Particles) void {
         for (self.buf[0..self.count]) |*p| {
             const f = mathx.clampF(p.Life / p.maxLife, 0, 1);

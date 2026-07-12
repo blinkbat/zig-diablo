@@ -8,15 +8,11 @@ const v3 = mathx.v3;
 const rgba = mathx.rgba;
 const lerpColor = mathx.lerpColor;
 
-// MAP — the authored level format. The game is authored, not procgen: every area
-// is a `maps/*.map` file played back verbatim (the campaign is the maps folder in
-// lexicographic order, so files are named like `01_blood_moor.map`).
-//
-// The format is line-based text, one object per line — diff-friendly and
-// hand-editable, in the family of the sibling projects' editors — with a
-// `version:` header (the thing both siblings regretted omitting). Sections don't
-// exist; every line is `key: payload` and unknown keys are an ERROR (typos must
-// not silently drop half a map). `#` starts a comment.
+// MAP — the authored level format (no procgen; the campaign is maps/*.map in
+// lexicographic order, e.g. `01_blood_moor.map`). Line-based text, one object per
+// line, diff-friendly and hand-editable, with a required `version:` header. Every
+// line is `key: payload`; unknown keys are an ERROR (typos must not silently drop
+// half a map). `#` starts a comment.
 //
 //   version: 2
 //   name: The Blood Moor
@@ -35,20 +31,20 @@ const lerpColor = mathx.lerpColor;
 //   decor: tuft 3.1 4.2 0.5              (kind x z size)
 //   pack: fallen 3 -10.5 12              (kind count x z)
 //
-// Tints are NOT stored: presentation colors derive deterministically from the
-// map's palette + a position hash (same look every load, nothing to keep in sync).
+// Tints are NOT stored: colors derive deterministically from the palette + a
+// position hash (same look every load).
 
 pub const FORMAT_VERSION = 2; // v2: rectangular arenas (size: W D); v1 'half:' still loads
 pub const MAX_PACKS = 24;
 pub const MAX_MAPS = 16;
 pub const ext = ".map";
 pub const dir = "maps";
-// Capacity of a stored map-file path: the campaign list, the game's cached paths,
-// and the editor's Ctrl+S target all size to this so none silently truncates.
+// Stored map-file path capacity, shared by the campaign list, cached paths, and the
+// editor's Ctrl+S target so none silently truncates.
 pub const PATH_CAP = 96;
 
-// The default moor palette: the Map field defaults AND the editor's "Moor" preset
-// both read these, so a fresh map and the preset can't drift to different browns.
+// Default moor palette, shared by Map field defaults and the editor's "Moor" preset
+// so a fresh map and the preset can't drift.
 pub const DEFAULT_GROUND = rgba(92, 80, 62, 255);
 pub const DEFAULT_ACCENT = rgba(72, 62, 50, 255);
 
@@ -75,6 +71,12 @@ pub const Pack = struct {
     count: i32 = 3,
     x: f32 = 0,
     z: f32 = 0,
+
+    // Ground position as a Vector3 (y=0). One accessor so callers stop rebuilding
+    // `v3(pk.x, 0, pk.z)` by hand (obstacles/decor already carry a `.Pos`).
+    pub fn pos(p: Pack) rl.Vector3 {
+        return v3(p.x, 0, p.z);
+    }
 };
 
 pub const Map = struct {
@@ -103,56 +105,49 @@ pub const Map = struct {
         return self.packs[0..self.pack_count];
     }
 
-    // Swap-remove helpers: the editor deletes from three parallel arrays in half
-    // a dozen places (erase sweeps, context menu, pack modal) — one idiom, here.
-    // `i` must be a live index: on an empty collection the `_count -= 1` would
-    // wrap (usize) into a wild out-of-bounds swap, so assert the contract.
+    // Swap-remove helpers, one idiom for the editor's many delete sites. See swapRemove
+    // below for the shared body (and the live-index contract).
     pub fn removeObstacle(self: *Map, i: usize) void {
-        std.debug.assert(i < self.obstacle_count);
-        self.obstacle_count -= 1;
-        self.obstacles[i] = self.obstacles[self.obstacle_count];
+        swapRemove(self.obstacles[0..], &self.obstacle_count, i);
     }
-
     pub fn removeDecor(self: *Map, i: usize) void {
-        std.debug.assert(i < self.decor_count);
-        self.decor_count -= 1;
-        self.decor[i] = self.decor[self.decor_count];
+        swapRemove(self.decor[0..], &self.decor_count, i);
     }
-
     pub fn removePack(self: *Map, i: usize) void {
-        std.debug.assert(i < self.pack_count);
-        self.pack_count -= 1;
-        self.packs[i] = self.packs[self.pack_count];
+        swapRemove(self.packs[0..], &self.pack_count, i);
     }
-
     pub fn removeLedge(self: *Map, i: usize) void {
-        std.debug.assert(i < self.ledge_count);
-        self.ledge_count -= 1;
-        self.ledges[i] = self.ledges[self.ledge_count];
+        swapRemove(self.ledges[0..], &self.ledge_count, i);
     }
-
     pub fn removeRamp(self: *Map, i: usize) void {
-        std.debug.assert(i < self.ramp_count);
-        self.ramp_count -= 1;
-        self.ramps[i] = self.ramps[self.ramp_count];
+        swapRemove(self.ramps[0..], &self.ramp_count, i);
     }
 };
 
-// How far the fixed anchors sit in from the arena walls on a fresh map — shared
-// by defaultMap and the editor's New Map so the two can't drift.
+// Swap the last live element into slot `i` and shrink the count — one body for all
+// five remove* helpers, so a sixth collection can't forget the guard. `i` MUST be a
+// live index: on an empty collection `count -= 1` wraps (usize) into a wild
+// out-of-bounds swap in ReleaseFast (where the assert is compiled out), so assert it.
+fn swapRemove(arr: anytype, count: *usize, i: usize) void {
+    std.debug.assert(i < count.*);
+    count.* -= 1;
+    arr[i] = arr[count.*];
+}
+
+// Inset of the fixed anchors from the arena walls on a fresh map; shared by
+// defaultMap and the editor's New Map so they can't drift.
 pub const SPAWN_INSET = 6.0;
 pub const PORTAL_INSET = 7.0;
 pub const BOSS_INSET = 12.0;
 
-/// The fallback world when no map file exists or one fails to parse: a small
-/// empty field with a spawn, a portal, and one sad pack — the game always runs.
+/// Fallback world when no map file exists or one fails to parse: a small empty
+/// field with spawn, portal, and one pack, so the game always runs.
 pub fn defaultMap() Map {
     var m = Map{};
     m.name.set("Empty Field");
     m.boss.set("The Absence");
-    // Place the anchors from the INSET constants (same as the editor's New Map),
-    // not hand-computed literals — retune an inset or the default half-extent and
-    // the fallback map follows instead of silently drifting.
+    // Anchors from the INSET constants (like the editor's New Map), not literals, so
+    // retuning an inset or the default half-extent carries through.
     m.spawn = v3(0, 0, m.halfD - SPAWN_INSET);
     m.portal = v3(0, 0, -(m.halfD - PORTAL_INSET));
     m.bossPos = v3(0, 0, -(m.halfD - BOSS_INSET));
@@ -161,8 +156,7 @@ pub fn defaultMap() Map {
     return m;
 }
 
-// Deterministic per-position variation (replaces the old procgen rng tints):
-// the same map file renders identically on every load.
+// Deterministic per-position variation: the same map renders identically every load.
 fn hash01(x: f32, z: f32, salt: f32) f32 {
     const s = @sin(x * 127.1 + z * 311.7 + salt * 74.7) * 43758.5453;
     return s - @floor(s);
@@ -190,9 +184,9 @@ fn decorTint(m: *const Map, kind: world.DecorKind, x: f32, z: f32) rl.Color {
     };
 }
 
-/// Materialize the static world this map describes. The World carries no strings:
-/// names are read from Game.map at display time (a slice into a by-value World
-/// would dangle whenever the source struct moves).
+/// Materialize the static world this map describes. The World carries no strings
+/// (names are read from Game.map at display time; a slice into a by-value World
+/// would dangle when the source struct moves).
 pub fn toWorld(m: *const Map, isLast: bool) world.World {
     var w = world.World{
         .HalfW = m.halfW,
@@ -210,8 +204,8 @@ pub fn toWorld(m: *const Map, isLast: bool) world.World {
     for (m.obstacles[0..m.obstacle_count], 0..) |o, i| {
         w.obstacles[i] = o;
         w.obstacles[i].Tint = obstacleTint(m, o.Kind, o.Pos.x, o.Pos.z);
-        // Props stand ON the terrain: a gravestone authored on a rampart bakes at
-        // rampart height (the ledges/ramps were copied above, so groundY is live).
+        // Props stand ON the terrain: bake at the local ground height (ledges/ramps
+        // copied above, so groundY is live).
         w.obstacles[i].Pos.y = w.groundY(o.Pos.x, o.Pos.z);
     }
     w.decor_count = m.decor_count;
@@ -227,7 +221,7 @@ pub fn toWorld(m: *const Map, isLast: bool) world.World {
 
 pub fn save(m: *const Map, path: []const u8) !void {
     std.fs.cwd().makePath(dir) catch {};
-    // Never clobber the only copy: keep a .bak of whatever was there before.
+    // Keep a .bak of whatever was there before, so we never clobber the only copy.
     var bakBuf: [160]u8 = undefined;
     if (std.fmt.bufPrint(&bakBuf, "{s}.bak", .{path})) |bak| {
         std.fs.cwd().copyFile(path, std.fs.cwd(), bak, .{}) catch {};
@@ -265,9 +259,8 @@ pub fn save(m: *const Map, path: []const u8) !void {
 
 // ---- Loading ----
 
-// Every malformed-line case (unknown key, too-many-of-a-kind, bad payload) routes
-// through fail() -> BadLine with a descriptive log; callers fall back to defaultMap
-// regardless of which, so one line-error variant covers them all.
+// Every malformed-line case routes through fail() -> BadLine with a descriptive log;
+// callers fall back to defaultMap regardless, so one variant covers them all.
 const LoadError = error{ BadHeader, BadLine, ReadFailed };
 
 fn fail(lineNo: usize, line: []const u8, why: []const u8) LoadError {
@@ -278,9 +271,8 @@ fn fail(lineNo: usize, line: []const u8, why: []const u8) LoadError {
 fn nextF32(it: *std.mem.TokenIterator(u8, .scalar)) !f32 {
     const tok = it.next() orelse return LoadError.BadLine;
     const val = std.fmt.parseFloat(f32, tok) catch return LoadError.BadLine;
-    // parseFloat accepts "inf"/"nan"; a non-finite coordinate would ride through
-    // sanitize and detonate later (hash01(@sin(inf))->NaN->@intFromFloat in tint
-    // math). Reject at the door so every stored float is finite.
+    // parseFloat accepts "inf"/"nan"; a non-finite coord would detonate later
+    // (hash01(@sin(inf))->NaN->@intFromFloat). Reject so every stored float is finite.
     if (!std.math.isFinite(val)) return LoadError.BadLine;
     return val;
 }
@@ -314,10 +306,11 @@ pub fn load(path: []const u8) LoadError!Map {
 
         if (std.mem.eql(u8, key, "version")) {
             const ver = nextF32(&it) catch return fail(lineNo, line, "bad version");
-            // Compare as a float (never @intFromFloat an unvalidated parse — a huge,
-            // inf, or NaN version would make that cast illegal behavior). The negated
-            // form also rejects NaN, which is never a version we support.
-            if (!(ver <= @as(f32, @floatFromInt(FORMAT_VERSION)))) return fail(lineNo, line, "map is from a newer format version");
+            // Compare as float (never @intFromFloat an unvalidated parse — huge/inf/NaN
+            // makes the cast illegal). Require 1 <= ver <= FORMAT_VERSION: the negated,
+            // range-checked form also rejects NaN, and the lower bound rejects a
+            // truncated/typo'd value (0, negative) that would otherwise load silently.
+            if (!(ver >= 1 and ver <= @as(f32, @floatFromInt(FORMAT_VERSION)))) return fail(lineNo, line, "unsupported map format version");
             sawVersion = true;
         } else if (std.mem.eql(u8, key, "name")) {
             m.name.set(rest);
@@ -327,7 +320,7 @@ pub fn load(path: []const u8) LoadError!Map {
             m.halfW = nextF32(&it) catch return fail(lineNo, line, "bad size");
             m.halfD = nextF32(&it) catch return fail(lineNo, line, "bad size");
         } else if (std.mem.eql(u8, key, "half")) {
-            // Legacy v1 square arenas: one extent for both axes.
+            // Legacy v1 square arena: one extent for both axes.
             m.halfW = nextF32(&it) catch return fail(lineNo, line, "bad half");
             m.halfD = m.halfW;
         } else if (std.mem.eql(u8, key, "ground")) {
@@ -396,9 +389,8 @@ pub fn load(path: []const u8) LoadError!Map {
         } else {
             return fail(lineNo, line, "unknown key");
         }
-        // Leftover tokens mean a typo'd or merge-mangled line, not a longer
-        // format — reject loudly, same philosophy as unknown keys. `name` and
-        // `boss` hold free text and never consume their tokens.
+        // Leftover tokens mean a typo'd/merge-mangled line — reject loudly, as with
+        // unknown keys. `name`/`boss` hold free text and never consume their tokens.
         if (!std.mem.eql(u8, key, "name") and !std.mem.eql(u8, key, "boss") and it.next() != null) {
             return fail(lineNo, line, "trailing data");
         }
@@ -411,47 +403,40 @@ pub fn load(path: []const u8) LoadError!Map {
     return m;
 }
 
-// Harden a parsed map against hand-edited nonsense that would otherwise reach
-// the renderer or simulation: zero-size arenas, inverted feature rects, empty
-// pack counts (a pack of 0 divides by zero in the editor's tick ring).
+// Ledge and Ramp share the minX/maxX/minZ/maxZ/h rect fields; sanitize both the same
+// way — un-invert the rect, clamp it to the arena walls, clamp the height — so the two
+// feature paths can't drift. `f` is a pointer to a Ledge or Ramp.
+fn sanitizeFeatureRect(f: anytype, hw: f32, hd: f32) void {
+    if (f.minX > f.maxX) std.mem.swap(f32, &f.minX, &f.maxX);
+    if (f.minZ > f.maxZ) std.mem.swap(f32, &f.minZ, &f.maxZ);
+    f.minX = std.math.clamp(f.minX, -hw, hw);
+    f.maxX = std.math.clamp(f.maxX, -hw, hw);
+    f.minZ = std.math.clamp(f.minZ, -hd, hd);
+    f.maxZ = std.math.clamp(f.maxZ, -hd, hd);
+    f.h = std.math.clamp(f.h, 0.4, 8);
+}
+
+// Harden a parsed map against hand-edited nonsense: zero-size arenas, inverted
+// feature rects, empty pack counts (a pack of 0 divides by zero in the tick ring).
 fn sanitize(m: *Map) void {
     m.halfW = std.math.clamp(m.halfW, 12, 60);
     m.halfD = std.math.clamp(m.halfD, 12, 60);
     if (m.name.len == 0) m.name.set("Unnamed");
     if (m.boss.len == 0) m.boss.set("Champion");
-    // Bound every stored coordinate to the arena walls. nextF32 already rejected
-    // inf/NaN, but a finite-but-HUGE hand-edited value (e.g. `ledge: 1e18 ...`)
-    // would still ride through to an @intFromFloat in the editor minimap — illegal
-    // for an out-of-i32-range float — and would place content out in the void.
-    // Clamping to the walls closes both; it is a no-op for any in-arena map.
+    // Clamp every stored coordinate to the arena walls. nextF32 rejected inf/NaN, but
+    // a finite-but-HUGE value (e.g. `ledge: 1e18`) would still crash an @intFromFloat
+    // in the editor minimap and place content in the void. No-op for in-arena maps.
     const hw = m.halfW;
     const hd = m.halfD;
     m.spawn = v3(std.math.clamp(m.spawn.x, -hw, hw), 0, std.math.clamp(m.spawn.z, -hd, hd));
     m.portal = v3(std.math.clamp(m.portal.x, -hw, hw), 0, std.math.clamp(m.portal.z, -hd, hd));
     m.bossPos = v3(std.math.clamp(m.bossPos.x, -hw, hw), 0, std.math.clamp(m.bossPos.z, -hd, hd));
-    // Sizes/heights/light get the same treatment as coordinates: wider than the
-    // editor ever authors (hand-edited maps stay welcome), but a finite-but-HUGE
-    // value can't reach the renderer — a 1e18 ledge height puts the hero, camera,
-    // and shadow rig in orbit, and bakes cubes with absurd extents.
+    // Sizes/heights/light clamped like coordinates: wider than the editor authors
+    // (hand edits stay welcome), but a finite-but-HUGE value can't reach the renderer
+    // (a 1e18 ledge height would put the hero/camera/shadow rig in orbit).
     for (&m.light) |*c| c.* = std.math.clamp(c.*, 0, 4);
-    for (m.ledges[0..m.ledge_count]) |*l| {
-        if (l.minX > l.maxX) std.mem.swap(f32, &l.minX, &l.maxX);
-        if (l.minZ > l.maxZ) std.mem.swap(f32, &l.minZ, &l.maxZ);
-        l.minX = std.math.clamp(l.minX, -hw, hw);
-        l.maxX = std.math.clamp(l.maxX, -hw, hw);
-        l.minZ = std.math.clamp(l.minZ, -hd, hd);
-        l.maxZ = std.math.clamp(l.maxZ, -hd, hd);
-        l.h = std.math.clamp(l.h, 0.4, 8);
-    }
-    for (m.ramps[0..m.ramp_count]) |*r| {
-        if (r.minX > r.maxX) std.mem.swap(f32, &r.minX, &r.maxX);
-        if (r.minZ > r.maxZ) std.mem.swap(f32, &r.minZ, &r.maxZ);
-        r.minX = std.math.clamp(r.minX, -hw, hw);
-        r.maxX = std.math.clamp(r.maxX, -hw, hw);
-        r.minZ = std.math.clamp(r.minZ, -hd, hd);
-        r.maxZ = std.math.clamp(r.maxZ, -hd, hd);
-        r.h = std.math.clamp(r.h, 0.4, 8);
-    }
+    for (m.ledges[0..m.ledge_count]) |*l| sanitizeFeatureRect(l, hw, hd);
+    for (m.ramps[0..m.ramp_count]) |*r| sanitizeFeatureRect(r, hw, hd);
     for (m.obstacles[0..m.obstacle_count]) |*o| {
         o.Pos.x = std.math.clamp(o.Pos.x, -hw, hw);
         o.Pos.z = std.math.clamp(o.Pos.z, -hd, hd);
@@ -470,18 +455,17 @@ fn sanitize(m: *Map) void {
     }
 }
 
-/// The campaign: every maps/*.map, lexicographically ordered (name files
-/// 01_xxx.map, 02_xxx.map ... to order them). Returns how many were found.
+/// The campaign: every maps/*.map, lexicographically ordered (name files 01_xxx.map,
+/// 02_xxx.map ...). Returns how many were found.
 pub fn listCampaign(paths: *[MAX_MAPS][PATH_CAP]u8, lens: *[MAX_MAPS]usize) usize {
     var n: usize = 0;
     var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch return 0;
     defer d.close();
     var it = d.iterate();
-    // A mid-scan readdir error must still fall through to the sort below: returning
-    // here would hand back the maps in raw directory order, and campaign order is
-    // load-bearing (difficulty tier = areaIndex, and IsLast/victory key off the
-    // sorted index). Stop collecting, keep what we have, sort it. (`break` can't
-    // live in the while-condition, so drive the iterator explicitly.)
+    // A mid-scan readdir error must still fall through to the sort: campaign order is
+    // load-bearing (difficulty tier = areaIndex; IsLast/victory key off the sorted
+    // index), so stop collecting, keep what we have, and sort. (`break` can't live in
+    // the while-condition, so drive the iterator explicitly.)
     while (true) {
         const entry = (it.next() catch break) orelse break;
         if (entry.kind != .file) continue;
@@ -491,7 +475,7 @@ pub fn listCampaign(paths: *[MAX_MAPS][PATH_CAP]u8, lens: *[MAX_MAPS]usize) usiz
         lens[n] = full.len;
         n += 1;
     }
-    // Lexicographic sort (insertion; n is tiny).
+    // Lexicographic insertion sort (n is tiny).
     var i: usize = 1;
     while (i < n) : (i += 1) {
         var j = i;

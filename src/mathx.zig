@@ -1,8 +1,7 @@
 const std = @import("std");
 const rl = @import("raylib");
 
-// The game plays on the XZ ground plane; Y is up. Most gameplay math is 2D in
-// the XZ plane, so these helpers deliberately ignore Y. (Ported from util.go.)
+// Gameplay math on the XZ ground plane (Y up); these helpers ignore Y. (From util.go.)
 
 /// Vector3 constructor shorthand: v3(x, y, z).
 pub const v3 = rl.Vector3.init;
@@ -12,9 +11,8 @@ pub const rgba = rl.Color.init;
 pub const zero3 = rl.Vector3{ .x = 0, .y = 0, .z = 0 };
 
 pub fn clampF(v: f32, lo: f32, hi: f32) f32 {
-    // NaN slips past ordered comparisons (both `<` and `>` are false), so a NaN
-    // would pass through unclamped and blow up any downstream @intFromFloat. Pin
-    // it to lo — a clamp has no meaningful position for NaN, and lo is safe.
+    // NaN passes both `<` and `>`, so it'd escape unclamped and blow up a downstream
+    // @intFromFloat; pin it to lo (safe, no meaningful clamp position for NaN).
     if (std.math.isNan(v)) return lo;
     if (v < lo) return lo;
     if (v > hi) return hi;
@@ -47,8 +45,8 @@ pub fn distXZ(a: rl.Vector3, b: rl.Vector3) f32 {
     return @sqrt(dx * dx + dz * dz);
 }
 
-/// Squared horizontal distance (Y ignored). For threshold tests, compare against a
-/// squared radius to skip the per-check @sqrt on hot collision scans.
+/// Squared horizontal distance (Y ignored); compare vs a squared radius to skip
+/// the @sqrt on hot collision scans.
 pub fn dist2XZ(a: rl.Vector3, b: rl.Vector3) f32 {
     const dx = a.x - b.x;
     const dz = a.z - b.z;
@@ -138,8 +136,7 @@ pub const Rng = struct {
         return self.rand().float(f64);
     }
 
-    /// Uniform f32 in [lo, hi). Used for damage rolls (min..max) so player and
-    /// monster attacks share one roll expression.
+    /// Uniform f32 in [lo, hi). Used for damage rolls (min..max).
     pub fn range(self: *Rng, lo: f32, hi: f32) f32 {
         return lo + self.float() * (hi - lo);
     }

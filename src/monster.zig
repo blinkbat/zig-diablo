@@ -1,9 +1,11 @@
 const rl = @import("raylib");
 const mathx = @import("mathx.zig");
+const stats = @import("stats.zig");
 
 const v3 = mathx.v3;
 const rgba = mathx.rgba;
 const Rng = mathx.Rng;
+const maxF = mathx.maxF;
 
 pub const MonsterKind = enum(u8) {
     fallen, // fast, weak melee imp
@@ -12,50 +14,71 @@ pub const MonsterKind = enum(u8) {
     brute, // big, hard-hitting melee
 };
 
-// Capacity of a monster's inline name buffer. The boss name is copied in from the
-// map's `boss:` field, so map.zig sizes that StrBuf to this same constant — grow
-// one and the other follows instead of silently truncating boss names.
+// Inline name-buffer cap; shared with Map.boss (map.zig sizes its StrBuf to this)
+// so boss names copy in without truncating.
 pub const NAME_CAP = 48;
 
-// How long (seconds) a slain monster takes to fade out.
+// Seconds a slain monster takes to fade out.
 pub const monster_death_fade = 0.55;
 
-// How long (seconds) a struck monster flashes white. Owned here (like the death
-// fade) rather than as a bare literal in game.zig's combat code.
+// Seconds a struck monster flashes white.
 pub const monster_hitflash = 0.12;
 
-// Kinds whose strike telegraph is carried ENTIRELY by the body animation (the
-// pib's cocked knife, the zombie's overhead raise, the skeleton's drawn bow):
-// no red ground marking or beam is drawn for them, so their windup poses must
-// stay unmistakable.
+// Kinds whose strike telegraph is carried ENTIRELY by the body animation (no red
+// ground ring/beam), so their windup poses must stay unmistakable. Expressed as
+// "everyone but the brute" so a new melee kind defaults to the body telegraph and
+// must opt OUT explicitly, rather than silently getting a ground ring.
 pub fn animTelegraph(kind: MonsterKind) bool {
-    return kind == .fallen or kind == .zombie or kind == .skeleton;
+    return kind != .brute;
 }
 
-// Pib pack panic (Diablo's Fallen): watching any packmate die within this range
-// sends a pib scattering for a few seconds. Aggro survives the panic, so they
-// regroup and come right back — cowardice, not retreat.
+// Pib pack panic (Diablo's Fallen): a packmate dying within this range scatters
+// the pib for a few seconds. Aggro survives, so they regroup and return.
 pub const flee_trigger_radius = 9.0;
 pub const flee_time_min = 2.2;
 pub const flee_time_rand = 1.6;
+
+// ── Per-kind AI "personality" knobs ──────────────────────────────────────────
+// Pib (Fallen) aggression: the knife pigs don't trudge, they dart. On a cadence a
+// pib commits a fast dash that closes the gap, then recovers before the next.
+pub const pib_lunge_cd_min = 2.4; // seconds between lunges…
+pub const pib_lunge_cd_rand = 1.4; // …plus up to this much (desyncs a pack)
+pub const pib_lunge_time = 0.32; // duration of the dash itself
+pub const pib_lunge_speed = 2.6; // dash speed as a multiple of walk Speed
+pub const pib_lunge_range = 9.0; // only lunge when the hero is within this
+// A pib that eats a heavy single blow (this fraction of max HP) recoils and
+// scatters — the SAME panic path as a packmate's death (see flee_* above).
+pub const pib_recoil_frac = 0.28;
+
+// Skeleton Archer footwork: when a player bolt bears down, juke sideways instead of
+// eating it — but on a cooldown, so a line of archers isn't an un-hittable wall.
+pub const skel_dodge_cd_min = 2.6;
+pub const skel_dodge_cd_rand = 1.2;
+pub const skel_dodge_time = 0.4; // duration of the strafe
+pub const skel_dodge_speed = 1.5; // strafe speed as a multiple of walk Speed
+pub const skel_dodge_sense = 6.5; // react to a player bolt closing within this range
 
 // Monster is a hostile entity. AI is a simple wander/aggro/chase/attack loop.
 pub const Monster = struct {
     id: i32 = 0,
     Kind: MonsterKind = .fallen,
-    // Name is stored INLINE, not as a slice: a boss name sliced from the map's
-    // `boss:` field would dangle whenever the struct that owns the map moves
-    // (see the StrBuf note in map.zig). Cap shared with Map.boss via NAME_CAP.
+    // Name stored INLINE, not sliced: a boss name aliased into the map would dangle
+    // when the owning struct moves (see map.zig). Cap shared with Map.boss.
     nameBuf: [NAME_CAP]u8 = [_]u8{0} ** NAME_CAP,
     nameLen: u8 = 0,
     Pos: rl.Vector3 = mathx.zero3,
     Facing: rl.Vector3 = mathx.zero3,
     HP: f32 = 0,
     MaxHP: f32 = 0,
+    // Reserved for future mana-costing foe skills; populated but not yet consumed.
+    Mana: f32 = 0,
+    MaxMana: f32 = 0,
     Speed: f32 = 0,
     Radius: f32 = 0,
     Height: f32 = 0,
     Color: rl.Color = rgba(255, 255, 255, 255),
+    // Armor (PoE2 hit-size phys DR) + four elemental resists.
+    def: stats.Defense = .{},
     MinDmg: f32 = 0,
     MaxDmg: f32 = 0,
     XP: i32 = 0,
@@ -67,20 +90,80 @@ pub const Monster = struct {
     atkCD: f32 = 0,
     windup: f32 = 0, // >0 while telegraphing a committed strike
     windupTime: f32 = 0,
-    swing: f32 = 0, // >0 while the strike arc plays out; the hit lands at its midpoint
-    swingTime: f32 = 0, // 0 = no follow-through anim: the hit resolves at windup end
+    swing: f32 = 0, // >0 while the strike arc plays; hit lands at its midpoint
+    swingTime: f32 = 0, // 0 = no follow-through: hit resolves at windup end
     fleeTimer: f32 = 0, // >0 while scattering in panic (pibs; see flee_* above)
+    lungeTimer: f32 = 0, // pib: >0 mid-lunge (a locked, boosted dash at the hero)
+    lungeCD: f32 = 0, // pib: countdown to the next lunge
+    dodgeTimer: f32 = 0, // skeleton: >0 mid-dodge (strafing off a bolt's line)
+    dodgeCD: f32 = 0, // skeleton: countdown before it can juke a bolt again
+    dodgeDir: rl.Vector3 = mathx.zero3, // skeleton: current strafe heading
     aggro: bool = false,
     hitFlash: f32 = 0,
     wanderTimer: f32 = 0,
     wanderDir: rl.Vector3 = mathx.zero3,
     bob: f32 = 0,
-    deathTimer: f32 = 0, // >0 while playing the death fade, then removed
+    deathTimer: f32 = 0, // >0 while the death fade plays, then removed
     dying: bool = false,
     boss: bool = false,
 
+    // Stun. stunTimer > 0 = frozen (can't act); set by a light stun (single >25%-max
+    // blow) or a heavy stun (meter topping out). stunFill (0→1) is the accumulating
+    // heavy-stun meter (fills by landed/heavyStunMax, decays); at 1 it heavy-stuns
+    // for heavyStunDur seconds.
+    stunTimer: f32 = 0,
+    stunFill: f32 = 0,
+    heavyStunMax: f32 = 0, // damage to fill the meter (per-kind, scales with HP)
+    heavyStunDur: f32 = 0, // heavy-stun seconds when the meter tops out
+
     pub fn alive(m: *const Monster) bool {
         return m.HP > 0 and !m.dying;
+    }
+
+    /// Frozen by a light or heavy stun: skip AI/attacks this frame.
+    pub fn stunned(m: *const Monster) bool {
+        return m.stunTimer > 0;
+    }
+
+    /// Apply a typed hit through defense and return the damage that landed. Also
+    /// feeds the stun systems: a single big blow light-stuns (interrupting a
+    /// windup), and every hit builds the heavy-stun meter.
+    pub fn hurt(m: *Monster, dmg: stats.Damage) f32 {
+        const landed = stats.mitigate(dmg, m.def);
+        m.HP -= landed;
+        m.hitFlash = monster_hitflash;
+        m.aggro = true;
+        // Light stun: a huge single blow staggers, cancelling an in-progress strike.
+        if (m.HP > 0 and stats.isLightStun(landed, m.MaxHP)) {
+            m.applyStun(stats.LIGHT_STUN_DUR);
+        }
+        // Heavy stun: accumulate toward the meter; topping out locks it down hard.
+        if (m.HP > 0 and m.heavyStunMax > 0) {
+            m.stunFill += landed / m.heavyStunMax;
+            if (m.stunFill >= 1) {
+                m.stunFill = 0;
+                m.applyStun(m.heavyStunDur);
+            }
+        }
+        return landed;
+    }
+
+    /// Freeze the monster for `dur` (max with any current stun) and cancel a
+    /// committed strike so the stun genuinely interrupts.
+    pub fn applyStun(m: *Monster, dur: f32) void {
+        m.stunTimer = maxF(m.stunTimer, dur);
+        m.windup = 0;
+        m.swing = 0;
+    }
+
+    /// Advance stun timers/meter one frame. Returns true if still stunned after.
+    pub fn tickStun(m: *Monster, dt: f32) bool {
+        if (m.stunTimer > 0) m.stunTimer -= dt;
+        if (m.stunFill > 0) {
+            m.stunFill -= stats.HEAVY_STUN_DECAY_PER_SEC * dt;
+            if (m.stunFill < 0) m.stunFill = 0;
+        }
+        return m.stunTimer > 0;
     }
 
     pub fn name(m: *const Monster) []const u8 {
@@ -93,17 +176,15 @@ pub const Monster = struct {
         m.nameLen = @intCast(n);
     }
 
-    /// Telegraph progress 0→1 as a committed strike winds up (0 when not winding
-    /// up). Shared by the body pose, the flashing tint, and the FX ring/beam so the
-    /// drawn telegraph and the strike timing can never drift apart.
+    /// Telegraph progress 0→1 as a committed strike winds up (0 when idle). Shared
+    /// by body pose, tint, and FX so drawn telegraph and strike timing can't drift.
     pub fn windupProgress(m: *const Monster) f32 {
         if (m.windup <= 0 or m.windupTime <= 0) return 0;
         return 1 - m.windup / m.windupTime;
     }
 
-    /// Strike-arc progress 0→1 as the committed blow sweeps through (0 when idle).
-    /// Shared by the body pose and the FX pass (blade trail), and it's what the
-    /// damage timing reads too — the hit lands where the swing visibly is.
+    /// Strike-arc progress 0→1 as the blow sweeps through (0 when idle). Shared by
+    /// body pose, FX, and damage timing — the hit lands where the swing visibly is.
     pub fn swingProgress(m: *const Monster) f32 {
         if (m.swing <= 0 or m.swingTime <= 0) return 0;
         return 1 - m.swing / m.swingTime;
@@ -116,14 +197,18 @@ pub const Monster = struct {
 
 // makeMonster builds a monster of the given kind, scaled by difficulty tier.
 pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Monster {
-    _ = rng; // parity with Go signature; kind stats are deterministic
+    // rng seeds each kind's behavior cooldown to a random initial value so a freshly
+    // spawned pack lunges/dodges out of sync rather than in a single wave; base stats
+    // stay deterministic.
     const t: f32 = @floatFromInt(tier);
     var m = Monster{ .Kind = kind, .Pos = pos, .Facing = v3(0, 0, 1) };
+    // Heavy-stun meter as a multiple of MaxHP (per kind): tankier = harder to
+    // stagger. Applied after MaxHP is known.
+    var stunFactor: f32 = 1.4;
     switch (kind) {
         .fallen => {
             m.setName("Pib"); // the knife pigs (gf-certified)
             m.MaxHP = 30 + t * 11;
-            m.Speed = 3.8 + t * 0.2;
             m.Radius = 0.45;
             m.Height = 1.4;
             m.Color = rgba(170, 60, 50, 255);
@@ -133,17 +218,23 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
             m.GoldDrop = 4 + tier * 3;
             m.atkRange = 1.7;
             m.sightRange = 14;
-            m.atkRate = 1.6;
-            // The knife arc IS the telegraph (no ground ring): windup cocks the
-            // blade back, then the swing whips it through — quick, but the cock
-            // before it is the readable beat.
-            m.windupTime = 0.5;
+            // Fast and jittery: the knife pigs move quicker and stab more often than
+            // the rest of the bestiary, and they close the gap in bursts (lunge).
+            m.Speed = 4.4 + t * 0.25;
+            m.atkRate = 1.25;
+            // Knife arc IS the telegraph (no ground ring): windup cocks the blade,
+            // swing whips it through — the cock is the readable beat. Snappy but legible.
+            m.windupTime = 0.42;
             m.swingTime = 0.22;
+            m.def.armor = 4 + t * 1;
+            m.heavyStunDur = 1.1;
+            stunFactor = 1.2; // squishy: easy to stagger
+            m.lungeCD = rng.float() * pib_lunge_cd_min; // stagger first lunge across the pack
         },
         .zombie => {
             m.setName("Zombie");
-            // A lumbering wall: too slow to catch anyone paying attention, too
-            // tanky to ignore, and its overhead slam ruins whoever stands in it.
+            // A lumbering wall: too slow to catch the alert, too tanky to ignore,
+            // and its overhead slam ruins whoever stands in it.
             m.MaxHP = 115 + t * 34;
             m.Speed = 1.35 + t * 0.1;
             m.Radius = 0.6;
@@ -155,12 +246,15 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
             m.GoldDrop = 9 + tier * 5;
             m.atkRange = 2.0;
             m.sightRange = 12;
-            m.atkRate = 3.4;
-            // Long overhead raise, then a near-instant drop: the raise is the whole
-            // telegraph (and must give even a walking player time to leave); the
-            // slam itself is a guillotine.
-            m.windupTime = 1.15;
+            m.atkRate = 2.9; // still ponderous, but the slam comes around a bit sooner
+            // Long overhead raise (the whole telegraph — must let even a walking
+            // player leave), then a near-instant guillotine drop. A touch snappier now.
+            m.windupTime = 1.0;
             m.swingTime = 0.18;
+            m.def.armor = 45 + t * 6; // a wall: shrugs off small hits
+            m.def.setRes(.cold, 0.3); // rotting meat doesn't feel the chill
+            m.heavyStunDur = 2.2; // rare, but a toppled zombie stays down
+            stunFactor = 1.7;
         },
         .skeleton => {
             m.setName("Skeleton Archer");
@@ -177,9 +271,13 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
             m.atkRange = 17;
             m.sightRange = 22;
             m.atkRate = 2.2;
-            // The draw IS the telegraph (no aiming beam): bow tracking you, string
-            // coming back, arrowhead heating — long enough to read and sidestep.
+            // The draw IS the telegraph (no aiming beam) — long enough to read
+            // and sidestep.
             m.windupTime = 0.75;
+            m.def.armor = 6 + t * 1.5;
+            m.heavyStunDur = 1.4;
+            stunFactor = 1.2;
+            m.dodgeCD = rng.float() * skel_dodge_cd_min; // stagger first juke across the line
         },
         .brute => {
             m.setName("Brute");
@@ -196,15 +294,23 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
             m.sightRange = 16;
             m.atkRate = 2.6;
             m.windupTime = 0.85;
+            m.def.armor = 70 + t * 9; // heavily plated
+            m.def.setRes(.fire, 0.2);
+            m.heavyStunDur = 1.8;
+            stunFactor = 1.6;
         },
     }
     m.HP = m.MaxHP;
+    m.MaxMana = 0; // no kind spends mana yet (reserved for future skills)
+    m.Mana = m.MaxMana;
+    // Meter scales with the monster's own health: higher tiers need proportionally
+    // more punishment to stagger.
+    m.heavyStunMax = m.MaxHP * stunFactor;
     return m;
 }
 
-// makeBoss promotes a brute into the area's champion. The name is supplied by the
-// caller (the map's `boss:` field), so there's no parallel tier->name table to
-// keep in lockstep.
+// makeBoss promotes a brute into the area's champion. Name supplied by the caller
+// (map's `boss:` field), so there's no parallel tier->name table to sync.
 pub fn makeBoss(tier: i32, bossName: []const u8, rng: *Rng, pos: rl.Vector3) Monster {
     var m = makeMonster(.brute, tier, rng, pos);
     m.boss = true;
@@ -219,5 +325,11 @@ pub fn makeBoss(tier: i32, bossName: []const u8, rng: *Rng, pos: rl.Vector3) Mon
     m.Height = 3.8;
     m.Color = rgba(190, 50, 60, 255);
     m.sightRange = 26;
+    // Champion: resistant, extra armor, hard to stagger. Rescale the stun meter off
+    // the boosted HP (makeMonster sized it to base brute HP, before the ×2.4+120).
+    m.def.armor += 40;
+    m.def.setAllElemental(0.25);
+    m.heavyStunDur = 2.4;
+    m.heavyStunMax = m.MaxHP * 1.8;
     return m;
 }

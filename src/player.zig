@@ -1,31 +1,74 @@
 const rl = @import("raylib");
 const mathx = @import("mathx.zig");
+const stats = @import("stats.zig");
 
 const v3 = mathx.v3;
 const lenXZ = mathx.lenXZ;
 const minF = mathx.minF;
+const maxF = mathx.maxF;
+const clampF = mathx.clampF;
 
-// Dodge-roll tuning: a short, fast burst with a generous i-frame window — the
-// core way to survive deadly, telegraphed attacks.
+// Dodge-roll tuning: a short fast burst with a generous i-frame window — the core
+// way to survive telegraphed attacks.
 pub const rollDur = 0.42;
 pub const rollSpeed = 17.0;
 pub const rollCDMax = 1.05;
 pub const rollIframe = 0.34;
 
-// swingDur is the melee swing animation length (seconds).
+// Melee swing animation length (seconds).
 pub const swingDur = 0.22;
 
-// How long (seconds) the hero flashes white when struck. Owned here as a named const
-// (like monster_hitflash on the monster) rather than a bare literal in takeDamage.
+// Seconds the hero flashes white when struck.
 pub const hitflash = 0.25;
 
 pub const maxPots = 9;
 
-// The hero's collision radius — THE single source of truth (there is no per-player
-// field; nothing varies it at runtime). Used for movement collision and melee hit
-// reach; the monster attack telegraph reads it too, so the drawn ring matches the
-// real hitbox.
+// Hero collision radius — the single source of truth (no per-player field; never
+// varies at runtime). Used for movement collision and melee reach, and read by the
+// monster telegraph so the drawn ring matches the real hitbox.
 pub const radius: f32 = 0.55;
+
+// ── Base kit (pre-attribute) ─────────────────────────────────────────────────
+// Level-1, anchor-attribute numbers. recompute() multiplies these by
+// attribute/skill scaling; at the starting spread the multipliers are 1.0, so these
+// reproduce the old hardcoded feel — balance is unchanged until you allocate.
+pub const BASE_MELEE_MIN: f32 = 9;
+pub const BASE_MELEE_MAX: f32 = 15;
+pub const BASE_SPELL_DMG: f32 = 20;
+pub const BASE_ATK_RATE: f32 = 0.85;
+pub const BASE_CAST_RATE: f32 = 0.7;
+pub const BASE_SPELL_COST: f32 = 7;
+// No gear yet: modest innate armor (item armor will add here later). Resists start 0.
+pub const BASE_ARMOR: f32 = 20;
+
+// Points granted per level (Diablo-2 style: allocated by hand).
+pub const ATTR_POINTS_PER_LEVEL: i32 = 5;
+pub const SKILL_POINTS_PER_LEVEL: i32 = 1;
+
+// Per-rank skill bumps (no full tree yet — points rank up the three skills).
+pub const MELEE_RANK_INC: f32 = 0.08; // +8% melee damage per rank over 1
+pub const FIREBOLT_RANK_INC: f32 = 0.12; // +12% firebolt damage per rank over 1
+pub const DODGE_RANK_IFRAME: f32 = 0.04; // +0.04s i-frames per rank over 1
+pub const DODGE_RANK_CD: f32 = 0.06; // -0.06s roll cooldown per rank over 1
+pub const DODGE_CD_FLOOR: f32 = 0.55; // roll cooldown never shrinks below this
+
+// The three skills; skill points rank these up. Label lives with the enum (like
+// stats.Attribs) so the sheet iterates one source, not a parallel list.
+pub const Skill = enum {
+    melee,
+    firebolt,
+    dodge,
+
+    pub const count = @typeInfo(Skill).@"enum".fields.len;
+
+    pub fn label(s: Skill) [:0]const u8 {
+        return switch (s) {
+            .melee => "Melee",
+            .firebolt => "Firebolt",
+            .dodge => "Dodge",
+        };
+    }
+};
 
 // Player is the hero — an Amazon-ish ranged/melee hybrid.
 pub const Player = struct {
@@ -36,6 +79,16 @@ pub const Player = struct {
     Level: i32 = 0,
     XP: i32 = 0,
     XPNext: i32 = 0,
+
+    // ── RPG layer ──
+    attribs: stats.Attribs = .{},
+    derived: stats.Derived = .{},
+    def: stats.Defense = .{ .armor = BASE_ARMOR },
+    attrPoints: i32 = 0,
+    skillPoints: i32 = 0,
+    meleeRank: i32 = 1,
+    fireboltRank: i32 = 1,
+    dodgeRank: i32 = 1,
 
     HP: f32 = 0,
     MaxHP: f32 = 0,
@@ -61,12 +114,17 @@ pub const Player = struct {
     atkRate: f32 = 0,
     atkRange: f32 = 0,
     castCD: f32 = 0,
+    castRate: f32 = 0,
 
     // Dodge roll.
     rollTimer: f32 = 0,
     rollCD: f32 = 0,
     rollDir: rl.Vector3 = mathx.zero3,
     iframe: f32 = 0,
+
+    // Light stun: brief interrupt when a single blow lands for >25% of max HP. The
+    // hero can ONLY be light-stunned (never heavy-stunned like an enemy).
+    stunTimer: f32 = 0,
 
     // Spell (Firebolt).
     spellCost: f32 = 0,
@@ -86,6 +144,47 @@ pub const Player = struct {
     pub fn rolling(p: *const Player) bool {
         return p.rollTimer > 0;
     }
+    /// Light-stunned: can't attack, cast, or steer until it wears off.
+    pub fn stunned(p: *const Player) bool {
+        return p.stunTimer > 0;
+    }
+
+    /// Recompute every derived combat number from current attributes + skill ranks.
+    /// Called on spawn, level-up, and allocation. Preserves the HP/Mana FILL RATIO so
+    /// raising max life doesn't retroactively heal.
+    pub fn recompute(p: *Player) void {
+        const hpFrac = if (p.MaxHP > 0) p.HP / p.MaxHP else 1;
+        const manaFrac = if (p.MaxMana > 0) p.Mana / p.MaxMana else 1;
+
+        p.derived = stats.derive(p.attribs);
+        p.MaxHP = p.derived.maxHP;
+        p.MaxMana = p.derived.maxMana;
+        p.hpRegen = p.derived.hpRegen;
+        p.manaRegen = p.derived.manaRegen;
+
+        const meleeRankMult = 1 + MELEE_RANK_INC * @as(f32, @floatFromInt(p.meleeRank - 1));
+        p.MinDmg = BASE_MELEE_MIN * p.derived.meleeMult * meleeRankMult;
+        p.MaxDmg = BASE_MELEE_MAX * p.derived.meleeMult * meleeRankMult;
+
+        const fbRankMult = 1 + FIREBOLT_RANK_INC * @as(f32, @floatFromInt(p.fireboltRank - 1));
+        p.spellDmg = BASE_SPELL_DMG * p.derived.spellMult * fbRankMult;
+
+        // Cast-speed shortens cooldowns; int's CDR shortens the spell cooldown more.
+        p.atkRate = BASE_ATK_RATE / p.derived.castSpeedMult;
+        p.castRate = BASE_CAST_RATE * (1 - p.derived.cdrFrac) / p.derived.castSpeedMult;
+
+        p.HP = hpFrac * p.MaxHP;
+        p.Mana = manaFrac * p.MaxMana;
+    }
+
+    /// Roll i-frame duration for the current dodge rank.
+    pub fn rollIframeDur(p: *const Player) f32 {
+        return rollIframe + DODGE_RANK_IFRAME * @as(f32, @floatFromInt(p.dodgeRank - 1));
+    }
+    /// Roll cooldown for the current dodge rank (floored so it can't trivialize).
+    pub fn rollCooldown(p: *const Player) f32 {
+        return maxF(DODGE_CD_FLOOR, rollCDMax - DODGE_RANK_CD * @as(f32, @floatFromInt(p.dodgeRank - 1)));
+    }
 
     pub fn addXP(p: *Player, amount: i32) bool {
         var leveled = false;
@@ -100,39 +199,92 @@ pub const Player = struct {
         return leveled;
     }
 
+    /// A level grants points to allocate (no automatic stat bumps) and, Diablo-style,
+    /// fully restores you.
     pub fn levelUp(p: *Player) void {
-        p.MaxHP += 22;
-        p.MaxMana += 9;
-        p.MinDmg += 2.2;
-        p.MaxDmg += 3.0;
-        p.spellDmg += 4;
-        p.hpRegen += 0.25;
-        // A level-up fully restores you, Diablo-style.
+        p.attrPoints += ATTR_POINTS_PER_LEVEL;
+        p.skillPoints += SKILL_POINTS_PER_LEVEL;
+        p.recompute();
         p.HP = p.MaxHP;
         p.Mana = p.MaxMana;
     }
 
+    /// Spend one attribute point on `k`. False if none are available.
+    pub fn allocAttr(p: *Player, k: stats.Attribs.Kind) bool {
+        if (p.attrPoints <= 0) return false;
+        p.attrPoints -= 1;
+        p.attribs.addPoint(k);
+        p.recompute();
+        return true;
+    }
+
+    /// Current rank of a skill (skills start at rank 1).
+    pub fn skillRank(p: *const Player, s: Skill) i32 {
+        return switch (s) {
+            .melee => p.meleeRank,
+            .firebolt => p.fireboltRank,
+            .dodge => p.dodgeRank,
+        };
+    }
+
+    /// Spend one skill point ranking up `s`. False if none are available.
+    pub fn allocSkill(p: *Player, s: Skill) bool {
+        if (p.skillPoints <= 0) return false;
+        p.skillPoints -= 1;
+        switch (s) {
+            .melee => p.meleeRank += 1,
+            .firebolt => p.fireboltRank += 1,
+            .dodge => p.dodgeRank += 1,
+        }
+        p.recompute();
+        return true;
+    }
+
     /// Begin a dodge in dir (falling back to facing). False if on cooldown/underway.
     pub fn startRoll(p: *Player, dir_in: rl.Vector3) bool {
-        if (p.rollCD > 0 or p.rollTimer > 0 or !p.alive()) return false;
+        if (p.rollCD > 0 or p.rollTimer > 0 or p.stunned() or !p.alive()) return false;
         var dir = dir_in;
         if (lenXZ(dir) < 1e-3) dir = p.Facing;
         if (lenXZ(dir) < 1e-3) dir = v3(0, 0, -1);
         p.rollDir = dir;
         p.Facing = dir;
         p.rollTimer = rollDur;
-        p.rollCD = rollCDMax;
-        p.iframe = rollIframe;
+        p.rollCD = p.rollCooldown();
+        p.iframe = p.rollIframeDur();
         // A roll interrupts whatever you were doing.
         p.hasMoveTarget = false;
         p.targetMonster = -1;
         return true;
     }
 
-    pub fn takeDamage(p: *Player, dmg: f32) void {
-        p.HP -= dmg;
+    /// Take a typed hit. Armor + resists applied via the shared mitigation path;
+    /// returns the damage that landed so callers can gate feedback FX. A blow above
+    /// the light-stun threshold briefly interrupts the hero and cancels a swing/cast.
+    pub fn takeDamage(p: *Player, dmg: stats.Damage) f32 {
+        const landed = stats.mitigate(dmg, p.def);
+        p.HP -= landed;
         if (p.HP < 0) p.HP = 0;
         p.hitFlash = hitflash;
+        if (p.alive() and stats.isLightStun(landed, p.MaxHP)) {
+            p.stunTimer = maxF(p.stunTimer, stats.LIGHT_STUN_DUR);
+            p.swing = 0; // interrupt an in-progress melee swing
+        }
+        return landed;
+    }
+
+    /// Clear transient combat/roll/stun state. Called on an area transition so a
+    /// roll or stun in progress at the portal doesn't carry into the next area
+    /// (sliding off spawn mid-roll, or spawning rooted and stunned).
+    pub fn resetCombatState(p: *Player) void {
+        p.rollTimer = 0;
+        p.rollCD = 0;
+        p.iframe = 0;
+        p.stunTimer = 0;
+        p.swing = 0;
+        p.atkCD = 0;
+        p.castCD = 0;
+        p.hasMoveTarget = false;
+        p.targetMonster = -1;
     }
 
     pub fn regen(p: *Player, dt: f32) void {
@@ -162,28 +314,26 @@ pub fn newPlayer(pos: rl.Vector3) Player {
         .Speed = 4.6, // deliberate, weighty walk
         .Level = 1,
         .XP = 0,
-        .MaxHP = 100,
-        .MaxMana = 50,
-        .hpRegen = 0.4, // you cannot soak — avoid, don't tank
-        .manaRegen = 3.0,
-        .MinDmg = 9,
-        .MaxDmg = 15,
         .Gold = 0,
         .HealthPots = 4,
         .ManaPots = 2,
         .targetMonster = -1,
-        .atkRate = 0.85, // slower, heavier swings
         .atkRange = 2.4,
-        .spellCost = 7,
-        .spellDmg = 20,
+        .spellCost = BASE_SPELL_COST,
+        .def = .{ .armor = BASE_ARMOR },
     };
+    // Derive stats from the starting attributes, then top off.
+    p.recompute();
     p.HP = p.MaxHP;
     p.Mana = p.MaxMana;
     p.XPNext = xpForLevel(p.Level);
     return p;
 }
 
-// xpForLevel is the XP required to advance FROM the given level.
+// xpForLevel is the XP required to advance FROM the given level. Levels are
+// 1-based; a below-1 level (e.g. a default-constructed player) would make the
+// curve return a negative threshold and spin the level-up loop, so floor it.
 pub fn xpForLevel(level: i32) i32 {
-    return 40 + (level - 1) * 55 + (level - 1) * (level - 1) * 12;
+    const l = if (level < 1) 1 else level;
+    return 40 + (l - 1) * 55 + (l - 1) * (l - 1) * 12;
 }

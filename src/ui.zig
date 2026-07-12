@@ -8,11 +8,10 @@ const rgba = mathx.rgba;
 const lerpColor = mathx.lerpColor;
 const withAlpha = mathx.withAlpha;
 
-// UI — a tiny immediate-mode widget kit for the editor (raylib, IM Fell type via
-// hudx). Each widget hit-tests AND draws in one call; the caller applies results
-// on the spot. `Ctx.anyHot` accumulates "the pointer is over some widget this
-// frame" — the editor stores it and gates world clicks on it NEXT frame (the
-// one-frame lag is imperceptible and avoids a layout/interaction split).
+// UI — tiny immediate-mode widget kit for the editor. Each widget hit-tests AND
+// draws in one call. `Ctx.anyHot` accumulates "pointer over some widget this
+// frame"; the editor gates world clicks on it NEXT frame (1-frame lag is
+// imperceptible and avoids a layout/interaction split).
 
 pub const Ctx = struct {
     mouse: rl.Vector2,
@@ -20,9 +19,8 @@ pub const Ctx = struct {
     down: bool, // LMB held
     anyHot: bool = false, // pointer over any widget (accumulated)
 
-    // Deferred tooltip: whatever hovered LAST this frame wins, drawn on top of
-    // everything by drawTip. Copied into a buffer so formatted tips can use a
-    // caller's stack storage.
+    // Deferred tooltip: last hover this frame wins, drawn on top by drawTip. Copied
+    // into a buffer so formatted tips can use caller stack storage.
     tipBuf: [96]u8 = undefined,
     tipLen: usize = 0,
 
@@ -47,7 +45,7 @@ pub const Ctx = struct {
     }
 };
 
-// Attach a tooltip to any rectangle (labels, steppers, the minimap...).
+// Attach a tooltip to any rectangle.
 pub fn tipFor(ctx: *Ctx, r: rl.Rectangle, text: [:0]const u8) void {
     if (rl.checkCollisionPointRec(ctx.mouse, r)) ctx.setTip(text);
 }
@@ -76,10 +74,9 @@ pub fn rect(x: i32, y: i32, w: i32, h: i32) rl.Rectangle {
     return .{ .x = @floatFromInt(x), .y = @floatFromInt(y), .width = @floatFromInt(w), .height = @floatFromInt(h) };
 }
 
-// A panel that also claims its rect as chrome (the common case): the body must
-// set anyHot or world clicks fall through the padding onto the map. Editing one
-// rect of a separate claim+panel pair silently reopens that click-through hole,
-// so they travel together here.
+// Panel that also claims its rect as chrome: without anyHot, world clicks fall
+// through the padding onto the map. Claim+panel travel together so the
+// click-through hole can't silently reopen.
 pub fn claimedPanel(ctx: *Ctx, r: rl.Rectangle, title: ?[:0]const u8) void {
     _ = ctx.hot(r);
     panel(r, title);
@@ -94,8 +91,8 @@ pub fn panel(r: rl.Rectangle, title: ?[:0]const u8) void {
     }
 }
 
-// A clickable text button. `active` renders it latched (brass fill) for tool
-// palettes and tabs. Returns true on click.
+// Clickable text button; `active` latches it (brass fill) for palettes/tabs.
+// Returns true on click.
 pub fn button(ctx: *Ctx, r: rl.Rectangle, label: [:0]const u8, size: i32, active: bool) bool {
     const h = ctx.hot(r);
     const base = if (active) rgba(96, 74, 40, 235) else rgba(24, 19, 15, 225);
@@ -109,8 +106,8 @@ pub fn button(ctx: *Ctx, r: rl.Rectangle, label: [:0]const u8, size: i32, active
     return h and ctx.pressed;
 }
 
-// A compact auto-width chip (variant pickers). Returns clicked; writes the width
-// it used so callers can flow chips in a row.
+// Auto-width chip (variant pickers). Returns clicked; writes its used width so
+// callers can flow chips in a row.
 pub fn chip(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, active: bool, usedW: *i32) bool {
     const w = hudx.textW(label, 15) + 16;
     usedW.* = w + 6;
@@ -122,9 +119,8 @@ pub fn stepperF(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *f32, step: f
     hudx.text(label, x, y + 3, 15, withAlpha(theme.labelColor, 230));
     const bx = x + 92;
     var changed = false;
-    // Only report a change when the CLAMPED value actually moved: pressing +/- at
-    // a bound must not bank a no-op undo step or raise the dirty flag (which would
-    // then pop a spurious "unsaved changes" confirm).
+    // Report a change only when the CLAMPED value moved: +/- at a bound must not
+    // bank a no-op undo step or raise the dirty flag (spurious "unsaved" confirm).
     if (button(ctx, rect(bx, y, 22, 22), "-", 16, false)) {
         const nv = mathx.clampF(v.* - step, min, max);
         if (nv != v.*) {
@@ -150,7 +146,7 @@ pub fn stepperI(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *i32, min: i3
     hudx.text(label, x, y + 3, 15, withAlpha(theme.labelColor, 230));
     const bx = x + 92;
     var changed = false;
-    // Same as stepperF: a press that clamps to no change is not a change.
+    // Like stepperF: a press that clamps to no change is not a change.
     if (button(ctx, rect(bx, y, 22, 22), "-", 16, false)) {
         const nv = mathx.clampI(v.* - 1, min, max);
         if (nv != v.*) {
@@ -180,8 +176,8 @@ pub fn swatch(ctx: *Ctx, x: i32, y: i32, w: i32, h: i32, fill: rl.Color, edge: r
     return hov and ctx.pressed;
 }
 
-// Single-line text field. The caller owns focus; while focused this consumes
-// typed characters and backspace. Draws a breathing caret.
+// Single-line text field. Caller owns focus; while focused, consumes typed chars
+// and backspace. Draws a breathing caret.
 pub fn textField(ctx: *Ctx, r: rl.Rectangle, buf: []u8, len: *usize, focused: bool, t: f32) void {
     _ = ctx.hot(r);
     rl.drawRectangleRounded(r, 0.2, 4, rgba(16, 13, 11, 240));
@@ -205,10 +201,9 @@ pub fn textField(ctx: *Ctx, r: rl.Rectangle, buf: []u8, len: *usize, focused: bo
     }
 }
 
-// Modal scaffold: dim the screen, center a panel, return its top-left in PIXEL
-// ints (every caller lays out in ints — returning a float Rectangle forced an
-// @intFromFloat ceremony at every field). The backdrop eats the pointer (sets
-// anyHot) so nothing behind it can be clicked.
+// Modal scaffold: dim screen, center a panel, return its top-left as PIXEL ints
+// (callers lay out in ints). The backdrop eats the pointer (anyHot) so nothing
+// behind it is clickable.
 pub const ModalBox = struct { x: i32, y: i32 };
 
 pub fn beginModal(ctx: *Ctx, w: i32, h: i32, title: [:0]const u8) ModalBox {

@@ -10,6 +10,8 @@ const scenemesh = @import("scenemesh.zig");
 const editor = @import("editor.zig");
 const fogmod = @import("fog.zig");
 const playermod = @import("player.zig");
+const stats = @import("stats.zig");
+const input = @import("input.zig");
 const loot = @import("loot.zig");
 const cameramod = @import("camera.zig");
 const hudx = @import("hudx.zig");
@@ -38,63 +40,48 @@ const maxF = mathx.maxF;
 const alloc = std.heap.c_allocator;
 
 const MAX_MONSTERS = 128;
-const CAST_RATE = 0.7; // firebolt cooldown (seconds)
-const CRIT_CHANCE = 0.15;
-const CRIT_MULT = 2.0;
+// Firebolt cooldown/crit come from the RPG layer: p.castRate, p.derived.critChance,
+// stats.CRIT_MULT. See stats.zig / player.zig.
 
-// Scuffed-earth dust kicked up by footsteps and dodges — one tint (alpha varies per
-// use) so the two effects read as the same dry road.
+// Scuffed-earth dust for footsteps and dodges; one tint (alpha varies per use).
 const DUST_COLOR = rgba(200, 172, 132, 255);
 
-// Torch tuning. The light is anchored to the CARRIED torch: its XZ tracks the flame
-// in the hero's off-hand (smoothed — see torchXZ), so shadows fall away from the
-// torch side and swing around as the hero turns, instead of radiating from a lamp
-// floating over the hero's head. Height is a hard trade: lower = longer, more
-// lantern-dramatic body shadows and grazing floor light, but the overhead shadow
-// camera's cone must stay under its 150-degree FOV clamp (2*atan(12*1.3/4.5) =
-// 148) and TORCH_HEIGHT - SHADOW_CLIP_NEAR must clear a zombie/brute head (~3.9)
-// so they keep casting. 4.5 is the floor of that envelope; only the boss's crown
-// (~4.9) pokes above it, which reads as campfire uplighting on the champion.
+// Torch tuning. Light anchors to the CARRIED off-hand flame (smoothed — see torchXZ),
+// so shadows fall away from the torch and swing as the hero turns. 4.5 is the height
+// floor: lower breaks the shadow cam's 150-deg FOV clamp or stops clearing a
+// zombie/brute head (~3.9) so they'd stop casting; only the boss crown (~4.9) pokes above.
 const TORCH_HEIGHT = 4.5;
 const TORCH_RADIUS = 12.0;
 
-// The hero is drawn scaled up about his feet by this factor (uniform, so normals
-// stay valid untransformed). 1.22 also closes the old gap between the drawn torso
-// (0.42) and the actual collision radius (playermod.radius 0.55) — the body you
-// see finally fills the hitbox you play.
+// Hero drawn scaled up about his feet (uniform, so normals stay valid). 1.22 makes
+// the drawn torso fill the collision radius (playermod.radius 0.55).
 const HERO_SCALE = 1.22;
 
-// The off-hand torch grip: ONE set of offsets shared by the drawn stick + flame
-// (hero-local frame) and torchFlameWorld (the world anchor for the light and
-// embers), so the visual flame and the light source can never drift apart.
+// Off-hand torch grip: ONE set of offsets shared by the drawn stick+flame and
+// torchFlameWorld (light+ember anchor), so flame and light can't drift apart.
 const TORCH_GRIP_RIGHT = 0.45;
 const TORCH_GRIP_FWD = 0.05;
 const TORCH_FLAME_Y = 1.64; // flame-heart height in the hero's ground-local frame
 
-// The bow-hand grip in the hero's ground-local frame: back off the chest, out to
-// the draw side, at chest height. ONE anchor (heroBowHand) for the drawn bow limbs
-// AND the emissive string, so the string can't detach from the tips — the string
-// used to omit the walk bob the limbs carried and slid off them every stride.
+// Bow-hand grip (hero ground-local frame). ONE anchor (heroBowHand) for the drawn
+// bow limbs AND the emissive string, so the string can't detach from the tips.
 const BOW_GRIP_BACK = 0.18;
 const BOW_GRIP_SIDE = 0.4;
 const BOW_GRIP_Y = 1.15;
 
-// A live player fireball is its own moving light: a warm pool that follows the bolt
-// and lights (+ shadows) whatever it flies past, even out beyond the torch radius.
-// Modeled overhead like the torch so its downward shadow map stays well-oriented.
+// A live player fireball is its own moving light, following the bolt beyond the torch
+// radius. Modeled overhead like the torch so its downward shadow map stays oriented.
 const FIRE_HEIGHT = 3.5;
 const FIRE_RADIUS = 7.0;
-// The vision radius that gates targeting / health bars / popups — a little past the
-// torch's lit disc so a foe right at the edge can still be hovered and engaged. Body
-// DRAWING is gated tighter, at TORCH_RADIUS itself (see bodyVisible), so nothing dynamic
-// bleeds into the fog-of-war "seen" band beyond the light.
+// Vision radius gating targeting/health bars/popups — a little past the lit disc so an
+// edge foe can still be engaged. Body DRAWING is gated tighter at TORCH_RADIUS
+// (bodyVisible), so nothing dynamic bleeds into the fog "seen" band.
 const CULL = TORCH_RADIUS + 3;
 
 pub const DAMAGE_FLASH_DUR = 0.4;
 pub const TOAST_DUR = 2.5;
 
-// How long the area-name banner holds before fading (seconds). Level-up reuses the
-// banner with its own shorter hold.
+// Area-name banner hold (seconds); level-up reuses the banner with a shorter hold.
 const AREA_BANNER_DUR = 3.5;
 const LEVELUP_BANNER_DUR = 2.2;
 
@@ -113,14 +100,13 @@ const ProjList = struct {
     }
 };
 
-// A slain zombie's miasma: a stationary poison cloud that ticks damage on anyone
-// standing inside it. Fixed capacity like ProjList; overflow drops the NEW cloud,
-// which takes 24 zombie corpses gassing at once to even reach.
+// A slain zombie's miasma: stationary poison cloud that ticks damage inside it.
+// Fixed capacity; overflow drops the NEW cloud (needs 24 corpses gassing at once).
 const MAX_GAS = 24;
 const GAS_RADIUS = 2.2; // the DoT footprint — the drawn blobs must visually fill it
 const GAS_LIFE = 7.0;
-const GAS_GROW = 0.5; // seconds to billow out to full size after the corpse drops
-const GAS_TICK = 0.45; // seconds between hurt pulses while standing in any cloud
+const GAS_GROW = 0.5; // seconds to billow to full size
+const GAS_TICK = 0.45; // seconds between hurt pulses in a cloud
 const GAS_DPS_FRAC = 0.3; // cloud dps as a fraction of the dead zombie's MaxDmg
 
 const GasCloud = struct {
@@ -130,9 +116,8 @@ const GasCloud = struct {
     seed: f32 = 0, // per-cloud churn phase so neighbouring clouds don't boil in sync
 };
 
-// A fixed-capacity, self-contained transient text field: format into an inline buffer
-// with a countdown timer. The toast and the area banner share this so neither re-rolls
-// the overflow-safe bufPrintZ + buffer/len bookkeeping.
+// Fixed-capacity transient text field: format into an inline buffer with a countdown.
+// Shared by the toast and area banner.
 fn TextField(comptime cap: usize) type {
     return struct {
         buf: [cap]u8 = [_]u8{0} ** cap,
@@ -165,27 +150,45 @@ pub const Scene = enum { menu, playing, dead, victory, editor };
 pub const MenuMode = enum { root, options };
 pub const DisplayMode = enum { windowed, borderless, fullscreen };
 
-// The title menu's root rows. RootItem names each slot so the labels (drawn by
-// hudx) and the dispatch (menuActivate) can't drift out of order — reorder or add
-// a row and both follow the enum. The label array mirrors the enum 1:1; the
-// assert pins them to the same length so a lone edit is a compile error.
-pub const RootItem = enum(i32) { adventure, editor, options, debug, quit };
-pub const menuRootItems = [_][:0]const u8{ "Adventure", "Editor", "Options", "Debug Log", "Quit" };
+// Title menu root rows. RootItem names each slot so labels (hudx) and dispatch
+// (menuActivate) stay in order; the assert pins the label array 1:1 with the enum.
+pub const RootItem = enum(i32) { adventure, editor, options, quit };
+pub const menuRootItems = [_][:0]const u8{ "Adventure", "Editor", "Options", "Quit" };
 comptime {
     std.debug.assert(menuRootItems.len == @typeInfo(RootItem).@"enum".fields.len);
 }
 
-// Entering the options screen and every return-from-options lands the cursor on
-// the Options row; its index derives from the enum so it tracks any reordering.
+// Options screen entry/return lands the cursor on the Options row; index derives from the enum.
 pub const MENU_OPTIONS_IDX: i32 = @intFromEnum(RootItem.options);
-// The options screen's rows, same enum discipline as RootItem: the row labels
-// (hudx builds them 1:1 with a comptime assert) and the dispatch below both follow
-// this, and key-nav wrap derives its count from it — add a row in one place.
-pub const OptionsItem = enum(i32) { display, back };
+// Options screen rows, same enum discipline as RootItem: labels (hudx), dispatch, and
+// nav-wrap count all follow this — add a row in one place.
+pub const OptionsItem = enum(i32) { display, debug, back };
 pub const MENU_OPTIONS_COUNT: i32 = @typeInfo(OptionsItem).@"enum".fields.len;
 
-// Switch the window's display mode, unwinding whatever mode is active first so
-// the raylib toggles never stack (each toggle is its own on/off latch).
+// Stat sheet rows: the six attributes (stats.zig display order) then the three skills.
+// Nav-wrap and hudx layout derive their count from these.
+pub const sheetSkills = [_]playermod.Skill{ .melee, .firebolt, .dodge };
+comptime {
+    std.debug.assert(sheetSkills.len == playermod.Skill.count); // every skill has a row
+}
+pub const SHEET_ATTR_COUNT: i32 = @intCast(stats.Attribs.order.len);
+pub const SHEET_ROW_COUNT: i32 = SHEET_ATTR_COUNT + @as(i32, @intCast(sheetSkills.len));
+
+// Drive the open stat sheet: arrows move, confirm/nav-right spends a point, cancel closes.
+fn updateSheet(g: *Game, altHeld: bool) void {
+    if (input.navDown()) g.sheetSel = @mod(g.sheetSel + 1, SHEET_ROW_COUNT);
+    if (input.navUp()) g.sheetSel = @mod(g.sheetSel - 1 + SHEET_ROW_COUNT, SHEET_ROW_COUNT);
+    if (input.confirm(altHeld) or input.navRight()) {
+        if (g.sheetSel < SHEET_ATTR_COUNT) {
+            _ = g.p.allocAttr(stats.Attribs.order[@intCast(g.sheetSel)]);
+        } else {
+            _ = g.p.allocSkill(sheetSkills[@intCast(g.sheetSel - SHEET_ATTR_COUNT)]);
+        }
+    }
+    if (input.cancel()) g.sheetOpen = false;
+}
+
+// Switch display mode, unwinding the active mode first (raylib toggles are on/off latches).
 fn setDisplayMode(g: *Game, want: DisplayMode) void {
     if (g.displayMode == want) return;
     switch (g.displayMode) {
@@ -213,6 +216,7 @@ pub fn menuActivate(g: *Game, idx: i32) void {
     if (g.menuMode == .options) {
         switch (@as(OptionsItem, @enumFromInt(idx))) {
             .display => cycleDisplayMode(g, true),
+            .debug => toggleDebugLog(g),
             .back => {
                 g.menuMode = .root;
                 g.menuSel = MENU_OPTIONS_IDX;
@@ -220,12 +224,14 @@ pub fn menuActivate(g: *Game, idx: i32) void {
         }
         return;
     }
-    // idx is a valid row (menuSel wraps mod menuRootItems.len; the mouse path passes
-    // the row it drew), so decode it back to the named slot and dispatch on that.
+    // idx is a valid row; decode to the named slot and dispatch.
     switch (@as(RootItem, @enumFromInt(idx))) {
-        .adventure => g.startRun(),
+        // Resume a live run if one is paused behind the menu; otherwise start fresh.
+        .adventure => if (g.canResume) {
+            g.paused = false; // don't resume into a frozen (P-paused) world
+            g.scene = .playing;
+        } else g.startRun(),
         .editor => editor.enter(g),
-        .debug => toggleDebugLog(g),
         .options => {
             g.menuMode = .options;
             g.menuSel = 0;
@@ -234,49 +240,41 @@ pub fn menuActivate(g: *Game, idx: i32) void {
     }
 }
 
-// A melee monster's true reach: its attack range, plus the target's radius, plus a
-// small lunge. The strike check and the drawn telegraph ring MUST use this same
-// formula so that standing just outside the ring is genuinely safe.
+// A melee monster's true reach: attack range + target radius + a small lunge. Strike
+// check and drawn telegraph ring MUST share this so outside-the-ring is safe.
 const MELEE_LUNGE = 0.35;
 fn meleeReach(atkRange: f32, targetRadius: f32) f32 {
     return atkRange + targetRadius + MELEE_LUNGE;
 }
 
-// The red a monster's body flushes toward while a committed strike winds up and
-// swings — the same tint at both ends of the telegraph, so the threat reads as one
-// color whether it's charging or cutting.
+// Red a monster's BODY flushes toward through windup and swing (the ground rings,
+// threat beam, and lit eyes each carry their own hostile red at their draw sites).
 const THREAT_TINT = rgba(255, 80, 40, 255);
 
-// How far ahead of the zombie's own radius its overhead slam lands. The dust-kick
-// (resolveMonsterAttack) and the drawn slamming fists (drawMonsterBody) both read
-// this, so the punctuation and the pose strike the same spot.
+// How far ahead of the zombie's radius its overhead slam lands. Shared by the dust-kick
+// (resolveMonsterAttack) and the drawn fists (drawMonsterBody).
 const ZOMBIE_SLAM_FWD = 0.7;
 
-// The hero's own strike reach against a target: attack range plus the target's radius.
-// One helper so the chase-stop distance and the hit check can't drift apart.
+// Hero's strike reach: attack range + target radius. One helper so chase-stop and
+// hit check can't drift apart.
 fn playerReach(atkRange: f32, targetRadius: f32) f32 {
     return atkRange + targetRadius;
 }
 
-// Max vertical gap at which two bodies count as "on comparable ground" for melee:
-// a strike (either direction) and a monster's decision to wind up all read this one
-// rule, so nobody can swing across a cliff/rampart edge. One source keeps the three
-// combat gates in lockstep. (Comfortably above world.STEP_MAX so a single step up a
-// ramp is still within reach.)
+// Max vertical gap counting as "comparable ground" for melee: strikes (both ways) and
+// windup decisions all read this, so nobody swings across a cliff edge. Above
+// world.STEP_MAX so a single ramp step is still in reach.
 const SAME_GROUND_DY = 1.0;
 
-// Low-poly sphere. raylib's drawSphere defaults to 16x16 and regenerates on the CPU
-// with per-vertex trig on every call — the scene is drawn twice a frame (shadow depth
-// pass + main pass). Under a dark torch an 8x8 ball is indistinguishable at ~1/4 cost.
+// Low-poly sphere. raylib's drawSphere is 16x16 with per-call CPU trig; under a dark
+// torch an 8x8 ball is indistinguishable at ~1/4 cost (scene drawn twice a frame).
 fn sphere(pos: rl.Vector3, r: f32, col: rl.Color) void {
     rl.drawSphereEx(pos, r, 8, 8, col);
 }
 
-// Scale the model-view stack up about the hero's feet, so every hero draw call
-// (body + FX, in every pass) renders HERO_SCALE bigger without touching its math.
-// The final translate carries base.y, lifting the whole (ground-relative) body
-// onto whatever terrain the hero stands on. Uniform scale only: rlgl doesn't
-// re-transform normals, which is exactly correct for a pure uniform scale.
+// Scale the model-view stack up about the hero's feet so every hero draw renders
+// HERO_SCALE bigger; the translate carries base.y onto the terrain. Uniform scale
+// only (rlgl doesn't re-transform normals — correct for uniform scale).
 fn beginHeroScale(base: rl.Vector3) void {
     rl.gl.rlPushMatrix();
     rl.gl.rlTranslatef(base.x, base.y, base.z);
@@ -284,10 +282,9 @@ fn beginHeroScale(base: rl.Vector3) void {
     rl.gl.rlTranslatef(-base.x, 0, -base.z);
 }
 
-// The carried torch's flame position in the world: off-hand side of the hero, at
-// flame height above his ground, in the SCALED body's frame. One source of truth
-// shared by the ember spitter and the LIGHT itself (the light's XZ anchors here —
-// see Game.torchXZ); the drawn flame lands here too via the beginHeroScale wrap.
+// Carried flame's world position (off-hand side, flame height, SCALED frame). One
+// source shared by the ember spitter, the light (torchXZ anchors here), and the
+// drawn flame (via beginHeroScale).
 fn torchFlameWorld(p: *const Player) rl.Vector3 {
     const f = mathx.orFacing(p.Facing, 0, -1);
     const right = mathx.perpXZ(f);
@@ -298,9 +295,8 @@ fn torchFlameWorld(p: *const Player) rl.Vector3 {
     );
 }
 
-// The bow-hand anchor in the hero-local frame (see BOW_GRIP_*). Both the body's bow
-// limbs and the FX pass's emissive string derive their endpoints from this, passing
-// the same walk `bob`, so the string always meets the tips.
+// Bow-hand anchor (hero-local frame, see BOW_GRIP_*). Body limbs and FX string both
+// derive endpoints from this with the same bob, so the string meets the tips.
 fn heroBowHand(base: rl.Vector3, f: rl.Vector3, right: rl.Vector3, bob: f32) rl.Vector3 {
     return v3(
         base.x - f.x * BOW_GRIP_BACK + right.x * BOW_GRIP_SIDE,
@@ -318,9 +314,8 @@ pub const Game = struct {
     sceneMesh: scenemesh.SceneMesh,
     fog: fogmod.Fog,
     w: world.World,
-    // The authored campaign: maps/*.map in lexicographic order. `map` is the
-    // CURRENT area's parsed file — the world, monster spawns, and displayed
-    // area name all come from it.
+    // The authored campaign: maps/*.map in lexicographic order. `map` is the CURRENT
+    // area's parsed file (world, spawns, area name all come from it).
     map: mapmod.Map,
     mapPaths: [mapmod.MAX_MAPS][mapmod.PATH_CAP]u8 = undefined,
     mapPathLens: [mapmod.MAX_MAPS]usize = undefined,
@@ -333,6 +328,12 @@ pub const Game = struct {
     // Start menu state + display mode.
     menuMode: MenuMode = .root,
     menuSel: i32 = 0,
+    // Character stat sheet (C / Select in play): freezes the world, allocates points on sheetSel.
+    sheetOpen: bool = false,
+    sheetSel: i32 = 0,
+    // True while a live run is paused behind the menu, so the top row resumes instead of
+    // starting fresh. Cleared on death/victory.
+    canResume: bool = false,
     quit: bool = false,
     displayMode: DisplayMode = .windowed,
     debugLog: bool = false, // main menu → Debug Log: per-frame light-state log (lightlog.txt)
@@ -345,16 +346,15 @@ pub const Game = struct {
     lootList: std.ArrayList(LootDrop),
     gas: [MAX_GAS]GasCloud = undefined,
     gasCount: usize = 0,
-    gasHurtCD: f32 = 0, // countdown to the next DoT pulse while standing in miasma
+    gasHurtCD: f32 = 0, // countdown to the next DoT pulse in miasma
 
     rig: CamRig,
 
     // Per-frame input cache.
     mouseGround: rl.Vector3 = mathx.zero3,
     kbMove: rl.Vector3 = mathx.zero3,
-    hoverMonster: i32 = -1, // monster id (NOT an array index): stays valid across the
-    // same-frame corpse compaction in updateDeaths, so the highlight can't slip onto the
-    // wrong monster between updateAim setting it and the HUD reading it.
+    hoverMonster: i32 = -1, // monster id (NOT array index): survives same-frame corpse
+    // compaction in updateDeaths, so the highlight can't slip to the wrong monster.
 
     // Presentation timers + transient text.
     damageFlash: f32 = 0,
@@ -369,8 +369,8 @@ pub const Game = struct {
     parts: particles.Particles = .{},
     portalPuff: f32 = 0, // countdown to the next portal mote
     stepPuff: f32 = 0, // countdown to the next footstep dust kick
-    // Where the LIGHT is this frame: the carried flame's ground point, smoothed so
-    // shadows swing around a turn instead of snapping when Facing flips.
+    // The light's XZ this frame: the carried flame's ground point, smoothed so shadows
+    // swing on a turn instead of snapping when Facing flips.
     torchXZ: rl.Vector3 = mathx.zero3,
 
     pub fn init(seed: u64) !Game {
@@ -405,8 +405,7 @@ pub const Game = struct {
         return g;
     }
 
-    // Load the idx-th campaign map file; a missing folder or a corrupt file falls
-    // back to the built-in empty field so the game always boots.
+    // Load the idx-th campaign map; missing/corrupt falls back to the built-in empty field.
     pub fn loadMapAt(g: *Game, idx: usize) mapmod.Map {
         if (g.mapCount == 0) return mapmod.defaultMap();
         const i = @min(idx, g.mapCount - 1);
@@ -436,6 +435,8 @@ pub const Game = struct {
     pub fn startRun(g: *Game) void {
         g.playtest = false;
         g.paused = false; // a pause from the previous run must not freeze this one
+        g.sheetOpen = false; // never resume into a leftover open sheet
+        g.canResume = true; // a live run now exists to return to
         g.p = playermod.newPlayer(mathx.zero3);
         g.kills = 0;
         g.elapsed = 0;
@@ -451,17 +452,15 @@ pub const Game = struct {
         g.torch.setLightColor(g.map.light); // each floor gets its own night
         g.sceneMesh.rebuild(&g.w);
         resetArena(g); // dynamic bodies, FX pools, fog, presentation timers, packs
-        g.p.hasMoveTarget = false;
-        g.p.targetMonster = -1;
+        g.p.resetCombatState(); // no roll/stun/swing carries across the portal
         g.p.HP = g.p.MaxHP;
         g.p.Mana = g.p.MaxMana;
         teleportHero(g, g.map.spawn);
         g.setBanner(AREA_BANNER_DUR, "{s}", .{g.map.name.slice()});
     }
 
-    // spawnPacks deploys the map's authored packs (members jittered around each
-    // pack's anchor) plus the area champion at its authored post. Difficulty tier
-    // is the campaign position — map 3 hits like old area 3.
+    // Deploy the map's authored packs (jittered around each anchor) plus the area
+    // champion. Difficulty tier = campaign position.
     fn spawnPacks(g: *Game) void {
         const tier: i32 = @intCast(g.areaIndex);
         for (g.map.packList()) |pk| {
@@ -505,8 +504,7 @@ pub const Game = struct {
         return center;
     }
 
-    // inVision: within the torch's lit disc. Beyond it the world is black, so the hero
-    // can't target, and health bars / popups there would float in darkness.
+    // inVision: within the lit disc. Beyond it is black — no targeting, no floating bars.
     pub fn inVision(g: *const Game, p: rl.Vector3) bool {
         return dist2XZ(p, g.p.Pos) <= CULL * CULL; // squared: pure threshold, called per monster/frame
     }
@@ -566,14 +564,14 @@ fn updatePlaying(g: *Game, dt_in: f32) void {
 
     g.rig.follow(g.p.Pos, dt);
 
-    // Ease the light toward the carried flame: turning swings the shadows around
-    // the hero over a few frames instead of snapping them when Facing flips.
+    // Ease the light toward the carried flame so turning swings shadows over a few
+    // frames instead of snapping.
     const flame = torchFlameWorld(&g.p);
     const lk = 1 - @exp(-dt * 9.0);
     g.torchXZ = v3(g.torchXZ.x + (flame.x - g.torchXZ.x) * lk, 0, g.torchXZ.z + (flame.z - g.torchXZ.z) * lk);
 
-    // Fog of war: the torch reveals the ground it sweeps (kept as a monotonic memory),
-    // then upload the mask if it changed this frame, before drawWorld samples it.
+    // Fog of war: the torch reveals ground it sweeps (monotonic memory); upload the mask
+    // before drawWorld samples it.
     g.fog.reveal(g.p.Pos, TORCH_RADIUS);
     g.fog.sync();
 }
@@ -585,6 +583,7 @@ fn updateTimers(g: *Game, dt: f32) void {
     if (p.rollTimer > 0) p.rollTimer -= dt;
     if (p.rollCD > 0) p.rollCD -= dt;
     if (p.iframe > 0) p.iframe -= dt;
+    if (p.stunTimer > 0) p.stunTimer -= dt;
     if (p.swing > 0) p.swing -= dt;
     if (p.hitFlash > 0) p.hitFlash -= dt;
     if (g.damageFlash > 0) g.damageFlash -= dt;
@@ -596,8 +595,8 @@ fn updateTimers(g: *Game, dt: f32) void {
 
 // ---- Input ----
 
-// The screen-bottom band occupied by the HUD; clicks there don't move the hero.
-// Owned by hudx (which draws the HUD) so the reserve tracks the real layout height.
+// Screen-bottom HUD band; clicks there don't move the hero. Owned by hudx so it tracks
+// the real layout height.
 const hudReserve = hudx.bottomBandHeight;
 
 fn handleInput(g: *Game) void {
@@ -657,6 +656,7 @@ fn handleInput(g: *Game) void {
 
 fn castFirebolt(g: *Game) void {
     const p = &g.p;
+    if (p.stunned()) return;
     if (p.castCD > 0 or p.Mana < p.spellCost) {
         if (p.Mana < p.spellCost) g.setToast("Not enough mana", .{});
         return;
@@ -665,24 +665,26 @@ fn castFirebolt(g: *Game) void {
     if (lenXZ(dir) < 1e-4) dir = p.Facing;
     p.Facing = dir;
     p.Mana -= p.spellCost;
-    p.castCD = CAST_RATE;
-    const dmg = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(8)));
+    p.castCD = p.castRate;
+    // Firebolt is pure fire; resists (not armor) mitigate it. Crit applies here too
+    // (luck's crit chance is global, as the stat sheet advertises — not melee-only).
+    var roll = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(8)));
+    if (g.rng.float() < p.derived.critChance) roll *= stats.CRIT_MULT;
+    const dmg = stats.Damage.one(.fire, roll);
     g.projs.add(projectile.newFirebolt(p.Pos, dir, dmg, aimYVel(p.Pos.y + projectile.fireboltMuzzleDY, g.mouseGround.y + 0.9, distXZ(p.Pos, g.mouseGround), projectile.fireboltSpeed)));
     g.rumble.play(rumble.cast);
 }
 
-// The vertical velocity that carries a shot from its muzzle height to the target
-// height over the horizontal flight — how a bolt rains DOWN off a rampart, or an
-// arrow climbs up at whoever is camping one. Clamped so degenerate point-blank
-// aims can't turn a shot into a mortar.
+// Vertical velocity carrying a shot from muzzle to target height over its flight (a
+// bolt raining off a rampart, an arrow climbing up). Clamped so point-blank aims
+// can't become mortars.
 fn aimYVel(fromY: f32, toY: f32, distH: f32, speed: f32) f32 {
     const ft = maxF(distH, 2.0) / speed;
     return clampF((toY - fromY) / ft, -9.0, 9.0);
 }
 
-// Attempt a dodge roll in dir, playing the shared feedback (rumble + popup) on
-// success. The keyboard and gamepad paths only differ in how they pick dir, so the
-// roll + feedback lives here once.
+// Attempt a dodge roll in dir, with shared feedback on success. Keyboard and gamepad
+// share this and differ only in how they pick dir.
 fn doDodge(g: *Game, dir: rl.Vector3) void {
     if (g.p.startRoll(dir)) {
         g.rumble.play(rumble.dodge);
@@ -691,8 +693,7 @@ fn doDodge(g: *Game, dir: rl.Vector3) void {
     }
 }
 
-// Drink a belt potion and toast the result. Shared by the keyboard (1/2) and gamepad
-// (L1/R1) bindings so the two input paths can't drift.
+// Drink a belt potion and toast it. Shared by keyboard (1/2) and gamepad (L1/R1).
 fn useHealthPotion(g: *Game) void {
     if (g.p.drinkHealth()) g.setToast("Drank a Health Potion", .{});
 }
@@ -701,24 +702,14 @@ fn useManaPotion(g: *Game) void {
 }
 
 // ---- Gamepad ----
-// Left stick moves; right stick aims (and targets a nearby foe); X attacks, Y casts
-// Firebolt, B dodges, L1/R1 drink potions, Start opens the menu (handled in run()).
-const PAD = rumble.PAD; // first connected controller (shared with the rumble backend)
-const STICK_DEADZONE = 0.25; // ignore small stick drift
-const AIM_REACH = 6.0; // how far ahead the right stick projects the aim point
+// Left stick moves; right stick aims/targets; X attacks, Y casts Firebolt, B dodges,
+// L1/R1 potions, Start opens the menu (in run()). Scheme lives in input.zig; these
+// aliases keep call sites terse.
+const PAD = input.PAD;
+const AIM_REACH = input.AIM_REACH;
 
-// Read a stick as a unit XZ direction (stick up = -Z = "forward", matching the camera
-// and the WASD mapping). Returns zero inside the deadzone; otherwise a unit vector, so
-// movement is full-speed and facing stays unit-length like the keyboard path.
-fn stickXZ(axisX: rl.GamepadAxis, axisY: rl.GamepadAxis) rl.Vector3 {
-    const v = v3(rl.getGamepadAxisMovement(PAD, axisX), 0, rl.getGamepadAxisMovement(PAD, axisY));
-    if (lenXZ(v) < STICK_DEADZONE) return mathx.zero3;
-    return dirXZ(mathx.zero3, v); // normalize to a unit heading
-}
-
-// Pick a foe to engage with the gamepad: the best-scored live monster in vision —
-// nearest by default, biased toward `aimDir` when the right stick is pushed. Updates
-// hoverMonster so the HUD highlights it; returns the monster id, or null if none.
+// Pick a gamepad target: best-scored live monster in vision (nearest, biased toward
+// aimDir when the stick is pushed). Updates hoverMonster; returns the id, or null.
 fn padAcquireTarget(g: *Game, aimDir: rl.Vector3) ?i32 {
     var bestID: ?i32 = null;
     var bestScore: f32 = -std.math.floatMax(f32);
@@ -743,19 +734,19 @@ fn handleGamepad(g: *Game) void {
     const p = &g.p;
 
     // Left stick: movement (overrides click-to-move, like the keyboard does).
-    const mv = stickXZ(.left_x, .left_y);
+    const mv = input.stickXZ(.left_x, .left_y);
     if (lenXZ(mv) > 0) {
         g.kbMove = mv;
         p.hasMoveTarget = false;
         p.targetMonster = -1;
     }
 
-    // Right stick: aim. Project a ground point ahead of the hero so the existing
-    // Firebolt / dodge / hover logic can all key off g.mouseGround.
-    const aimDir = stickXZ(.right_x, .right_y); // already a unit heading (or zero)
+    // Right stick: aim. Project a ground point ahead of the hero so Firebolt/dodge/hover
+    // can key off g.mouseGround.
+    const aimDir = input.stickXZ(.right_x, .right_y); // already a unit heading (or zero)
     const aiming = lenXZ(aimDir) > 0;
-    // The aim highlight and the X-attack acquire are the SAME O(monsters) scan; run
-    // it at most once per frame and reuse the result across both.
+    // Aim highlight and X-attack acquire are the SAME O(monsters) scan; run it once,
+    // reuse across both.
     var aimTarget: ?i32 = null;
     var scannedAim = false;
     if (aiming) {
@@ -764,9 +755,8 @@ fn handleGamepad(g: *Game) void {
         scannedAim = true;
     }
 
-    // X: attack — engage the best foe (nearest, biased to the aim direction). The
-    // auto-attack + chase then drive it, exactly like clicking a monster with the mouse.
-    if (rl.isGamepadButtonDown(PAD, .right_face_left) and !p.rolling()) {
+    // X: attack — engage the best foe; auto-attack + chase drive it like a mouse click.
+    if (input.padAttackDown() and !p.rolling()) {
         if (if (scannedAim) aimTarget else padAcquireTarget(g, aimDir)) |id| {
             p.targetMonster = id;
             p.hasMoveTarget = false;
@@ -774,34 +764,27 @@ fn handleGamepad(g: *Game) void {
     }
 
     // Y: cast Firebolt toward the aim point (falls back to facing when not aiming).
-    if (rl.isGamepadButtonDown(PAD, .right_face_up) and !p.rolling()) {
+    if (input.padCastDown() and !p.rolling()) {
         if (!aiming) g.mouseGround = v3(p.Pos.x + p.Facing.x * AIM_REACH, 0, p.Pos.z + p.Facing.z * AIM_REACH);
         castFirebolt(g);
     }
 
     // B: dodge roll (movement direction, else aim direction, else facing).
-    if (rl.isGamepadButtonPressed(PAD, .right_face_right)) {
+    if (input.padDodgePressed()) {
         var dir = g.kbMove;
         if (lenXZ(dir) < 1e-3) dir = aimDir;
         doDodge(g, dir);
     }
 
     // L1 / R1: potions.
-    if (rl.isGamepadButtonPressed(PAD, .left_trigger_1)) useHealthPotion(g);
-    if (rl.isGamepadButtonPressed(PAD, .right_trigger_1)) useManaPotion(g);
-}
-
-// The Start button, guarded by controller presence. Used across scenes for
-// menu / confirm, mirroring Enter.
-fn padStartPressed() bool {
-    return rl.isGamepadAvailable(PAD) and rl.isGamepadButtonPressed(PAD, .middle_right);
+    if (input.padHealthPotPressed()) useHealthPotion(g);
+    if (input.padManaPotPressed()) useManaPotion(g);
 }
 
 // updateAim refreshes the ground point under the cursor and the hovered monster.
 fn updateAim(g: *Game) void {
     const ray = rl.getScreenToWorldRay(rl.getMousePosition(), g.rig.cam);
-    // Terrain-aware pick: a click on a rampart top lands ON the rampart (with its
-    // height), not on the floor plane hidden beneath it.
+    // Terrain-aware pick: a click on a rampart top lands ON the rampart, not the floor beneath.
     if (g.w.pickGround(ray)) |pt| g.mouseGround = pt;
 
     g.hoverMonster = -1;
@@ -831,6 +814,9 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
         return;
     }
 
+    // Light-stunned: rooted until it wears off (the hero can't be heavy-stunned, so brief).
+    if (p.stunned()) return;
+
     var dir = mathx.zero3;
     var moving = false;
 
@@ -841,8 +827,8 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
         if (g.monsterByID(p.targetMonster)) |m| {
             if (m.alive()) {
                 p.Facing = dirXZ(p.Pos, m.Pos);
-                // Close to half a body-radius inside reach so the hero settles into
-                // solid striking range instead of hovering at the exact edge.
+                // Stop half a body-radius inside reach so the hero settles into solid
+                // striking range, not hovering at the edge.
                 if (distXZ(p.Pos, m.Pos) > playerReach(p.atkRange, m.Radius) - m.Radius * 0.5) {
                     dir = p.Facing;
                     moving = true;
@@ -861,7 +847,7 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
         const step = v3(dir.x * p.Speed * dt, 0, dir.z * p.Speed * dt);
         p.Pos = g.w.moveWithCollision(p.Pos, step, playermod.radius);
         p.walkBob += dt * 12;
-        // Each stride kicks a little dust off the road — the ground answers the boot.
+        // Each stride kicks a little dust off the road.
         g.stepPuff -= dt;
         if (g.stepPuff <= 0) {
             g.stepPuff = 0.17;
@@ -884,7 +870,7 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
 
 fn updatePlayerAttack(g: *Game) void {
     const p = &g.p;
-    if (p.rolling() or p.targetMonster < 0 or p.atkCD > 0) return;
+    if (p.rolling() or p.stunned() or p.targetMonster < 0 or p.atkCD > 0) return;
     const m = g.monsterByID(p.targetMonster) orelse {
         p.targetMonster = -1;
         return;
@@ -895,30 +881,35 @@ fn updatePlayerAttack(g: *Game) void {
     }
     if (distXZ(p.Pos, m.Pos) <= playerReach(p.atkRange, m.Radius) and @abs(m.Pos.y - p.Pos.y) < SAME_GROUND_DY) {
         var dmg = g.rng.range(p.MinDmg, p.MaxDmg);
-        const crit = g.rng.float() < CRIT_CHANCE;
-        if (crit) dmg *= CRIT_MULT;
+        const crit = g.rng.float() < p.derived.critChance;
+        if (crit) dmg *= stats.CRIT_MULT;
         p.Facing = dirXZ(p.Pos, m.Pos);
         p.swing = playermod.swingDur;
         p.atkCD = p.atkRate;
         g.rumble.play(if (crit) rumble.crit_hit else rumble.attack_hit);
-        damageMonster(g, m, dmg, crit);
+        // Melee is untyped physical — armor (not resists) mitigates it.
+        damageMonster(g, m, stats.Damage.phys(dmg), crit);
     }
 }
 
-fn damageMonster(g: *Game, m: *Monster, dmg: f32, crit: bool) void {
-    m.HP -= dmg;
-    m.hitFlash = monster.monster_hitflash;
-    m.aggro = true;
-    // Hit sparks: a few pale chips off the body; crits flare bigger and golder.
-    // (No floating damage numbers by owner decree — the sparks ARE the feedback.)
+// Deal a typed hit: mitigation/HP/stun live in monster.hurt; FX (sparks, gore) and the
+// kill hook live here. `crit` only tunes FX weight.
+fn damageMonster(g: *Game, m: *Monster, dmg: stats.Damage, crit: bool) void {
+    const landed = m.hurt(dmg);
+    // Pib recoil: a knife pig that eats a heavy blow bolts, the SAME panic path as a
+    // nearby death (they're scared of you). maxF so a follow-up can't shorten a scatter.
+    if (m.Kind == .fallen and m.alive() and landed >= m.MaxHP * monster.pib_recoil_frac) {
+        m.fleeTimer = maxF(m.fleeTimer, monster.flee_time_min + g.rng.float() * monster.flee_time_rand);
+    }
+    // Hit sparks: pale chips off the body; crits flare bigger and golder. (No floating
+    // damage numbers by owner decree — the sparks ARE the feedback.)
     const hitAt = v3(m.Pos.x, m.Pos.y + MONSTER_TORSO_BASE + m.Height * 0.5, m.Pos.z);
     if (crit) {
         g.parts.burst(&g.rng, hitAt, 12, 5.5, 0.11, 0.5, rgba(255, 215, 90, 255), 9);
     } else {
         g.parts.burst(&g.rng, hitAt, 5, 4.0, 0.08, 0.35, rgba(255, 235, 200, 230), 9);
     }
-    // And the wound itself: heavy dark droplets of the body's own ichor, falling
-    // fast — sparks say "impact", these say "flesh".
+    // The wound: heavy dark droplets of the body's ichor, falling fast.
     const gore = lerpColor(m.Color, rgba(96, 12, 14, 255), 0.65);
     g.parts.burst(&g.rng, hitAt, if (crit) 7 else 4, 3.2, 0.085, 0.5, gore, 15);
     if (m.HP <= 0 and !m.dying) killMonster(g, m);
@@ -935,20 +926,20 @@ fn killMonster(g: *Game, m: *Monster) void {
     const n: usize = if (m.boss) 34 else 16;
     g.parts.burst(&g.rng, at, n, 6.0, 0.13, 0.7, lerpColor(m.Color, rl.Color.white, 0.25), 10);
     g.parts.burst(&g.rng, at, n / 2, 3.5, 0.16, 0.9, lerpColor(m.Color, rl.Color.black, 0.45), 12);
-    // Pib packs break: a packmate dying in view sends every nearby pib scattering
-    // (Diablo's Fallen). maxF, not overwrite: a kill-chain must never SHORTEN an
-    // already-running panic.
+    // Pibs are cowards: ANY death nearby — a packmate OR any other monster you cut
+    // down — sends the knife pigs scattering (they're scared of you). maxF, not
+    // overwrite: a kill-chain must never SHORTEN a running panic.
     for (g.liveMonsters()) |*other| {
         if (other.Kind == .fallen and other.alive() and distXZ(other.Pos, m.Pos) < monster.flee_trigger_radius) {
             other.fleeTimer = maxF(other.fleeTimer, monster.flee_time_min + g.rng.float() * monster.flee_time_rand);
         }
     }
-    // The zombie's last act: the corpse exhales its rot as a lingering miasma
-    // cloud — the kill is safe, standing in the remains is not.
+    // Zombie's last act: the corpse exhales a lingering miasma cloud — safe to kill,
+    // not to stand in.
     if (m.Kind == .zombie) spawnGasCloud(g, m.Pos, m.MaxDmg * GAS_DPS_FRAC);
     if (g.p.addXP(m.XP)) onLevelUp(g);
-    // rollLoot scatters in XZ without terrain knowledge: re-seat each new drop on
-    // the ground it actually landed on (a rampart kill may scatter off the edge).
+    // rollLoot scatters in XZ with no terrain knowledge: re-seat each new drop on the
+    // ground it landed on (a rampart kill may scatter off the edge).
     const firstNew = g.lootList.items.len;
     loot.rollLoot(m, &g.rng, &g.lootList);
     for (g.lootList.items[firstNew..]) |*d| d.Pos = g.w.snapY(d.Pos);
@@ -978,9 +969,12 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
     if (m.atkCD > 0) m.atkCD -= dt;
     m.bob += dt * (m.Speed + 2);
 
-    // Strike follow-through: the blade/arms sweep their arc, and the damage lands
-    // as the arc crosses its MIDPOINT — for anim-telegraphed kinds the swing is
-    // the only warning, so the hit must land where the swing visibly is.
+    // Stunned: frozen (no steering/windup/attacks). tickStun decays the meter; applyStun
+    // already cancelled any windup/swing.
+    if (m.tickStun(dt)) return;
+
+    // Strike follow-through: damage lands as the arc crosses its MIDPOINT — for
+    // anim-telegraphed kinds the swing is the only warning, so the hit lands where seen.
     if (m.swing > 0) {
         const before = m.swing;
         m.swing -= dt;
@@ -1004,11 +998,11 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
         return;
     }
 
-    // Panic (a pib whose packmate just died): drop everything and run from the
-    // player — Diablo's Fallen. Aggro survives, so when the timer runs out they
-    // turn straight around and come back.
+    // Panic (pib whose packmate just died): run from the player — Diablo's Fallen.
+    // Aggro survives, so they turn around and come back when the timer ends.
     if (m.fleeTimer > 0) {
         m.fleeTimer -= dt;
+        m.lungeTimer = 0; // a panicking pib abandons any half-finished lunge
         if (g.p.alive()) {
             m.Facing = dirXZ(g.p.Pos, m.Pos); // face AWAY: they run with their backs to you
             moveMonster(g, m, m.Facing, dt * 1.15); // panic legs beat charging legs
@@ -1016,8 +1010,7 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
         return;
     }
 
-    // Distance AND facing come from the same hero-delta: compute it once (one @sqrt
-    // per live monster per frame instead of two — distXZ then dirXZ on the same vec).
+    // Distance AND facing from one hero-delta: compute once (one @sqrt/monster/frame).
     const pdx = g.p.Pos.x - m.Pos.x;
     const pdz = g.p.Pos.z - m.Pos.z;
     const toPlayer = @sqrt(pdx * pdx + pdz * pdz);
@@ -1032,7 +1025,7 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
         if (m.wanderTimer <= 0) {
             m.wanderTimer = 1.5 + g.rng.float() * 2.5;
             if (g.rng.float() < 0.55) {
-                const ang: f32 = @floatCast(g.rng.float64() * 2 * std.math.pi);
+                const ang: f32 = @floatCast(g.rng.float64() * std.math.tau);
                 m.wanderDir = v3(cosf(ang), 0, sinf(ang));
             } else m.wanderDir = mathx.zero3;
         }
@@ -1046,16 +1039,34 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
     // Face the hero, reusing the delta above (guard matches dirXZ's own 1e-5).
     m.Facing = if (toPlayer < 1e-5) mathx.zero3 else v3(pdx / toPlayer, 0, pdz / toPlayer);
     if (m.Ranged) {
+        // Footwork (skeleton personality): on a cooldown, juke sideways off a player
+        // bolt bearing down, so the archer isn't a stationary target — gated so a line
+        // of archers isn't an un-hittable wall. A live juke owns the mouse; it still
+        // looses if the shot lines up mid-strafe.
+        if (m.dodgeCD > 0) m.dodgeCD -= dt;
+        if (m.dodgeTimer > 0) {
+            m.dodgeTimer -= dt;
+            moveMonster(g, m, m.dodgeDir, dt * monster.skel_dodge_speed);
+            if (toPlayer <= m.atkRange and m.atkCD <= 0) m.windup = m.windupTime;
+            return;
+        }
+        if (m.dodgeCD <= 0) {
+            if (dodgeFromBolt(g, m)) |ddir| {
+                m.dodgeDir = ddir;
+                m.dodgeTimer = monster.skel_dodge_time;
+                m.dodgeCD = monster.skel_dodge_cd_min + g.rng.float() * monster.skel_dodge_cd_rand;
+                moveMonster(g, m, ddir, dt * monster.skel_dodge_speed);
+                return;
+            }
+        }
         // Kite: hold at range, back off if the player gets close, then shoot.
         if (toPlayer > m.atkRange * 0.85) {
             moveMonster(g, m, m.Facing, dt); // == dirXZ(m.Pos, g.p.Pos), already set above
         } else if (toPlayer < m.atkRange * 0.35) {
             moveMonster(g, m, v3(-m.Facing.x, 0, -m.Facing.z), dt * 0.7); // away from the hero
         } else if (m.atkCD > 0.25) {
-            // Between shots: sidestep an arc around the target, id parity picking
-            // the direction so a pack splits both ways — a planted archer reads
-            // as a turret, a circling one reads as a hunter. Facing stays on the
-            // player throughout, so the bow keeps pointing at you as they slide.
+            // Between shots: sidestep an arc, id parity picking the direction so a pack
+            // splits both ways. Facing stays on the player so the bow keeps pointing.
             const tang = mathx.perpXZ(m.Facing);
             const sdir = if (@rem(m.id, 2) == 0) tang else v3(-tang.x, 0, -tang.z);
             moveMonster(g, m, sdir, dt * 0.45);
@@ -1064,24 +1075,78 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
         return;
     }
 
-    // Melee: close the gap, then commit to a telegraphed swing — but never wind up
-    // at someone standing a cliff above or below; keep pressing toward them (which
-    // funnels the pack to the ramp) instead of swinging at a wall of stone.
-    if (toPlayer > m.atkRange + playermod.radius or @abs(m.Pos.y - g.p.Pos.y) >= SAME_GROUND_DY) {
-        moveMonster(g, m, m.Facing, dt); // == dirXZ(m.Pos, g.p.Pos), already set above
-    } else if (m.atkCD <= 0) {
+    // Melee: close the gap, then commit to a telegraphed swing — but never wind up at
+    // someone a cliff above/below; keep pressing (funnels the pack to the ramp).
+    const inMelee = toPlayer <= m.atkRange + playermod.radius and @abs(m.Pos.y - g.p.Pos.y) < SAME_GROUND_DY;
+    if (inMelee and m.atkCD <= 0) {
+        m.lungeTimer = 0; // a lunge that connects ends here — no phantom dash after the swing
         m.windup = m.windupTime;
+        return;
     }
+    // Pib lunge (fallen personality): a committed dash on a cadence that closes the
+    // gap in a burst — the knife pigs dart in rather than trudge. A live lunge locks a
+    // boosted charge at the hero (Facing is already the hero direction).
+    if (m.Kind == .fallen) {
+        if (m.lungeCD > 0) m.lungeCD -= dt;
+        if (m.lungeTimer > 0) {
+            m.lungeTimer -= dt;
+            // Keep dashing until the lunge reaches melee; then drop it and fall through
+            // so the attack/wait logic runs instead of overshooting past the hero.
+            if (!inMelee) {
+                moveMonster(g, m, m.Facing, dt * monster.pib_lunge_speed);
+                return;
+            }
+            m.lungeTimer = 0;
+        }
+        if (m.lungeCD <= 0 and !inMelee and toPlayer < monster.pib_lunge_range) {
+            m.lungeTimer = monster.pib_lunge_time;
+            m.lungeCD = monster.pib_lunge_cd_min + g.rng.float() * monster.pib_lunge_cd_rand;
+            moveMonster(g, m, m.Facing, dt * monster.pib_lunge_speed);
+            return;
+        }
+    }
+    if (!inMelee) moveMonster(g, m, m.Facing, dt); // == dirXZ(m.Pos, g.p.Pos), already set above
+}
+
+// A skeleton's read on the nearest player bolt bearing down on it: if one is closing
+// (within sense range AND heading roughly at the archer), return a sideways strafe
+// (perpendicular to the bolt, toward the side the archer already sits on so the juke
+// widens the miss); null if nothing warrants a dodge. Scans the small projectile pool.
+fn dodgeFromBolt(g: *Game, m: *const Monster) ?rl.Vector3 {
+    var best: f32 = monster.skel_dodge_sense;
+    var out: ?rl.Vector3 = null;
+    for (g.projs.items()) |*pr| {
+        if (!pr.FromPlayer) continue;
+        const rx = m.Pos.x - pr.Pos.x;
+        const rz = m.Pos.z - pr.Pos.z;
+        const d = @sqrt(rx * rx + rz * rz);
+        if (d >= best or d < 1e-4) continue;
+        const vlen = lenXZ(pr.Vel);
+        if (vlen < 1e-4) continue;
+        const vx = pr.Vel.x / vlen;
+        const vz = pr.Vel.z / vlen;
+        // Bolt heading vs the direction to the archer: below this it's aimed elsewhere
+        // or already sailing past, not worth spending a dodge on.
+        if ((vx * rx + vz * rz) / d < 0.5) continue;
+        // Perp of the bolt heading is perpXZ(v) = (v.z, 0, -v.x); pick the side the
+        // archer is already offset toward so the strafe increases the miss distance.
+        const px = vz;
+        const pz = -vx;
+        const side: f32 = if (rx * px + rz * pz >= 0) 1 else -1;
+        out = v3(px * side, 0, pz * side);
+        best = d;
+    }
+    return out;
 }
 
 fn resolveMonsterAttack(g: *Game, m: *Monster) void {
     if (!g.p.alive()) return;
-    const dmg = g.rng.range(m.MinDmg, m.MaxDmg);
+    // Every current foe deals untyped physical; a typed foe would build a different packet.
+    const dmg = stats.Damage.phys(g.rng.range(m.MinDmg, m.MaxDmg));
     if (m.Ranged) {
-        // The arrow looses from the drawn bow itself (not the body center), so
-        // the nocked shaft and the flying shaft are one continuous motion.
-        // Arrows angle up or down to the player's actual elevation — a rampart is
-        // cover from the cliff side, never from an archer with a clean line.
+        // The arrow looses from the drawn bow (not the body center), so nocked and
+        // flying shaft are one motion. It angles to the player's true elevation — a
+        // rampart is cover from the cliff side, not from a clean line.
         const bowHead = skelBow(m).head;
         const from = v3(bowHead.x, m.Pos.y, bowHead.z);
         g.projs.add(projectile.newArrow(from, dirXZ(from, g.p.Pos), dmg, aimYVel(from.y + projectile.arrowMuzzleDY, g.p.Pos.y + 1.0, distXZ(from, g.p.Pos), projectile.arrowSpeed)));
@@ -1089,17 +1154,15 @@ fn resolveMonsterAttack(g: *Game, m: *Monster) void {
         g.parts.burst(&g.rng, v3(bowHead.x, m.Pos.y + bowHead.y, bowHead.z), 5, 2.6, 0.05, 0.3, rgba(255, 240, 210, 230), 4);
         return;
     }
-    // The zombie's slam hits the GROUND whether or not it hits you: a dust kick at
-    // the impact point is the strike's punctuation (it has no telegraph ring).
+    // The zombie's slam hits the GROUND regardless: a dust kick punctuates it (no ring).
     if (m.Kind == .zombie) {
         const f = mathx.orFacing(m.Facing, 0, 1);
         const at = v3(m.Pos.x + f.x * (m.Radius + ZOMBIE_SLAM_FWD), m.Pos.y + 0.15, m.Pos.z + f.z * (m.Radius + ZOMBIE_SLAM_FWD));
         g.parts.burst(&g.rng, at, 8, 3.2, 0.09, 0.4, mathx.withAlpha(DUST_COLOR, 150), 6);
         g.shake = maxF(g.shake, 0.12); // the ground answers even a miss
     }
-    // Use the module radius constant — the SAME source the drawn telegraph ring reads
-    // (drawMonstersFX) — so standing just outside the red ring is genuinely safe.
-    // Melee cannot land across a cliff: reach requires standing on comparable ground.
+    // Same reach the drawn telegraph ring uses (drawMonstersFX), so outside the ring is
+    // safe. Melee can't land across a cliff: reach requires comparable ground.
     if (distXZ(m.Pos, g.p.Pos) <= meleeReach(m.atkRange, playermod.radius) and @abs(m.Pos.y - g.p.Pos.y) < SAME_GROUND_DY) hitPlayer(g, dmg);
 }
 
@@ -1113,8 +1176,7 @@ fn separateMonsters(g: *Game) void {
         while (j < ms.len) : (j += 1) {
             if (!ms[j].alive()) continue;
             const minD = ms[i].Radius + ms[j].Radius;
-            // Squared pre-check: the vast majority of pairs don't overlap, so skip
-            // the @sqrt for them; only compute the real distance when they do.
+            // Squared pre-check: most pairs don't overlap; skip the @sqrt for them.
             if (dist2XZ(ms[i].Pos, ms[j].Pos) >= minD * minD) continue;
             const d = distXZ(ms[i].Pos, ms[j].Pos);
             if (d > 1e-3) {
@@ -1127,21 +1189,23 @@ fn separateMonsters(g: *Game) void {
     }
 }
 
-// The shared tail of every damage source: if that blow was lethal, fire the death
-// rumble (stronger than any hurt, so it takes over the fade) and switch to the death
-// screen. One place for a future death hook (stats, autosave) to land.
+// Shared tail of every damage source: on a lethal blow, fire the death rumble and
+// switch to the death screen. One spot for a future death hook.
 fn onPlayerDeath(g: *Game) void {
     if (g.p.alive()) return;
     g.rumble.play(rumble.death);
     g.scene = .dead;
+    g.canResume = false; // the run is over — the menu offers a fresh start
 }
 
-fn hitPlayer(g: *Game, dmg: f32) void {
+fn hitPlayer(g: *Game, dmg: stats.Damage) void {
     // I-frames from a dodge roll negate the blow entirely.
     if (g.p.invulnerable()) {
         return;
     }
-    g.p.takeDamage(dmg);
+    // takeDamage applies armor+resists and returns what landed (a big hit light-stuns).
+    // Zero landed → no FX/death check.
+    if (g.p.takeDamage(dmg) <= 0) return;
     g.damageFlash = DAMAGE_FLASH_DUR;
     g.shake = maxF(g.shake, 0.25);
     g.rumble.play(rumble.hurt);
@@ -1149,10 +1213,9 @@ fn hitPlayer(g: *Game, dmg: f32) void {
     onPlayerDeath(g);
 }
 
-// Retain-in-place: advance every item, keep those for which `keepFn` returns true,
-// compacting survivors to the front. `keepFn` mutates the item it's handed (it aliases
-// the live slot) and may run side effects (damage, pickups). Returns the new length.
-// The per-frame entity sweeps share this instead of each re-rolling a write-index loop.
+// Retain-in-place: keep items where keepFn returns true, compacting survivors to the
+// front. keepFn mutates its item (aliases the live slot) and may run side effects.
+// Returns the new length; shared by the per-frame entity sweeps.
 fn retain(comptime T: type, items: []T, ctx: anytype, comptime keepFn: fn (@TypeOf(ctx), *T) bool) usize {
     var w: usize = 0;
     for (items, 0..) |*it, i| {
@@ -1192,9 +1255,8 @@ fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
         impactBurst(g, pr);
         return false;
     }
-    // Hits require the shot to actually pass through the body's height band — a
-    // bolt raining down from a rampart sails clean over the heads between it and
-    // its mark instead of clipping everything on the way.
+    // Hits require passing through the body's height band, so a bolt raining off a
+    // rampart clears the heads between it and its mark.
     if (pr.FromPlayer) {
         for (g.liveMonsters()) |*m| {
             if (m.alive() and dist2XZ(m.Pos, pr.Pos) < (m.Radius + pr.Radius) * (m.Radius + pr.Radius) and @abs(pr.Pos.y - (m.Pos.y + m.Height * 0.55)) < m.Height * 0.55 + 0.7) {
@@ -1228,11 +1290,11 @@ fn updateProjectiles(g: *Game, dt: f32) void {
 // Loot: bob in place; collected (and dropped) when the player walks over it.
 fn keepLoot(c: SweepCtx, d: *LootDrop) bool {
     d.bob += c.dt * 3;
-    // Same-level pickup only: standing on the rampart edge must not hoover the
-    // drops glittering on the floor below.
-    if (distXZ(d.Pos, c.g.p.Pos) < playermod.radius + 1.3 and @abs(d.Pos.y - c.g.p.Pos.y) < 1.2) {
-        // Only remove the drop if it was actually picked up; a full belt leaves the
-        // potion glittering on the ground instead of destroying it with a lying toast.
+    // Same-level pickup only: a rampart edge must not hoover drops on the floor below.
+    // A hair more vertical slack than combat's SAME_GROUND_DY so a drop nudged onto a
+    // low step is still reachable, but not a full storey down.
+    if (distXZ(d.Pos, c.g.p.Pos) < playermod.radius + 1.3 and @abs(d.Pos.y - c.g.p.Pos.y) < SAME_GROUND_DY + 0.2) {
+        // Only remove if actually picked up; a full belt leaves the potion on the ground.
         if (collect(c.g, d.*)) return false;
     }
     return true;
@@ -1283,13 +1345,12 @@ fn spawnGasCloud(g: *Game, pos: rl.Vector3, dps: f32) void {
     if (g.gasCount >= g.gas.len) return;
     g.gas[g.gasCount] = .{ .Pos = pos, .life = GAS_LIFE, .dps = dps, .seed = g.rng.float() * std.math.tau };
     g.gasCount += 1;
-    // The transformation itself: the body's rot boiling OUT — buoyant, sickly.
+    // The body's rot boiling OUT — buoyant, sickly.
     g.parts.burst(&g.rng, v3(pos.x, pos.y + 0.7, pos.z), 18, 2.4, 0.15, 1.2, rgba(188, 228, 112, 230), -2);
 }
 
-// Advance one miasma cloud: age it out, and exhale slow wisps while it lives. Wisp
-// spawning is gated at the torch radius (like the gold glint and ambient dust): a
-// glow boiling out in the fog would break the "nothing dynamic beyond the light" rule.
+// Advance one miasma cloud: age it out, exhale slow wisps while it lives. Wisps gate
+// at the torch radius (nothing dynamic glows beyond the light).
 fn keepGas(c: SweepCtx, gc: *GasCloud) bool {
     const g = c.g;
     gc.life -= c.dt;
@@ -1303,8 +1364,7 @@ fn keepGas(c: SweepCtx, gc: *GasCloud) bool {
             .Life = 1.1 + g.rng.float() * 0.6,
             .maxLife = 1.7,
             .Size = 0.12 + g.rng.float() * 0.09,
-            // Bright enough that the pool's alpha blend can only lift the ground
-            // under it, never dim it (the pool has no additive mode to lean on).
+            // Bright enough that the pool's alpha blend only lifts the ground, never dims it.
             .Color = rgba(198, 235, 124, 190),
             .grav = -0.35, // rot gas rises
             .drag = 1.2,
@@ -1328,25 +1388,24 @@ fn updateGasClouds(g: *Game, dt: f32) void {
     }
 }
 
-// Miasma damage arrives as discrete choking pulses rather than a silent per-frame
-// drain, so each tick is FELT (flash + rumble + a cough of green) and reads "get out".
+// Miasma damage arrives as discrete choking pulses, not a silent drain, so each tick
+// is FELT (flash + rumble + a cough of green).
 fn gasHurtPlayer(g: *Game, dmg: f32) void {
-    g.p.takeDamage(dmg);
+    // Miasma is poison — classed as chaos, so chaos resist (not armor) blunts it.
+    _ = g.p.takeDamage(stats.Damage.one(.chaos, dmg));
     g.damageFlash = maxF(g.damageFlash, DAMAGE_FLASH_DUR * 0.5);
     g.rumble.play(rumble.gas_tick);
     g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 1.3, g.p.Pos.z), 4, 1.8, 0.08, 0.5, rgba(140, 180, 80, 200), -1);
     onPlayerDeath(g);
 }
 
-// Ambient, non-combat particles: violet motes spiraling up the open portal, a faint
-// gold glint over gold piles, warm dust hanging in the torchlight, and dark embers
-// smoldering off the area champion.
+// Ambient particles: violet motes up the open portal, gold glints over piles, warm
+// torchlight dust, and dark embers off the champion.
 fn updateAmbientFX(g: *Game, dt: f32) void {
     g.portalPuff -= dt;
     if (g.portalPuff <= 0) {
         g.portalPuff = 0.05;
-        // Dust in the torchlight: dim, slow, near-still motes drifting through the
-        // lit disc make the AIR visible. Kept faint so they read as atmosphere.
+        // Torchlight dust: dim, slow motes drifting the lit disc make the AIR visible.
         if (g.rng.float() < 0.55) {
             const dang = g.rng.float() * std.math.tau;
             const dr = (0.25 + 0.75 * g.rng.float()) * TORCH_RADIUS * 0.85;
@@ -1361,8 +1420,7 @@ fn updateAmbientFX(g: *Game, dt: f32) void {
                 .drag = 0.25,
             });
         }
-        // The hero's torch spits: now and then a live ember leaps off the flame and
-        // sails a short arc before dying — fire is never perfectly still.
+        // The torch spits: now and then an ember leaps off the flame and dies mid-arc.
         if (g.rng.float() < 0.22 and g.p.alive()) {
             g.parts.spawn(.{
                 .Pos = torchFlameWorld(&g.p),
@@ -1375,8 +1433,8 @@ fn updateAmbientFX(g: *Game, dt: f32) void {
                 .drag = 1.4,
             });
         }
-        // The champion smolders: dark-red embers curl off its shoulders whenever it
-        // stands in your light — you feel which one is the boss before the name.
+        // The champion smolders: dark-red embers curl off its shoulders in your light —
+        // you feel the boss before you read the name.
         for (g.liveMonsters()) |*m| {
             if (!m.boss or !m.alive()) continue;
             if (distXZ(m.Pos, g.p.Pos) > TORCH_RADIUS or g.rng.float() > 0.55) continue;
@@ -1430,25 +1488,24 @@ fn updatePortal(g: *Game) void {
         g.w.PortalOpen = true;
         g.setToast("Area cleared - a portal has opened!", .{});
     }
-    // Lingering gas or a final in-flight arrow can kill in the same frame the
-    // hero stands in the ring — the death must win, not the portal.
+    // Lingering gas or a last arrow can kill the same frame the hero reaches the ring —
+    // death must win over the portal.
     if (g.w.PortalOpen and g.p.alive() and distXZ(g.p.Pos, g.w.PortalPos) < 2.4) {
         if (g.playtest) {
             endPlaytest(g);
             g.ed.status("portal reached - playtest complete", .{});
         } else if (g.w.IsLast) {
             g.scene = .victory;
+            g.canResume = false; // the run is won — nothing to resume
         } else {
             g.enterArea(g.areaIndex + 1);
         }
     }
 }
 
-// Clear all per-arena dynamic state — dynamic bodies, FX pools, the fog mask, and
-// the presentation timers that only decay in .playing — then repopulate the
-// authored packs. Shared by enterArea (new map) and startPlaytest so a killing
-// blow's flash/shake or a stale toast can never bleed across the transition (the
-// drift that once let a playtest death replay its flash over the next F5).
+// Clear all per-arena dynamic state (bodies, FX pools, fog mask, presentation timers)
+// then repopulate packs. Shared by enterArea and startPlaytest so a killing blow's
+// flash/shake or a stale toast can't bleed across the transition.
 fn resetArena(g: *Game) void {
     g.monsterCount = 0;
     g.projs.count = 0;
@@ -1457,29 +1514,28 @@ fn resetArena(g: *Game) void {
     g.parts.clear(); // stray sparks must not carry across the portal
     g.damageFlash = 0; // timers only decay in .playing, so a killing blow's
     g.shake = 0; // flash/shake would otherwise replay over the fresh area
-    g.fog.reset(g.w.HalfW, g.w.HalfD); // each area is a fresh layout: forget the old exploration
-    g.fog.sync(); // upload the cleared grid now: a restart from dead/victory draws this
-    // frame WITHOUT running updatePlaying, so it would otherwise render the new area
-    // against the previous area's still-resident fog mask for one frame.
+    g.fog.reset(g.w.HalfW, g.w.HalfD); // fresh layout: forget the old exploration
+    g.fog.sync(); // upload now: a restart from dead/victory draws a frame without
+    // updatePlaying, else it'd show the new area against the old fog mask.
     g.spawnPacks();
     g.setToast("", .{});
 }
 
-// Teleport the hero: set position AND snap the camera and the smoothed torch anchor
-// to it. All three move together — a bare Pos change leaves the shadow rig lerping
-// across the map for a few frames.
+// Teleport the hero: set Pos AND snap the camera and smoothed torch anchor. All three
+// move together — a bare Pos change leaves the shadow rig lerping across the map.
 fn teleportHero(g: *Game, pos: rl.Vector3) void {
     g.p.Pos = pos;
     g.rig.snap(pos);
     g.torchXZ = torchFlameWorld(&g.p);
 }
 
-// Launch a playtest of the CURRENT in-memory map from the editor: real spawns,
-// real fog of war, real HUD. Every exit (Esc, death, portal) leads back to the
-// editor with the author's map untouched — no disk round-trip.
+// Playtest the CURRENT in-memory map from the editor: real spawns/fog/HUD. Every exit
+// leads back to the editor with the map untouched — no disk round-trip.
 pub fn startPlaytest(g: *Game) void {
     g.playtest = true;
     g.paused = false;
+    g.canResume = false; // a playtest is not a resumable adventure
+    g.sheetOpen = false;
     g.p = playermod.newPlayer(g.map.spawn);
     g.w.PortalOpen = false;
     resetArena(g);
@@ -1502,14 +1558,12 @@ fn endPlaytest(g: *Game) void {
 
 // ---- Rendering (frozen torchlight + baked scene mesh) ----
 
-// The hero: a cloaked, hooded ranger. Plain tint — torchlight shades + shadows it.
-// Drawn HERO_SCALE bigger about the feet (depth pass included, so the shadow grows
-// with the body).
+// The hero: a cloaked, hooded ranger; plain tint (torchlight shades it). Drawn
+// HERO_SCALE bigger about the feet (depth pass too, so the shadow grows with him).
 fn drawHeroBody(p: *const Player) void {
-    // Same clean-stack pre-flush as drawMonsterBody: a batch overflow inside the
-    // hero's scale-about-feet transform would light the whole flushed scene
-    // through that scale — and the hero is the BIGGEST body (~6.3k verts), drawn
-    // last at maximum batch fill. (See the matModel note on drawMonsterBody.)
+    // Clean-stack pre-flush like drawMonsterBody: an overflow inside the scale-about-feet
+    // transform would light the flushed scene through that scale, and the hero is the
+    // BIGGEST body (~6.3k verts). (See the matModel note on drawMonsterBody.)
     rl.gl.rlDrawRenderBatchActive();
     const base = p.Pos;
     beginHeroScale(base);
@@ -1540,18 +1594,16 @@ fn drawHeroBody(p: *const Player) void {
     }
 
     if (p.hitFlash > 0) cloak = lerpColor(cloak, rl.Color.white, 0.6);
-    // The cloak flares from the belt into an A-line skirt over the legs — the shape
-    // that says "cloaked wanderer" from the iso camera (feet still peek below the hem).
+    // The cloak flares from the belt into an A-line skirt — the "cloaked wanderer" shape
+    // from the iso camera (feet peek below the hem).
     rl.drawCylinderEx(v3(base.x, 0.6 + bob, base.z), v3(base.x, 0.16 + bob * 0.5, base.z), 0.33, 0.54, 10, lerpColor(cloak, rl.Color.black, 0.22));
     rl.drawCapsule(v3(base.x, 0.5 + bob, base.z), v3(base.x, 1.42 + bob, base.z), 0.42, 12, 8, cloak);
     rl.drawCapsule(v3(base.x - f.x * 0.22, 0.55 + bob, base.z - f.z * 0.22), v3(base.x - f.x * 0.12, 1.25 + bob, base.z - f.z * 0.12), 0.3, 10, 6, lerpColor(cloak, rl.Color.black, 0.25));
-    // A leather belt cinching the cloak, with a brass buckle at the front — one warm
-    // metal accent that breaks the silhouette into torso-over-skirt.
+    // Leather belt with a brass buckle — a warm accent splitting the silhouette into torso-over-skirt.
     rl.drawCylinderEx(v3(base.x, 0.88 + bob, base.z), v3(base.x, 0.98 + bob, base.z), 0.435, 0.42, 10, rgba(74, 50, 30, 255));
     sphere(v3(base.x + f.x * 0.42, 0.93 + bob, base.z + f.z * 0.42), 0.06, theme.trimColor);
 
-    // Sleeved arms out to the tools of the trade: bow hand forward-right, torch
-    // hand out left — without them the props float beside the body.
+    // Sleeved arms to the tools: bow hand forward-right, torch hand out left.
     const sleeve = lerpColor(hood, rl.Color.black, 0.1);
     const bhandB = heroBowHand(base, f, right, bob);
     rl.drawCapsule(v3(base.x + right.x * 0.28 + f.x * 0.05, 1.3 + bob, base.z + right.z * 0.28 + f.z * 0.05), bhandB, 0.1, 6, 4, sleeve);
@@ -1608,15 +1660,13 @@ fn drawHeroFX(p: *const Player, t: f32) void {
         rl.drawCylinderEx(shoulder, tip, 0.07, 0.03, 6, rgba(255, 240, 190, 255));
     }
 
-    // Torch bounce on the carrier: with the light at his own hand the hero's camera
-    // side falls into self-shadow, so a faint warm emissive wash keeps him readable
-    // — the fire lighting the one who holds it.
+    // Torch bounce: the light at his hand throws his camera side into self-shadow, so a
+    // faint warm wash keeps him readable.
     sphere(v3(base.x, 1.05, base.z), 0.78, rgba(255, 170, 90, 26));
     sphere(v3(base.x, 1.6, base.z), 0.45, rgba(255, 185, 110, 30));
 
-    // The torch burns in the firebolt's family language: wide corona, orange body,
-    // a live flame TONGUE licking upward (stretching and swaying on two beats), and
-    // a white-hot heart — plus the ember drift above.
+    // The torch burns like the firebolt: wide corona, orange body, a swaying flame
+    // TONGUE, a white-hot heart, plus the ember drift above.
     const flick = 1 + 0.18 * sinf(t * 22) + 0.1 * sinf(t * 37);
     const thand = v3(base.x - right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD, 0.95, base.z - right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD);
     const flame = v3(thand.x, TORCH_FLAME_Y, thand.z);
@@ -1654,8 +1704,7 @@ pub fn drawWalls(w: *const world.World) void {
         v3(hw * 2 + t, wallH, t), v3(hw * 2 + t, wallH, t),
         v3(t, wallH, hd * 2 + t), v3(t, wallH, hd * 2 + t),
     };
-    // Each rampart gets a stone profile instead of one extruded slab: a paler
-    // capstone course overhanging the top, and a darker plinth at the foot.
+    // Stone profile per rampart: a paler capstone overhanging the top, a darker plinth at the foot.
     const cap = lerpColor(col, rgba(170, 168, 160, 255), 0.3);
     const plinth = lerpColor(col, rl.Color.black, 0.35);
     for (segs, sizes) |seg, size| {
@@ -1663,8 +1712,7 @@ pub fn drawWalls(w: *const world.World) void {
         rl.drawCubeV(v3(seg.x, wallH + 0.14, seg.z), v3(size.x + 0.35, 0.28, size.z + 0.35), cap);
         rl.drawCubeV(v3(seg.x, 0.3, seg.z), v3(size.x + 0.22, 0.6, size.z + 0.22), plinth);
     }
-    // Buttress piers every few strides give the long ramparts a masonry rhythm —
-    // walking the arena edge you pass tower after tower instead of one endless slab.
+    // Buttress piers every few strides give the ramparts a masonry rhythm instead of one slab.
     const pier = lerpColor(col, rl.Color.black, 0.18);
     const pierCap = lerpColor(cap, rl.Color.white, 0.06);
     var px: f32 = -hw;
@@ -1691,21 +1739,17 @@ fn monsterBob(m: *const Monster) f32 {
     return MONSTER_BOB_AMP * sinf(m.bob);
 }
 
-// The pib's knife arm through every pose, evaluated in one place. The body draw
-// (arm + blade), the FX glint, and the swing's afterimage trail all call this, so
-// the drawn blade, its sparkle, and its ghosts can never disagree.
+// The pib's knife arm through every pose, in one place: body draw, FX glint, and swing
+// afterimage all call this so they can't disagree.
 //
-// The strike is an ARC, and that arc is the pib's entire telegraph (no ground
-// marking): rest shoulders the blade near-vertical on the right — a proud little
-// mast; windup hauls the arm back and UP behind the shoulder, blade cocked; the
-// swing whips it around the front in a falling arc (damage lands at midpoint,
-// where the blade visibly crosses you); flee throws it overhead, waving madly.
+// The arc IS the pib's entire telegraph: rest shoulders the blade near-vertical; windup
+// hauls it back and UP behind the shoulder; the swing whips it around the front (damage
+// at midpoint, where it crosses you); flee waves it overhead.
 const PibGrip = struct { hand: rl.Vector3, tip: rl.Vector3, out: rl.Vector3, f: rl.Vector3 };
 
-// Azimuth anchors of the swing arc in the body frame (0 = out the right side,
-// pi/2 = straight ahead): cocked BEHIND the right shoulder, released across the
-// front, following through to the far left. The front-crossing sits at the arc's
-// midpoint — the same instant updateMonster lands the damage.
+// Swing-arc azimuth anchors in the body frame (0 = right, pi/2 = ahead): cocked behind
+// the shoulder, across the front, through to the far left. Front-crossing = arc
+// midpoint, where updateMonster lands the damage.
 const PIB_A_REST = 0.25;
 const PIB_A_COCK = -0.9;
 const PIB_A_END = 2.4;
@@ -1750,11 +1794,9 @@ fn pibGrip(m: *const Monster) PibGrip {
     return pibGripAt(m, m.windupProgress(), m.swingProgress());
 }
 
-// The archer's bow through idle and draw, evaluated in one place — the body pass
-// (limbs, string, arms, arrow), the FX pass (arrowhead glint), and the actual
-// arrow spawn all read this, the same contract pibGrip keeps for the knife. With
-// the red aiming beam gone, the bow IS the skeleton's whole threat language: it
-// tracks the aim, the string comes back, the arrowhead heats — all must agree.
+// The archer's bow through idle and draw, in one place: body pass, FX glint, and arrow
+// spawn all read this (same contract as pibGrip). The bow IS the skeleton's whole
+// threat language — it tracks the aim, the string draws, the head heats.
 const SkelBow = struct {
     grip: rl.Vector3, // bow hand, held out front along the aim
     nock: rl.Vector3, // string hand: slides back as the draw builds
@@ -1771,8 +1813,8 @@ fn skelBow(m: *const Monster) SkelBow {
     const wp = m.windupProgress();
     const gy = MONSTER_TORSO_BASE + (m.Height - 0.5) * 0.72 + monsterBob(m);
     const grip = v3(m.Pos.x + f.x * (m.Radius + 0.5), gy, m.Pos.z + f.z * (m.Radius + 0.5));
-    // Canted like a hunter's bow (~35 deg off vertical): the top-down camera sees
-    // the full arc and the string, instead of a vertical bow edge-on as a line.
+    // Canted ~35 deg off vertical so the top-down camera sees the full arc and string,
+    // not a vertical bow edge-on.
     const axis = v3(right.x * 0.574, 0.819, right.z * 0.574);
     return .{
         .grip = grip,
@@ -1787,10 +1829,8 @@ fn monsterHeadY(m: *const Monster, shrink: f32) f32 {
     return MONSTER_TORSO_BASE + (m.Height - 0.5) * shrink + MONSTER_HEAD_GAP * shrink + monsterBob(m);
 }
 
-// How far each kind's head juts FORWARD of the spine: posture is silhouette. The
-// zombie lolls ahead of its hunch, the brute is neckless-forward, the pib leads with
-// its snout; the archer stands straight. Shared with the FX pass so the glowing eyes
-// always sit on the face that was actually drawn.
+// How far each kind's head juts FORWARD of the spine (posture is silhouette). Shared
+// with the FX pass so the glowing eyes sit on the drawn face.
 fn monsterHeadFwd(m: *const Monster) f32 {
     return switch (m.Kind) {
         .zombie => m.Radius * 0.6,
@@ -1800,11 +1840,9 @@ fn monsterHeadFwd(m: *const Monster) f32 {
     };
 }
 
-// How far the torso TOP (and everything hung off it: head, hump, shoulders) leans
-// off vertical this frame, in world XZ. Posture in motion: the pib rolls with its
-// waddle; the zombie LISTS side to side — lumbering is posture, not just speed —
-// rears back under its overhead raise, then heaves forward through the slam.
-// Shared by the body pass and the FX pass so the glowing eyes ride the leaning head.
+// How far the torso TOP (and head/hump/shoulders hung off it) leans off vertical this
+// frame, in world XZ. Posture in motion: pib waddle-roll, zombie list + slam pitch.
+// Shared by the body and FX passes so the eyes ride the leaning head.
 fn monsterTorsoLean(m: *const Monster) rl.Vector3 {
     const f = mathx.orFacing(m.Facing, 0, 1);
     const right = mathx.perpXZ(f);
@@ -1825,33 +1863,25 @@ fn monsterTorsoLean(m: *const Monster) rl.Vector3 {
             return v3(right.x * sway + f.x * pitch, 0, right.z * sway + f.z * pitch);
         },
         .skeleton => {
-            // The archer leans INTO the draw: weight shifting toward the target
-            // as the string comes back — the aim reads off the whole frame.
+            // The archer leans INTO the draw, weight toward the target as the string comes back.
             const wl = 0.14 * m.windupProgress();
             return v3(f.x * wl, 0, f.z * wl);
         },
-        // Exhaustive like the sibling posture tables: a new kind forces a lean
-        // decision here rather than silently defaulting to no lean.
+        // Exhaustive: a new kind must make a lean decision here, not silently default.
         .brute => return mathx.zero3,
     }
 }
 
-// Body + per-kind silhouette. Every appendage is drawn here (not in the FX pass) so
-// it exists in BOTH the shadow depth pass and the lit pass: horns and arms cast.
-// The whole (ground-relative) body is lifted by the monster's terrain height.
-// (pub: the editor draws statuesque encounter previews with the same bodies.)
+// Body + per-kind silhouette. Every appendage is drawn here (not FX) so it exists in
+// BOTH the depth and lit passes: horns and arms cast. Body lifted by terrain height.
+// (pub: the editor draws encounter previews with the same bodies.)
 pub fn drawMonsterBody(m: *const Monster) void {
-    // Flush the batch NOW, while the matrix stack is clean. rlgl uploads matModel
-    // (and matNormal) from the CURRENT transform stack at every flush, and the
-    // scene shader derives fragPosition — ALL of its lighting — from matModel
-    // against already-world-space vertices (correct only when it's identity). With
-    // enough bodies on screen the batch used to overflow MID-BODY, inside this
-    // pushMatrix, and the whole accumulated scene got lit through that transform:
-    // the torch disc/fog blew out for exactly one flush segment. UNCONDITIONAL
-    // flush (not a headroom check): every body then starts against an empty batch,
-    // so no body under the full ~32k batch can trip the overflow inside its own
-    // push — a reservation-sized check proved too easy to under-provision (the
-    // hero alone tessellates past 6k verts).
+    // Flush the batch NOW, while the matrix stack is clean. rlgl uploads matModel from
+    // the CURRENT stack at every flush, and the scene shader derives all lighting from
+    // matModel against world-space verts (correct only at identity). A mid-body overflow
+    // inside this pushMatrix once lit the whole scene through the transform (torch/fog
+    // blew out). Unconditional flush, not a headroom check: a reservation was too easy
+    // to under-provision (the hero alone is >6k verts).
     rl.gl.rlDrawRenderBatchActive();
     rl.gl.rlPushMatrix();
     defer rl.gl.rlPopMatrix();
@@ -1876,38 +1906,32 @@ pub fn drawMonsterBody(m: *const Monster) void {
     const right = mathx.perpXZ(f);
     const dark = lerpColor(col, rl.Color.black, 0.3);
     if (m.dying) {
-        // The felled body drains into a dark pool that spreads as the corpse fades —
-        // the floor remembers the kill for a beat after the silhouette is gone.
+        // The felled body drains into a dark pool that spreads as the corpse fades.
         const spread = m.Radius * (0.55 + 1.25 * (1 - shrink));
         rl.drawCylinderEx(v3(x, 0.012, z), v3(x, 0.03, z), spread, spread, 16, rgba(74, 12, 14, 255));
     }
-    // The torso top carries the frame's lean (waddle roll, lumbering list, slam
-    // pitch); shrink collapses it with the rest of the death fade. The skeleton
-    // draws GAUNT — a slimmer spine than its hitbox, with the bony fittings
-    // (shoulders, ribs, bow) carrying the width.
+    // Torso top carries the frame's lean; shrink collapses it in the death fade. The
+    // skeleton draws GAUNT — a slimmer spine than its hitbox, width carried by fittings.
     const lean = monsterTorsoLean(m);
     const torsoR = if (m.Kind == .skeleton) m.Radius * 0.72 else m.Radius;
     rl.drawCapsule(v3(x, MONSTER_TORSO_BASE + bob, z), v3(x + lean.x * shrink, MONSTER_TORSO_BASE + htop + bob, z + lean.z * shrink), torsoR, 8, 4, col);
     const headY = monsterHeadY(m, shrink);
     const headR = m.Radius * 0.7 * shrink;
-    // Posture: the head sits forward of the spine by a per-kind amount (hunch, jut,
-    // snout-lead) and rides the torso lean; every face feature hangs off this center.
+    // Head sits forward of the spine per-kind and rides the torso lean; face features hang off this center.
     const fwd = monsterHeadFwd(m) * shrink;
     const hcx = x + f.x * fwd + lean.x * shrink;
     const hcz = z + f.z * fwd + lean.z * shrink;
     sphere(v3(hcx, headY, hcz), headR, col);
 
     switch (m.Kind) {
-        // Pib: a cute little knife pig. Round ears, a pink snout, a stubby curl of
-        // tail, trotter feet under a happy waddle — and a genuinely dangerous knife
-        // whose cocked-back arc is the pib's entire strike telegraph.
+        // Pib: a cute little knife pig — ears, pink snout, curl of tail, trotters under a
+        // waddle — with a dangerous knife whose cocked-back arc is its whole telegraph.
         .fallen => {
             const gait = m.bob * 1.6;
             const waddle = sinf(gait) * 0.05; // side-to-side toddle
             const hx = hcx + right.x * waddle;
             const hz = hcz + right.z * waddle;
-            // Perky triangle pig ears pointing UP — they read from the top-down
-            // camera where side-mounted ears would vanish into the head.
+            // Triangle ears pointing UP — side-mounted ears would vanish from the top-down camera.
             for ([_]f32{ -1, 1 }) |s| {
                 const eb = v3(hx + right.x * headR * 0.55 * s, headY + headR * 0.5, hz + right.z * headR * 0.55 * s);
                 rl.drawCylinderEx(eb, v3(eb.x + right.x * 0.08 * s - waddle * right.x, eb.y + 0.26 * shrink, eb.z + right.z * 0.08 * s - waddle * right.z), 0.1 * shrink, 0.0, 5, lerpColor(col, rgba(255, 150, 150, 255), 0.35));
@@ -1917,26 +1941,21 @@ pub fn drawMonsterBody(m: *const Monster) void {
             // Curly tail nub, offset opposite the waddle so it wags as it walks.
             const tail = v3(x - f.x * m.Radius * 1.05 - right.x * waddle * 2, MONSTER_TORSO_BASE + 0.25 + bob, z - f.z * m.Radius * 1.05 - right.z * waddle * 2);
             sphere(tail, 0.09 * shrink, lerpColor(col, rgba(255, 150, 150, 255), 0.35));
-            // Trotter feet peeking out under the belly, stepping in antiphase —
-            // the waddle finally has legs under it (they read from top-down as
-            // little dark toes poking past the silhouette in turn).
+            // Trotter feet under the belly, stepping in antiphase — dark toes poking past the silhouette.
             const hoof = lerpColor(col, rl.Color.black, 0.35);
             for ([_]f32{ -1, 1 }) |s| {
                 const step = sinf(gait + s * 1.57) * 0.16;
                 sphere(v3(x + f.x * (0.18 + step) + right.x * 0.28 * s, 0.09, z + f.z * (0.18 + step) + right.z * 0.28 * s), 0.1 * shrink, hoof);
             }
             const armCol = lerpColor(col, rl.Color.black, 0.15);
-            // The knife: a comically OVERSIZED blade in its trotter — shouldered like
-            // a little pikeman on the march, cocked back behind the shoulder as the
-            // strike builds, then whipped around the front. It has to read at gameplay
-            // zoom: a big knife on a small pig is funnier AND scarier, and the blade
-            // is the pib's whole threat language.
+            // The knife: a comically OVERSIZED blade, shouldered on the march, cocked back
+            // as the strike builds, whipped around the front. Big blade on a small pig
+            // reads at gameplay zoom AND is the pib's whole threat language.
             const grip = pibGrip(m);
             const hand = grip.hand;
             const tip = grip.tip;
-            // The knife arm has an ELBOW: two segments bent around a joint pushed
-            // out from the spine, so cocks and swings read as an arm articulating,
-            // not a stick pivoting.
+            // The knife arm has an ELBOW: two segments around a joint pushed out from the
+            // spine, so it reads as an arm articulating, not a stick pivoting.
             const sh = v3(x + right.x * m.Radius * 0.6, MONSTER_TORSO_BASE + 0.28 + bob, z + right.z * m.Radius * 0.6);
             const wrist = v3(hand.x, hand.y - 0.08, hand.z);
             const eo = dirXZ(v3(x, 0, z), v3((sh.x + wrist.x) * 0.5, 0, (sh.z + wrist.z) * 0.5));
@@ -1944,8 +1963,7 @@ pub fn drawMonsterBody(m: *const Monster) void {
             rl.drawCapsule(sh, elbow, 0.09 * shrink, 6, 4, armCol);
             rl.drawCapsule(elbow, wrist, 0.08 * shrink, 6, 4, armCol);
             sphere(elbow, 0.095 * shrink, armCol);
-            // The off arm: a stubby counter-swinging trotter — thrown straight up
-            // beside the knife when the pib panics, which sells the flee in one glance.
+            // The off arm: a stubby counter-swinging trotter, thrown up beside the knife on panic.
             const osh = v3(x - right.x * m.Radius * 0.6, MONSTER_TORSO_BASE + 0.3 + bob, z - right.z * m.Radius * 0.6);
             var ohand = v3(osh.x + f.x * (0.14 + sinf(gait) * 0.14) - right.x * 0.1, osh.y + 0.04, osh.z + f.z * (0.14 + sinf(gait) * 0.14) - right.z * 0.1);
             if (m.fleeing() and m.windup <= 0 and m.swing <= 0) {
@@ -1955,30 +1973,26 @@ pub fn drawMonsterBody(m: *const Monster) void {
             // Leather grip with a brass pommel bead.
             rl.drawCylinderEx(v3(hand.x, hand.y - 0.15, hand.z), v3(hand.x, hand.y + 0.05, hand.z), 0.06 * shrink, 0.055 * shrink, 5, rgba(70, 50, 34, 255));
             sphere(v3(hand.x, hand.y - 0.17, hand.z), 0.06 * shrink, theme.trimColor);
-            // Crossguard: a proper brass bar across the blade root, perpendicular to
-            // the swing's radial so it stays square to the blade through the arc.
+            // Crossguard: a brass bar across the blade root, perpendicular to the radial so it stays square.
             const gd = mathx.perpXZ(grip.out);
             rl.drawCylinderEx(v3(hand.x - gd.x * 0.17, hand.y + 0.06, hand.z - gd.z * 0.17), v3(hand.x + gd.x * 0.17, hand.y + 0.06, hand.z + gd.z * 0.17), 0.04 * shrink, 0.04 * shrink, 4, theme.trimColor);
-            // The blade itself: bright cold steel tapering to the point, with a pale
-            // edge-bevel line up the spine so it catches light like ground metal.
-            // (The death fade shortens it toward the hand with everything else.)
+            // The blade: bright cold steel to the point, a pale bevel up the spine so it
+            // catches light. (Death fade shortens it toward the hand.)
             const tipDrawn = v3(hand.x + (tip.x - hand.x) * shrink, hand.y + (tip.y - hand.y) * shrink, hand.z + (tip.z - hand.z) * shrink);
             rl.drawCylinderEx(v3(hand.x, hand.y + 0.07, hand.z), tipDrawn, 0.095 * shrink, 0.0, 5, rgba(206, 214, 228, 255));
             rl.drawCylinderEx(v3(hand.x + f.x * 0.03, hand.y + 0.1, hand.z + f.z * 0.03), tipDrawn, 0.032 * shrink, 0.0, 4, rgba(240, 246, 252, 255));
         },
-        // Zombie: a lumbering hunch that lists side to side as it shuffles — and a
-        // slow two-handed OVERHEAD slam whose long raise is its entire telegraph.
+        // Zombie: a lumbering hunch that lists as it shuffles, with a two-handed OVERHEAD
+        // slam whose long raise is its entire telegraph.
         .zombie => {
             const shY = MONSTER_TORSO_BASE + htop * 0.8 + bob;
             const flesh = lerpColor(col, rgba(205, 215, 165, 255), 0.3); // paler rot
             const lurch = m.bob * 0.55; // the slow heave of the lumber
-            // The hump: a swollen back rising over the shoulders, shoving the head
-            // forward and down — the corpse never learned to stand back up straight.
+            // The hump: a swollen back over the shoulders, shoving the head forward and down.
             sphere(v3(x - f.x * m.Radius * 0.4 + lean.x * shrink, MONSTER_TORSO_BASE + htop * 0.98 + bob, z - f.z * m.Radius * 0.4 + lean.z * shrink), m.Radius * 0.8 * shrink, lerpColor(col, rl.Color.black, 0.15));
-            // Arms: elbowed, claw-tipped, asymmetric at rest (symmetry reads
-            // "healthy"). The windup hauls BOTH overhead — elbows flared, body
-            // rearing — and the swing crashes them down to the impact point out
-            // front, the same spot resolveMonsterAttack kicks its dust from.
+            // Arms: elbowed, claw-tipped, asymmetric at rest (symmetry reads "healthy").
+            // Windup hauls both overhead; the swing crashes them down to the impact point
+            // resolveMonsterAttack kicks its dust from.
             const wp = m.windupProgress();
             const sp = m.swingProgress();
             for ([_]f32{ -1, 1 }) |s| {
@@ -2004,8 +2018,7 @@ pub fn drawMonsterBody(m: *const Monster) void {
                 // A knotted claw of a hand — the slam needs a visible fist to follow.
                 sphere(hand, 0.16 * shrink, lerpColor(flesh, rl.Color.black, 0.2));
             }
-            // Feet: one stepping, one DRAGGING — a healthy alternating gait would
-            // read alive; the stiff leg never lifts into a proper stride.
+            // Feet: one stepping, one DRAGGING — the stiff leg never lifts into a stride.
             const bootCol = lerpColor(col, rl.Color.black, 0.4);
             for ([_]f32{ -1, 1 }) |s| {
                 var step = sinf(lurch + s * 1.57) * 0.22;
@@ -2015,25 +2028,21 @@ pub fn drawMonsterBody(m: *const Monster) void {
             // A slack jaw hanging off the front of the skull: the head lolls.
             sphere(v3(hcx + f.x * headR * 0.85, headY - headR * 0.5, hcz + f.z * headR * 0.85), headR * 0.38, flesh);
         },
-        // Archer: a gaunt bone frame behind a proper hunter's bow — canted arc,
-        // live string, both arms on the weapon. The whole rig points where it
-        // aims, and the draw is the entire warning a shot is coming.
+        // Archer: a gaunt bone frame behind a hunter's bow — canted arc, live string, both
+        // arms on it. The rig points where it aims; the draw is the whole shot warning.
         .skeleton => {
             const wp = m.windupProgress();
             const bow = skelBow(m);
             const boneCol = lerpColor(col, rl.Color.white, 0.15);
-            // Pale ashwood, not dark: the bow must read against scuffed dark ground
-            // at gameplay zoom — it's the skeleton's entire threat silhouette.
+            // Pale ashwood: the bow must read against dark ground — it's the whole threat silhouette.
             const bowCol = rgba(158, 118, 68, 255);
-            // Bow limbs: swept back off the canted axis, tapering to the tips.
-            // (Death fade folds the whole rig toward the grip via shrink.)
+            // Bow limbs: swept back off the canted axis, tapering. (Death fade folds toward the grip.)
             const tipU = v3(bow.grip.x + (bow.axis.x * BOW_HALF - f.x * 0.14) * shrink, bow.grip.y + bow.axis.y * BOW_HALF * shrink, bow.grip.z + (bow.axis.z * BOW_HALF - f.z * 0.14) * shrink);
             const tipD = v3(bow.grip.x - (bow.axis.x * BOW_HALF + f.x * 0.14) * shrink, bow.grip.y - bow.axis.y * BOW_HALF * shrink, bow.grip.z - (bow.axis.z * BOW_HALF + f.z * 0.14) * shrink);
             rl.drawCylinderEx(bow.grip, tipU, 0.07 * shrink, 0.025 * shrink, 5, bowCol);
             rl.drawCylinderEx(bow.grip, tipD, 0.07 * shrink, 0.025 * shrink, 5, bowCol);
-            // The string: tip to tip through the nock hand. At rest it sits nearly
-            // straight; the draw vees it back — THE aggression cue, readable from
-            // the top-down camera because the bow is canted.
+            // The string: tip to tip through the nock hand. Rest = nearly straight, draw
+            // vees it back — THE aggression cue, readable because the bow is canted.
             const stringCol = rgba(235, 235, 245, 255);
             rl.drawCylinderEx(tipU, bow.nock, 0.02, 0.02, 3, stringCol);
             rl.drawCylinderEx(bow.nock, tipD, 0.02, 0.02, 3, stringCol);
@@ -2042,8 +2051,8 @@ pub fn drawMonsterBody(m: *const Monster) void {
             const shL = v3(x - right.x * m.Radius * 0.85, shY, z - right.z * m.Radius * 0.85);
             const shR = v3(x + right.x * m.Radius * 0.85, shY, z + right.z * m.Radius * 0.85);
             rl.drawCapsule(shL, v3(bow.grip.x, bow.grip.y - 0.02, bow.grip.z), 0.065 * shrink, 6, 4, boneCol);
-            // Draw arm: hangs at the hip until a shot telegraphs, then snaps to
-            // the string and hauls it back, elbow flaring high behind.
+            // Draw arm: hangs at the hip until a shot telegraphs, then hauls the string
+            // back, elbow flaring high.
             const reachT = clampF(wp * 2.5, 0, 1); // hand finds the string early in the draw
             const rest = v3(x + right.x * m.Radius * 0.95 + f.x * 0.1, MONSTER_TORSO_BASE + htop * 0.35 + bob, z + right.z * m.Radius * 0.95 + f.z * 0.1);
             const dhand = v3(rest.x + (bow.nock.x - rest.x) * reachT, rest.y + (bow.nock.y - rest.y) * reachT, rest.z + (bow.nock.z - rest.z) * reachT);
@@ -2051,15 +2060,14 @@ pub fn drawMonsterBody(m: *const Monster) void {
             rl.drawCapsule(shR, delbow, 0.065 * shrink, 6, 4, boneCol);
             rl.drawCapsule(delbow, dhand, 0.055 * shrink, 6, 4, boneCol);
             sphere(delbow, 0.07 * shrink, boneCol);
-            // The nocked arrow rides the string back — shaft, pale head past the
-            // bow, grey fletch at the nock. It says a shot is coming AND from where.
+            // The nocked arrow rides the string back — shaft, pale head, grey fletch. Says
+            // a shot is coming AND from where.
             if (m.windup > 0) {
                 rl.drawCylinderEx(bow.nock, bow.head, 0.035, 0.035, 4, rgba(165, 128, 82, 255));
                 rl.drawCylinderEx(bow.head, v3(bow.head.x + f.x * 0.16, bow.head.y, bow.head.z + f.z * 0.16), 0.07, 0.0, 4, rgba(235, 230, 210, 255));
                 rl.drawCylinderEx(bow.nock, v3(bow.nock.x + f.x * 0.14, bow.nock.y, bow.nock.z + f.z * 0.14), 0.085, 0.02, 4, rgba(210, 210, 220, 230));
             }
-            // Quiver: a fan of fletched shafts over the off shoulder — the archer
-            // reads as an archer from BEHIND too, where the bow is hidden.
+            // Quiver: a fan of shafts over the off shoulder — reads as an archer from BEHIND too.
             for ([_]f32{ -0.14, 0.0, 0.14 }) |qa| {
                 const qb = v3(x - f.x * m.Radius * 0.55 - right.x * m.Radius * 0.35, MONSTER_TORSO_BASE + htop * 0.6 + bob, z - f.z * m.Radius * 0.55 - right.z * m.Radius * 0.35);
                 const qt = v3(qb.x + (-f.x * 0.22 + right.x * qa) * shrink, qb.y + 0.62 * shrink, qb.z + (-f.z * 0.22 + right.z * qa) * shrink);
@@ -2070,8 +2078,7 @@ pub fn drawMonsterBody(m: *const Monster) void {
             for ([_]f32{ -1, 1 }) |s| {
                 sphere(v3(x + right.x * m.Radius * 0.85 * s, shY, z + right.z * m.Radius * 0.85 * s), 0.14 * shrink, boneCol);
             }
-            // Ribcage: three darker bands arced across the front of the frame — the
-            // one detail that says "bones" instead of "pale ghost" at gameplay zoom.
+            // Ribcage: three darker bands across the front — the detail that says "bones", not "pale ghost".
             const ribCol = lerpColor(col, rl.Color.black, 0.35);
             for ([_]f32{ 0.42, 0.58, 0.74 }) |rf| {
                 const ry = MONSTER_TORSO_BASE + htop * rf + bob;
@@ -2085,8 +2092,7 @@ pub fn drawMonsterBody(m: *const Monster) void {
                 );
             }
         },
-        // Brute: mountainous shoulder boulders, a pair of ivory tusks, and thick
-        // knuckle-dragging arms planted ahead — the gorilla stance sells the mass.
+        // Brute: boulder shoulders, ivory tusks, knuckle-dragging arms ahead — a gorilla stance for mass.
         .brute => {
             const shY = MONSTER_TORSO_BASE + htop * 0.78 + bob;
             for ([_]f32{ -1, 1 }) |s| {
@@ -2116,22 +2122,18 @@ pub fn drawMonsterBody(m: *const Monster) void {
     }
 }
 
-// A dynamic body is worth drawing when it sits inside the torch's CURRENT lit disc
-// (torchR — the breathing radius uploaded to the shader this frame, always <=
-// TORCH_RADIUS), or when a live fireball is flying past close enough to light it out
-// in the dark. Gated at the live lit radius (not the padded CULL) so bodies never
-// linger as dim silhouettes on explored-but-dark ground: fog of war shows terrain
-// memory in the "seen" band, never monsters or loot. The static scene mesh, by
-// contrast, is always drawn in full.
+// A dynamic body is worth drawing inside the torch's CURRENT lit disc (torchR, the
+// breathing radius <= TORCH_RADIUS) or when a live fireball lights it. Gated at the
+// lit radius (not padded CULL) so bodies never linger as dim silhouettes on dark
+// ground — fog shows terrain memory in the "seen" band, never bodies. Static mesh always draws.
 fn bodyVisible(pos: rl.Vector3, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams) bool {
-    // Squared compares: this is the most-called cull test (every monster/loot, in
-    // each of the 2-3 draw passes), and it's a pure threshold — no @sqrt needed.
+    // Squared compares: the most-called cull test (every body, each pass), a pure threshold — no @sqrt.
     if (dist2XZ(pos, lightXZ) <= torchR * torchR) return true;
     return fp.intensity > 0 and dist2XZ(pos, fp.pos) <= fp.radius * fp.radius;
 }
 
-// Depth pass: living bodies visible this frame cast. Bodies neither near the torch
-// nor lit by the fireball render black anyway, so there's no point shadowing them.
+// Depth pass: visible living bodies cast. Bodies neither near the torch nor fireball-lit
+// render black, so shadowing them is pointless.
 fn drawMonstersCast(ms: []const Monster, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams) void {
     for (ms) |*m| {
         if (m.dying) continue;
@@ -2153,8 +2155,7 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
     for (ms) |*m| {
         if (m.dying or !m.alive()) continue;
         if (!bodyVisible(m.Pos, lightXZ, torchR, fp)) continue;
-        // Lift this monster's FX (rings, glints, eyes) onto its terrain height;
-        // anything aimed at the PLAYER must compensate back out of this frame.
+        // Lift this monster's FX onto its terrain height; anything aimed at the PLAYER compensates back out.
         rl.gl.rlPushMatrix();
         defer rl.gl.rlPopMatrix();
         rl.gl.rlTranslatef(0, m.Pos.y, 0);
@@ -2166,28 +2167,25 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
             rl.drawCircle3D(v3(m.Pos.x, 0.06, m.Pos.z), m.Radius + 0.4, v3(1, 0, 0), 90, rgba(255, 60, 60, 200));
             rl.drawCircle3D(v3(m.Pos.x, 0.06, m.Pos.z), m.Radius + 0.55 + 0.1 * sinf(t * 3), v3(1, 0, 0), 90, rgba(255, 60, 60, 90));
         }
-        // Ground telegraph — only for kinds that still use one. The pib, zombie,
-        // and skeleton carry their warning entirely in the body anim (cocked
-        // knife, overhead raise, drawn bow): no marking or beam for them, by design.
+        // Ground telegraph — only for kinds that still use one. Pib/zombie/skeleton carry
+        // their warning entirely in the body anim: no marking for them, by design.
         if (m.windup > 0 and !monster.animTelegraph(m.Kind)) {
             const tp = m.windupProgress();
             const a = mathx.u8f(clampF(110 + 130 * tp, 0, 255));
             if (m.Ranged) {
-                // Aim the threat beam at the player's true elevation (compensating
-                // for this monster's lifted frame), so it climbs up at a rampart.
+                // Aim the threat beam at the player's true elevation (compensating for the
+                // lifted frame) so it climbs at a rampart.
                 rl.drawCylinderEx(v3(m.Pos.x, 1.2, m.Pos.z), v3(pPos.x, pPos.y - m.Pos.y + 0.3, pPos.z), 0.05, 0.05, 4, rgba(255, 70, 50, a));
             } else {
-                // The kill zone fills in as the blow comes down: a translucent red
-                // disc swelling to the true reach, ringed by the hard edge.
+                // Kill zone fills as the blow comes down: a red disc swelling to true reach, ringed at the edge.
                 const rr = meleeReach(m.atkRange, playermod.radius);
                 rl.drawCylinderEx(v3(m.Pos.x, 0.015, m.Pos.z), v3(m.Pos.x, 0.045, m.Pos.z), rr * tp, rr * tp, 24, rgba(255, 50, 30, mathx.u8f(26 + 44 * tp)));
                 rl.drawCircle3D(v3(m.Pos.x, 0.09, m.Pos.z), rr, v3(1, 0, 0), 90, rgba(255, 60, 40, a));
                 rl.drawCircle3D(v3(m.Pos.x, 0.09, m.Pos.z), rr * tp, v3(1, 0, 0), 90, rgba(255, 100, 50, a));
             }
         }
-        // The pib knife catches the torchlight: a white star twinkling at the point
-        // whenever the pig is in view, flaring as the cock builds and the cut flies.
-        // The knife IS the pib's telegraph — you should never lose track of it.
+        // The pib knife catches the light: a white star at the point, flaring as the cock
+        // builds and the cut flies. The knife IS the telegraph — never lose track of it.
         if (m.Kind == .fallen) {
             const wp = m.windupProgress();
             const sp = m.swingProgress();
@@ -2196,8 +2194,7 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
             const tw = 0.7 + 0.3 * sinf(t * 9 + m.Pos.x * 3 + m.Pos.z * 5); // idle twinkle
             sphere(tip, (0.035 + 0.07 * flare) * tw, rgba(255, 255, 245, 255));
             sphere(tip, (0.1 + 0.15 * flare) * tw, rgba(255, 250, 220, mathx.u8f(40 + 110 * flare)));
-            // The cut leaves a trail: fading ghosts of the tip strung back along
-            // the arc it just carved — the swing reads as a sweep, not a teleport.
+            // The cut leaves a trail of fading tip-ghosts along the arc — reads as a sweep, not a teleport.
             if (sp > 0) {
                 var k: f32 = 1;
                 while (k <= 5) : (k += 1) {
@@ -2208,8 +2205,7 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
                 }
             }
         }
-        // The arrowhead heats as the draw builds: the "you are targeted" cue now
-        // lives on the weapon itself, growing from ember to flare at full draw.
+        // The arrowhead heats as the draw builds — the "you are targeted" cue, ember to flare at full draw.
         if (m.Kind == .skeleton and m.windup > 0) {
             const wp = m.windupProgress();
             const head = skelBow(m).head;
@@ -2232,23 +2228,19 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
     }
 }
 
-// The miasma made visible: a low churning stack of rot-green blobs filling the
-// DoT footprint, over a ground stain at the TRUE damage radius — what you see is
-// what hurts, without painting a hard warning ring. Emissive pass (after endScene)
-// like all glow FX; gated at the lit radius like every dynamic body.
+// The miasma made visible: churning rot-green blobs filling the DoT footprint over a
+// ground stain at the TRUE damage radius — what you see is what hurts, no hard ring.
+// Emissive pass like all glow FX; gated at the lit radius.
 //
-// ADDITIVE, with depth WRITES off: gas is glowing vapor, so it may only ever ADD
-// light. Default alpha blending filmed these mid-green blobs over the torch-lit
-// ground and visibly DARKENED it (the cloud "ate" the light), and their depth
-// writes clipped loot beams/particles that passed behind the invisible parts of
-// each sphere. Depth is still TESTED, so walls occlude the cloud correctly.
+// ADDITIVE with depth WRITES off: gas is glowing vapor, so it may only ADD light. Alpha
+// blending DARKENED the lit ground (the cloud "ate" light) and its depth writes clipped
+// beams/particles behind each sphere. Depth still TESTED, so walls occlude it.
 fn drawGasClouds(g: *Game, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams, t: f32) void {
     if (g.gasCount == 0) return;
     rl.beginBlendMode(.additive);
     rl.gl.rlDisableDepthMask();
     defer {
-        // endBlendMode FIRST: it flushes the batched gas geometry, which must
-        // still see depth writes disabled; only then restore the mask.
+        // endBlendMode FIRST: it flushes the gas geometry, which must still see depth writes off.
         rl.endBlendMode();
         rl.gl.rlEnableDepthMask();
     }
@@ -2260,8 +2252,7 @@ fn drawGasClouds(g: *Game, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams, 
         const r = GAS_RADIUS * grow;
         const a = fade * (0.8 + 0.2 * sinf(t * 2.3 + gc.seed)); // slow breathing
         rl.drawCylinderEx(v3(gc.Pos.x, gc.Pos.y + 0.02, gc.Pos.z), v3(gc.Pos.x, gc.Pos.y + 0.05, gc.Pos.z), r, r, 20, rgba(52, 105, 28, mathx.u8f(56 * a)));
-        // A bright heart low in the cloud, so the hazard reads at a glance even
-        // under the churn. (Additive: overlaps brighten, so each layer stays deep.)
+        // A bright heart low in the cloud so the hazard reads under the churn. (Additive: overlaps brighten.)
         sphere(v3(gc.Pos.x, gc.Pos.y + 0.45 * grow, gc.Pos.z), r * 0.38 * grow, rgba(98, 175, 50, mathx.u8f(62 * a)));
         // Blobs churn on slow per-cloud lissajous seats out to the footprint edge.
         var i: usize = 0;
@@ -2277,12 +2268,9 @@ fn drawGasClouds(g: *Game, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams, 
     }
 }
 
-// Pick the fireball that lights the scene: the first live player bolt. Its light is
-// modeled overhead (FIRE_HEIGHT above the terrain under the bolt) so the downward
-// shadow map is well-oriented, with a warm colour and a gentle flame flicker.
-// intensity 0 => no fireball, light disabled. (The "light blowing out mid-fight"
-// bug was never this light: it was the render batch overflowing mid-body-draw and
-// re-uploading matModel from a pushed transform — see drawMonsterBody.)
+// Pick the fireball that lights the scene: the first live player bolt, modeled overhead
+// (FIRE_HEIGHT above its terrain) so the shadow map stays oriented. intensity 0 => no
+// fireball. (The "light blowing out mid-fight" bug was the batch overflow, not this — see drawMonsterBody.)
 fn fireLight(g: *Game, t: f32) tl.FireParams {
     for (g.projs.items()) |*pr| {
         if (!pr.FromPlayer) continue;
@@ -2302,8 +2290,7 @@ fn fireLight(g: *Game, t: f32) tl.FireParams {
 fn drawProjectiles(projs: *ProjList, t: f32) void {
     for (projs.items()) |*pr| {
         if (pr.FromPlayer) {
-            // Firebolt: a white-hot heart inside a flickering orange corona, with a
-            // tapering flame tongue trailing behind. The spark trail is particles.
+            // Firebolt: a white-hot heart in a flickering orange corona, a flame tongue trailing. Sparks are particles.
             const flick = 1 + 0.16 * sinf(t * 31 + pr.Pos.x * 5 + pr.Pos.z * 3);
             const tail = v3(pr.Pos.x - pr.Vel.x * 0.055, pr.Pos.y + 0.1, pr.Pos.z - pr.Vel.z * 0.055);
             rl.drawCylinderEx(tail, pr.Pos, 0.04, pr.Radius * 0.75, 6, rgba(255, 120, 30, 120));
@@ -2311,15 +2298,13 @@ fn drawProjectiles(projs: *ProjList, t: f32) void {
             sphere(pr.Pos, pr.Radius * 0.6 * flick, rgba(255, 180, 60, 210));
             sphere(pr.Pos, pr.Radius * 0.32, projectile.flameHeartColor);
         } else {
-            // Arrow: a real shaft — dark wood, pale bone head, grey fletching — laid
-            // along its flight, far more legible (and menacing) than a floating ball.
+            // Arrow: a real shaft (dark wood, bone head, grey fletch) laid along its flight, not a floating ball.
             const inv = 1.0 / maxF(lenXZ(pr.Vel), 1e-4);
             const dx = pr.Vel.x * inv;
             const dz = pr.Vel.z * inv;
             const nock = v3(pr.Pos.x - dx * 0.5, pr.Pos.y, pr.Pos.z - dz * 0.5);
             const tip = v3(pr.Pos.x + dx * 0.28, pr.Pos.y, pr.Pos.z + dz * 0.28);
-            // A faint slipstream behind the shaft: with the aiming beam gone, the
-            // arrow itself must stay legible in the dark — the tracer is the warning.
+            // A faint slipstream behind the shaft: the arrow itself is the warning, so it stays legible in the dark.
             rl.drawCylinderEx(v3(pr.Pos.x - dx * 1.5, pr.Pos.y, pr.Pos.z - dz * 1.5), nock, 0.008, 0.05, 4, rgba(220, 226, 238, 70));
             rl.drawCylinderEx(nock, tip, 0.035, 0.035, 5, rgba(120, 90, 60, 255));
             rl.drawCylinderEx(tip, v3(tip.x + dx * 0.16, tip.y, tip.z + dz * 0.16), 0.07, 0.0, 5, rgba(225, 220, 200, 255));
@@ -2336,9 +2321,8 @@ fn drawLoot(lootList: *std.ArrayList(LootDrop), lightXZ: rl.Vector3, torchR: f32
         defer rl.gl.rlPopMatrix();
         rl.gl.rlTranslatef(0, d.Pos.y, 0);
         const y = 0.4 + 0.12 * sinf(d.bob);
-        // The Diablo promise: a soft shaft of light stands over every drop, so loot
-        // reads across the floor at a glance. Emissive pass — it glows, breathing
-        // slowly, in the drop's own color.
+        // A soft shaft of light stands over every drop so loot reads across the floor.
+        // Emissive, breathing slowly in the drop's color.
         const beamCol = switch (d.Kind) {
             .gold => theme.goldColor,
             .health_potion => theme.healthColor,
@@ -2347,8 +2331,7 @@ fn drawLoot(lootList: *std.ArrayList(LootDrop), lightXZ: rl.Vector3, torchR: f32
         const pulse = 0.7 + 0.3 * sinf(d.bob * 0.7);
         rl.drawCylinderEx(v3(d.Pos.x, 0.05, d.Pos.z), v3(d.Pos.x, 2.0, d.Pos.z), 0.05, 0.012, 6, mathx.withAlpha(beamCol, mathx.u8f(90 * pulse)));
         rl.drawCylinderEx(v3(d.Pos.x, 0.05, d.Pos.z), v3(d.Pos.x, 1.3, d.Pos.z), 0.14, 0.02, 6, mathx.withAlpha(beamCol, mathx.u8f(34 * pulse)));
-        // From the high iso camera the beam foreshortens to a dot, so the floor does
-        // the talking: a soft glow pool plus a crisp ring, pulsing together.
+        // The beam foreshortens to a dot from the iso camera, so the floor talks: a glow pool plus a crisp ring.
         rl.drawCylinderEx(v3(d.Pos.x, 0.012, d.Pos.z), v3(d.Pos.x, 0.03, d.Pos.z), 0.45, 0.45, 20, mathx.withAlpha(beamCol, mathx.u8f(28 * pulse)));
         rl.drawCircle3D(v3(d.Pos.x, 0.04, d.Pos.z), 0.4 + 0.05 * sinf(d.bob), v3(1, 0, 0), 90, mathx.withAlpha(beamCol, mathx.u8f(140 * pulse)));
         switch (d.Kind) {
@@ -2372,9 +2355,8 @@ fn drawLoot(lootList: *std.ArrayList(LootDrop), lightXZ: rl.Vector3, torchR: f32
 pub fn drawPortal(w: *const world.World, t: f32) void {
     const pp = w.PortalPos;
     if (!w.PortalOpen) {
-        // Dormant: a dark stone dais with a faint rune ring that slowly pulses,
-        // promising something will happen here. A dim heart-ember smolders at the
-        // center — banked, waiting to be fed.
+        // Dormant: a dark stone dais with a slow-pulsing rune ring and a dim heart-ember,
+        // banked and waiting.
         rl.drawCylinderEx(v3(pp.x, 0.02, pp.z), v3(pp.x, 0.06, pp.z), 2.0, 2.0, 24, rgba(42, 42, 58, 220));
         const pulse = mathx.u8f(70 + 45 * sinf(t * 1.4));
         rl.drawCircle3D(v3(pp.x, 0.09, pp.z), 1.55, v3(1, 0, 0), 90, rgba(110, 100, 170, pulse));
@@ -2383,10 +2365,8 @@ pub fn drawPortal(w: *const world.World, t: f32) void {
         sphere(v3(pp.x, 0.18, pp.z), 0.26, rgba(120, 105, 210, pulse / 4));
         return;
     }
-    // Open: a violet vortex built from AIR, not solids — a glowing dais, two helix
-    // strands of bright motes corkscrewing up a tapering throat, and thin breathing
-    // rim rings. (Stacked translucent cylinders read as one opaque blob from the iso
-    // camera; points and lines stay airy.)
+    // Open: a violet vortex built from AIR — a glowing dais, two helix strands up a
+    // tapering throat, thin rim rings. (Stacked cylinders read as an opaque blob; points/lines stay airy.)
     rl.drawCylinderEx(v3(pp.x, 0.02, pp.z), v3(pp.x, 0.05, pp.z), 2.3, 2.3, 28, rgba(70, 50, 130, 150));
     rl.drawCylinderEx(v3(pp.x, 0.05, pp.z), v3(pp.x, 0.08, pp.z), 1.9, 1.9, 28, rgba(120, 90, 220, 100));
     var strand: i32 = 0;
@@ -2407,8 +2387,7 @@ pub fn drawPortal(w: *const world.World, t: f32) void {
     // Breathing rim rings anchor the throat to the dais.
     rl.drawCircle3D(v3(pp.x, 0.1, pp.z), 1.6 + 0.08 * sinf(t * 2.1), v3(1, 0, 0), 90, rgba(200, 170, 255, 190));
     rl.drawCircle3D(v3(pp.x, 0.1, pp.z), 1.25 + 0.06 * sinf(t * 2.1 + 1.5), v3(1, 0, 0), 90, rgba(160, 130, 255, 130));
-    // A sky-beam over the open gate — the arena's one landmark, readable across the
-    // whole dark from the iso camera as a soft violet column over the dais.
+    // A sky-beam over the gate — the arena's one landmark, a violet column readable across the dark.
     rl.drawCylinderEx(v3(pp.x, 0.1, pp.z), v3(pp.x, 8.0, pp.z), 1.05, 0.28, 12, rgba(150, 110, 255, 26));
     rl.drawCylinderEx(v3(pp.x, 0.1, pp.z), v3(pp.x, 5.4, pp.z), 0.5, 0.12, 10, rgba(200, 170, 255, 44));
     // Three rune-sparks patrol the rim, counter-rotating against the helix.
@@ -2422,13 +2401,11 @@ pub fn drawPortal(w: *const world.World, t: f32) void {
     }
 }
 
-// Fireflies: a handful of tiny blinking lights adrift in the darkness OUTSIDE the
-// torch disc. Pure function of time + index (no state, no reveal — they're air, like
-// monster eyes), each wandering a slow lissajous around a fixed seat in the arena.
-// They make the unexplored black read as a living night instead of a void.
+// Fireflies: tiny blinking lights adrift OUTSIDE the torch disc. Pure function of
+// time+index (no state), each wandering a slow lissajous around a fixed seat, so the
+// unexplored black reads as living night.
 fn drawFireflies(g: *const Game, t: f32) void {
-    // Per-area swarm personality: meadow-green over the moor, pale wisps on the cold
-    // plains, sickly green under the dark wood, violet grave-lights in the catacombs.
+    // Per-area swarm color: moor green, plains wisps, dark-wood green, catacomb violet.
     const cols = [_]rl.Color{
         rgba(180, 220, 100, 255),
         rgba(170, 205, 255, 255),
@@ -2460,17 +2437,11 @@ fn drawFireflies(g: *const Game, t: f32) void {
     }
 }
 
-// LIGHT LOG (main menu → Debug Log) — a measuring instrument, not just a state
-// dump. While enabled, every playing frame:
-//   1. stashes the EXACT lp/fp/camera the frame was rendered with (drawWorld);
-//   2. after endDrawing, READS BACK the rendered frame and MEASURES the lit disc
-//      (dark-edge distance in px along 4 rays from screen center) + its color;
-//   3. logs both, plus clip planes, torch anchor, facing, every projectile's
-//      position/velocity, and NaN checks on all of it;
-//   4. when the measured radius deviates >30% from its rolling median, exports
-//      the offending frame itself to shots/anomaly_N.png and tags the line.
-// The rendered proof and the complete state land in the same line — whatever is
-// corrupting the lighting cannot hide on either side of the GPU boundary.
+// LIGHT LOG (main menu → Debug Log): a measuring instrument. Each playing frame stashes
+// the exact lp/fp/cam (drawWorld), then after endDrawing reads back the frame, measures
+// the lit disc (dark-edge px along 4 rays + color), logs that with clip planes, torch,
+// facing, projectiles, and NaN checks, and exports shots/anomaly_N.png when the radius
+// deviates >30% from its rolling median. State and picture land on one line.
 var lightLogFile: ?std.fs.File = null;
 var dbgLp: tl.LightParams = .{ .pos = mathx.zero3, .radius = 0 };
 var dbgFp: tl.FireParams = .{ .pos = mathx.zero3, .radius = 0, .color = mathx.zero3, .intensity = 0 };
@@ -2503,9 +2474,8 @@ fn nanBad(v: rl.Vector3) bool {
         std.math.isInf(v.x) or std.math.isInf(v.y) or std.math.isInf(v.z);
 }
 
-// Walk from screen center along (dx,dy) until 16 consecutive near-black pixels
-// begin (the fog beyond the lit disc); returns the px distance where the dark
-// run started, or the distance to the screen edge if it never went dark.
+// Walk from screen center along (dx,dy) until 16 consecutive near-black pixels (the fog
+// beyond the lit disc); returns the px distance to the dark run, or to the edge.
 fn rayDarkEdge(img: *const rl.Image, cx: i32, cy: i32, dx: i32, dy: i32) i32 {
     var d: i32 = 1;
     var darkRun: i32 = 0;
@@ -2537,8 +2507,7 @@ fn debugFrameProbe(g: *Game) void {
     const mU = rayDarkEdge(&img, cx, cy, 0, -1);
     const mD = rayDarkEdge(&img, cx, cy, 0, 1);
     const mAvg: f32 = @as(f32, @floatFromInt(mL + mR + mU + mD)) / 4.0;
-    // Disc color: mean RGB on a 12-point ring at 0.55x the measured extent —
-    // "turns colors" shows here as the ring hue jumping between lines.
+    // Disc color: mean RGB on a 12-point ring at 0.55x the extent — hue jumps flag "turns colors".
     var rr: i32 = 0;
     var rg: i32 = 0;
     var rb: i32 = 0;
@@ -2649,22 +2618,18 @@ fn drawWorld(g: *Game) void {
     }
 
     const t = g.elapsed;
-    // Torch breathing: the lit disc contracts a few percent on two beat frequencies so
-    // the light feels alive. Downward-only (never past TORCH_RADIUS) so bodies culled at
-    // exactly TORCH_RADIUS can never sit outside the drawn light.
+    // Torch breathing: the lit disc contracts a few percent on two beats. Downward-only
+    // (never past TORCH_RADIUS) so bodies culled at TORCH_RADIUS stay inside the light.
     const breath = 1.0 - 0.022 * (0.5 + 0.5 * sinf(t * 7.1)) - 0.014 * (0.5 + 0.5 * sinf(t * 13.7));
-    // The light hangs over the CARRIED flame (g.torchXZ), not over the hero's head —
-    // shadows lean away from the torch hand and swing around as the hero turns. It
-    // rides the LOCAL walkable ground, so a rampart lifts the whole rig with you.
+    // The light hangs over the CARRIED flame (g.torchXZ), not the hero's head, so shadows
+    // lean off the torch hand. Rides LOCAL ground, so a rampart lifts the whole rig.
     const pGroundY = g.w.groundY(g.p.Pos.x, g.p.Pos.z);
     const lp = tl.LightParams{ .pos = v3(g.torchXZ.x, pGroundY + TORCH_HEIGHT, g.torchXZ.z), .radius = TORCH_RADIUS * breath, .groundRef = pGroundY };
-    // Every body-draw gate measures from the light's own ground point, so the culled
-    // set and the drawn light disc can never diverge.
+    // Body-draw gates measure from the light's own ground point, so cull set and lit disc can't diverge.
     const lightGround = v3(g.torchXZ.x, 0, g.torchXZ.z);
     const fp = fireLight(g, t);
-    // Stash EXACTLY what this frame renders with (applyUniforms uploads these lp/fp,
-    // beginMode3D uses this cam) — debugFrameProbe logs them against the frame's
-    // MEASURED pixels after endDrawing, so state and picture can never disagree.
+    // Stash EXACTLY what this frame renders with — debugFrameProbe logs it against the
+    // frame's measured pixels after endDrawing, so state and picture can't disagree.
     if (g.debugLog) {
         dbgLp = lp;
         dbgFp = fp;
@@ -2697,8 +2662,7 @@ fn drawWorld(g: *Game) void {
     g.torch.applyFogUniforms(.{ .texId = @intCast(g.fog.tex.id), .halfW = g.fog.halfW, .halfD = g.fog.halfD });
     rl.beginMode3D(cam);
     g.torch.beginScene();
-    // beginScene bound the shadow map on slot 10 and left it active; reset to 0 so
-    // immediate-mode texture0 binds land on slot 0, not on the shadow map.
+    // beginScene left the shadow map active on slot 10; reset to 0 so immediate-mode binds land on slot 0.
     rl.gl.rlActiveTextureSlot(0);
     g.sceneMesh.drawScene();
     rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(g.w.HalfW * 2, g.w.HalfD * 2), g.w.Ground);
@@ -2718,29 +2682,24 @@ fn drawWorld(g: *Game) void {
 }
 
 pub fn run(shot: bool) void {
-    // 4x MSAA smooths every polygon edge in the scene (the biggest overall-fidelity
-    // win); set before initWindow or the GL context ignores it.
+    // 4x MSAA smooths every polygon edge; set before initWindow or the GL context ignores it.
     rl.setConfigFlags(.{ .msaa_4x_hint = true, .window_hidden = shot });
     rl.initWindow(1280, 800, "zig-diablo");
     defer rl.closeWindow();
-    // Esc is NAVIGATION (menus, editor modals, playtest exit) — raylib's default
-    // exit key is Esc, which would kill the window instead. Quitting goes through
-    // the menu's Quit item (g.quit) or the close button only.
+    // Esc is NAVIGATION (menus, editor, playtest exit); raylib's default exit key is Esc,
+    // which would kill the window. Quitting goes through the menu's Quit item or close button.
     rl.setExitKey(.null);
-    // Uncapped: no setTargetFPS. setTargetFPS paces by OS sleep, whose ~15.6ms Windows
-    // timer granularity makes a 60fps target periodically oversleep into a dropped frame
-    // (a "chug" despite ample headroom). Running free removes that jitter. To re-cap
-    // smoothly later, prefer .vsync_hint (GPU flip pacing) over setTargetFPS.
+    // Uncapped: setTargetFPS paces by OS sleep, whose ~15.6ms Windows granularity
+    // periodically oversleeps a 60fps target into a dropped frame. Free removes that
+    // jitter; to re-cap later prefer .vsync_hint over setTargetFPS.
 
     var g = Game.init(if (shot) 1234 else mathx.timeSeed()) catch return;
     defer g.deinit();
     defer g.rumble.stop(); // never leave a motor latched on after the window closes
 
-    // Screenshot harness: skip the menu, sweep a few vantage points — the RAMPART
-    // (hero on high ground, monsters at the cliff base), arena center, and the
-    // (forced-open) portal so its FX show. The camera snaps to each teleport, then
-    // a dozen frames run so fog reveals, particles spawn, and the smoothed rig
-    // settles before the shutter clicks.
+    // Screenshot harness: skip the menu, sweep a few vantages — the rampart, arena
+    // center, and the forced-open portal. Camera snaps to each teleport, then a dozen
+    // frames run so fog/particles/rig settle before the shutter.
     const sweep = [_]rl.Vector3{
         mathx.ground(31.5, 20), // atop the Blood Moor rampart (ledge spans x 26.., z 4..30)
         mathx.ground(0, 0),
@@ -2749,19 +2708,17 @@ pub fn run(shot: bool) void {
     if (shot) {
         g.scene = .playing;
         teleportHero(&g, sweep[0]);
-        // Drain the resources partway so the orbs photograph with a visible liquid
-        // surface (a full orb hides the meniscus + fill line entirely).
+        // Drain resources partway so the orbs show a liquid surface (a full orb hides the meniscus).
         g.p.HP = g.p.MaxHP * 0.62;
         g.p.Mana = g.p.MaxMana * 0.45;
-        // Rampart tableau: a pack milling at the cliff base below the hero, and a
-        // firebolt frozen mid-descent — the "pew from the high ground" money shot.
+        // Rampart tableau: a pack at the cliff base and a firebolt frozen mid-descent.
         g.p.Facing = dirXZ(g.p.Pos, v3(22, 0, 15));
         g.spawn(monster.makeMonster(.fallen, 0, &g.rng, mathx.ground(22.5, 13.5)));
         g.spawn(monster.makeMonster(.fallen, 0, &g.rng, mathx.ground(20.5, 17)));
         g.spawn(monster.makeMonster(.zombie, 0, &g.rng, mathx.ground(23.5, 19)));
         const boltFrom = v3(31.5, 2.4, 20);
         const boltTo = v3(21, 0, 13.5);
-        g.projs.add(projectile.newFirebolt(boltFrom, dirXZ(boltFrom, boltTo), 20, aimYVel(2.4 + projectile.fireboltMuzzleDY, 0.9, distXZ(boltFrom, boltTo), projectile.fireboltSpeed)));
+        g.projs.add(projectile.newFirebolt(boltFrom, dirXZ(boltFrom, boltTo), stats.Damage.one(.fire, playermod.BASE_SPELL_DMG), aimYVel(2.4 + projectile.fireboltMuzzleDY, 0.9, distXZ(boltFrom, boltTo), projectile.fireboltSpeed)));
     }
     var frame: i32 = 0;
     var shotIdx: usize = 0;
@@ -2779,45 +2736,52 @@ pub fn run(shot: bool) void {
         switch (g.scene) {
             .menu => {
                 const n: i32 = if (g.menuMode == .root) menuRootItems.len else MENU_OPTIONS_COUNT;
-                if (rl.isKeyPressed(.down) or rl.isKeyPressed(.s)) g.menuSel = @mod(g.menuSel + 1, n);
-                if (rl.isKeyPressed(.up) or rl.isKeyPressed(.w)) g.menuSel = @mod(g.menuSel - 1 + n, n);
-                if ((rl.isKeyPressed(.enter) and !altHeld) or rl.isKeyPressed(.space) or padStartPressed()) menuActivate(&g, g.menuSel);
+                if (input.navDown()) g.menuSel = @mod(g.menuSel + 1, n);
+                if (input.navUp()) g.menuSel = @mod(g.menuSel - 1 + n, n);
+                if (input.confirm(altHeld)) menuActivate(&g, g.menuSel);
                 if (g.menuMode == .options) {
-                    if (rl.isKeyPressed(.escape)) {
+                    if (input.cancel()) {
                         g.menuMode = .root;
                         g.menuSel = MENU_OPTIONS_IDX;
                     }
-                    if (g.menuSel == 0 and (rl.isKeyPressed(.left) or rl.isKeyPressed(.right))) {
-                        cycleDisplayMode(&g, rl.isKeyPressed(.right));
+                    // Left/right cycles the display value on the Display row.
+                    if (g.menuSel == 0 and (input.navLeft() or input.navRight())) {
+                        cycleDisplayMode(&g, input.navRight());
                     }
                 }
                 g.rig.follow(g.p.Pos, dt); // let the backdrop drift
             },
             .playing => {
-                if (rl.isKeyPressed(.escape) or padStartPressed()) {
-                    if (g.playtest) endPlaytest(&g) else {
-                        g.scene = .menu;
-                        g.hoverMonster = -1; // no hover ring pulsing in the menu backdrop
+                // Character sheet: toggles with C / Select and freezes the world.
+                if (input.sheetTogglePressed()) g.sheetOpen = !g.sheetOpen;
+                if (g.sheetOpen) {
+                    updateSheet(&g, altHeld);
+                    g.rig.follow(g.p.Pos, dt); // keep the camera live behind the sheet
+                } else {
+                    // Exit to menu is Escape/Start ONLY — never pad B (dodge in play).
+                    if (rl.isKeyPressed(.escape) or input.startPressed()) {
+                        if (g.playtest) endPlaytest(&g) else {
+                            g.scene = .menu;
+                            g.hoverMonster = -1; // no hover ring pulsing in the menu backdrop
+                        }
                     }
+                    if (g.scene == .playing) updatePlaying(&g, dt);
                 }
-                if (g.scene == .playing) updatePlaying(&g, dt);
             },
             .dead => {
-                if (rl.isKeyPressed(.r) or padStartPressed()) {
+                if (input.restartPressed(altHeld)) {
                     if (g.playtest) endPlaytest(&g) else g.startRun();
                 }
                 g.parts.update(dt, &g.w); // let the killing blow's burst finish playing
             },
             .victory => {
-                if ((rl.isKeyPressed(.enter) and !altHeld) or padStartPressed()) g.startRun();
+                if (input.confirm(altHeld)) g.startRun();
             },
             .editor => editor.update(&g, dt),
         }
 
-        // Drive rumble every frame across all scenes so envelopes always decay to
-        // silence (the death rumble swells on into the death screen). Silent while
-        // paused, with no controller, or in the HEADLESS screenshot harness — an
-        // automated --gameshot run must never buzz a connected pad on the desk.
+        // Drive rumble every frame across all scenes so envelopes always decay to silence.
+        // Silent while paused, with no controller, or in the headless screenshot harness.
         g.rumble.update(dt, !shot and rl.isGamepadAvailable(PAD) and !g.paused);
 
         if (g.scene == .editor) {
@@ -2841,25 +2805,32 @@ pub fn run(shot: bool) void {
                 rl.takeScreenshot(name);
                 shotIdx += 1;
                 if (shotIdx >= sweep.len) {
-                    // After the world vantages, photograph each full-screen scene
-                    // (the editor last — entered properly so it loads + applies).
-                    const extraScenes = [_]Scene{ .menu, .dead, .victory, .editor };
                     const ei = shotIdx - sweep.len;
-                    if (ei >= extraScenes.len) break;
-                    if (extraScenes[ei] == .editor) {
+                    // First extra shot: the stat sheet over the frozen world, points banked so the "+" shows.
+                    if (ei == 0) {
+                        g.scene = .playing;
+                        g.p.attrPoints = 5;
+                        g.p.skillPoints = 1;
+                        g.sheetOpen = true;
+                        continue;
+                    }
+                    g.sheetOpen = false; // close it before the full-screen scene shots
+                    // Then each full-screen scene (editor last, entered properly so it loads + applies).
+                    const extraScenes = [_]Scene{ .menu, .dead, .victory, .editor };
+                    const si = ei - 1;
+                    if (si >= extraScenes.len) break;
+                    if (extraScenes[si] == .editor) {
                         g.areaIndex = 0;
                         editor.enter(&g);
                     } else {
-                        g.scene = extraScenes[ei];
+                        g.scene = extraScenes[si];
                     }
                     continue;
                 }
                 teleportHero(&g, sweep[shotIdx]);
                 g.banner.time = 0; // the area banner would sit right over the subjects
                 if (shotIdx == 1) {
-                    // Family portrait: one of each kind posed around the hero, angled
-                    // three-quarter to the camera, zoomed in — one shot verifies
-                    // every silhouette.
+                    // Family portrait: one of each kind around the hero, three-quarter and zoomed — verifies every silhouette.
                     const px = g.p.Pos.x;
                     const pz = g.p.Pos.z;
                     g.spawn(monster.makeMonster(.fallen, 0, &g.rng, mathx.ground(px - 3, pz - 1)));
@@ -2870,37 +2841,33 @@ pub fn run(shot: bool) void {
                     while (mi < g.monsterCount) : (mi += 1) {
                         g.monsters[mi].Facing = v3(-0.66, 0, 0.75);
                     }
-                    // Pose the pib mid-SWING so the portrait shows the arc: blade
-                    // crossing the front, flare + afterimage trail behind it. The
-                    // posed dummies get STRETCHED timers: the settle frames before
-                    // the shutter still tick updateMonster, and a real-length swing
-                    // would decay past its readable middle before the shot.
+                    // Pib mid-SWING so the arc shows (blade crossing, flare + trail). Posed
+                    // dummies get STRETCHED timers: settle frames still tick updateMonster,
+                    // and a real-length swing would decay past its readable middle.
                     g.monsters[g.monsterCount - 4].swingTime = 3.0;
                     g.monsters[g.monsterCount - 4].swing = 1.5;
-                    // And the zombie near the top of its raise: both claws hauled
-                    // overhead, body reared back — the slam telegraph in full.
+                    // Zombie near the top of its raise: both claws overhead, body reared — full slam telegraph.
                     g.monsters[g.monsterCount - 3].windupTime = 6.0;
                     g.monsters[g.monsterCount - 3].windup = 0.9;
-                    // And the skeleton mid-draw: string hauled back, arrow nocked,
-                    // arrowhead glint burning — aimed at the hero (the windup AI
-                    // keeps its facing on the player through the settle frames).
+                    // Skeleton mid-draw: string back, arrow nocked, head glinting — aimed at
+                    // the hero (windup AI keeps facing through the settle frames).
                     g.monsters[g.monsterCount - 2].windupTime = 6.0;
                     g.monsters[g.monsterCount - 2].windup = 2.4;
-                    // Engage the brute so the top-center enemy plate is in frame
-                    // (updateAim re-derives hover each frame, but the attack target
-                    // sticks — and the plate reads from it as its second priority).
+                    // Engage the brute so the top-center enemy plate is in frame (hover re-derives,
+                    // but the attack target sticks and the plate reads from it).
                     g.p.targetMonster = g.monsters[g.monsterCount - 1].id;
+                    // Brute part-way into its heavy-stun meter to verify the amber stun channel under the HP bar.
+                    g.monsters[g.monsterCount - 1].stunFill = 0.6;
                     // And one fresh corpse mid-fade, to verify the spreading blood pool.
                     g.spawn(monster.makeMonster(.zombie, 0, &g.rng, mathx.ground(px + 0.6, pz + 4.6)));
                     g.monsters[g.monsterCount - 1].dying = true;
                     g.monsters[g.monsterCount - 1].HP = 0;
                     g.monsters[g.monsterCount - 1].deathTimer = monster.monster_death_fade * 0.5;
-                    // With its miasma already billowed out over it (aged past the
-                    // grow-in so the shot verifies the full cloud, not a seedling).
+                    // Miasma already billowed out (aged past grow-in to verify the full cloud).
                     spawnGasCloud(&g, g.monsters[g.monsterCount - 1].Pos, g.monsters[g.monsterCount - 1].MaxDmg * GAS_DPS_FRAC);
                     if (g.gasCount > 0) g.gas[g.gasCount - 1].life = GAS_LIFE - 1.5;
                     // A firebolt frozen mid-flight, to verify the bolt + its trail.
-                    g.projs.add(projectile.newFirebolt(mathx.ground(px - 1.5, pz + 2.5), v3(-0.8, 0, 0.6), 20, 0));
+                    g.projs.add(projectile.newFirebolt(mathx.ground(px - 1.5, pz + 2.5), v3(-0.8, 0, 0.6), stats.Damage.one(.fire, playermod.BASE_SPELL_DMG), 0));
                     // Ground loot just out of pickup range, to verify the drop beams.
                     g.lootList.append(.{ .Kind = .gold, .Pos = mathx.ground(px - 0.4, pz + 4.0), .Amount = 25 }) catch {};
                     g.lootList.append(.{ .Kind = .health_potion, .Pos = mathx.ground(px - 2.6, pz + 2.0), .Amount = 1 }) catch {};

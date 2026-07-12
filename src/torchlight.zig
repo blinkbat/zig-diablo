@@ -1,39 +1,33 @@
 const std = @import("std");
 const rl = @import("raylib");
 
-// TORCHLIGHT — the approved torch lighting + cast-shadow + light-radius pipeline,
-// originally copied VERBATIM from demo2.zig (the frozen reference demo). It now
-// intentionally diverges from the demo in TWO ways: (1) the scene shader is purely
-// diffuse (the demo's specular term was removed) so the flat ground no longer flares a
-// bright specular hot-spot under the overhead torch; (2) past the torch disc the shader
-// no longer fades straight to black — it falls back to the fog-of-war memory layer
-// (fog.zig), so explored ground stays a dim, cool "seen" instead of vanishing. The
-// cast-shadow PCF and the fireball light are otherwise unchanged from the demo. The
-// game feeds this its torch position, light radius, camera, casters, and fog map.
+// TORCHLIGHT — torch lighting + cast-shadow + light-radius pipeline, adapted from
+// demo2.zig. Two deliberate divergences from the demo: (1) the scene shader is purely
+// diffuse (specular removed) so flat ground doesn't flare a hot-spot under the torch;
+// (2) past the torch disc the shader falls back to the fog-of-war memory layer
+// (fog.zig) instead of black, so explored ground stays a dim, cool "seen". The game
+// feeds this its torch position, radius, camera, casters, and fog map.
 
-// The torch only lights a small disc. 4096 gives the soft-PCF penumbra a crisp base
-// to blur from (so edges read as soft, not chunky) while still costing far less depth
-// fill than the demo's 6144. Lighting math is otherwise unchanged.
+// The torch lights a small disc. 4096 gives the soft-PCF penumbra a crisp base to blur
+// from while costing far less depth fill than the demo's 6144.
 pub const SHADOWMAP_RESOLUTION = 4096;
 pub const SHADOW_COVER_MARGIN = 1.3;
 
-// Depth-pass clip planes for the overhead shadow cameras (torch + fireball). Shared
-// so both passes frame the same near/far slab around the light. NEAR bounds which
-// casters exist to the map: anything above (light height - NEAR) is clipped out of
-// the depth pass, so it must stay small enough that monster heads clear it under
-// the lowered torch (0.4 leaves ~4.1 of caster headroom under a 4.5 light; the
-// 32-bit depth target keeps precision fine at this ratio).
+// Depth-pass clip planes for the overhead shadow cameras (torch + fireball), shared
+// so both frame the same near/far slab. NEAR clips anything above (light height -
+// NEAR) out of the depth pass, so it must stay small enough that monster heads clear
+// it under the lowered torch (0.4 leaves ~4.1 headroom under a 4.5 light; the 32-bit
+// depth target keeps precision fine at this ratio).
 pub const SHADOW_CLIP_NEAR = 0.4;
 pub const SHADOW_CLIP_FAR = 45.0;
 
-// The fireball's shadow pool is a fraction of the torch's, so a small map keeps its
-// second depth pass cheap while its soft PCF hides the lower resolution.
+// The fireball's shadow pool is a fraction of the torch's, keeping its second depth
+// pass cheap while soft PCF hides the lower resolution.
 pub const FIRE_SHADOWMAP_RESOLUTION = 1024;
 
-// GPU texture units the scene shader's samplers are pinned to. Each slot is set as a
-// uniform ONCE in init() and re-bound every frame in beginScene(); the upload and the
-// bind MUST use the same number or a sampler silently reads the wrong texture. Named
-// here so the two sites can't drift.
+// GPU texture units the scene shader's samplers are pinned to. Set as a uniform ONCE
+// in init() and re-bound every frame in beginScene(); upload and bind MUST use the
+// same number or a sampler reads the wrong texture. Named so the two sites can't drift.
 const SLOT_SHADOW: i32 = 10;
 const SLOT_FIRE: i32 = 11;
 const SLOT_FOG: i32 = 12;
@@ -236,22 +230,19 @@ fn loadShadowmap(res: i32) rl.RenderTexture2D {
     };
 }
 
-/// Everything the pipeline needs to place the torch this frame. The torch sits at
-/// `pos` (above the player); `groundRef` is the walkable ground height under it
-/// (0 on the flat floor, the ledge height on a rampart) — the overhead shadow
-/// camera aims at and sizes its cone against THAT plane, so standing on raised
-/// ground doesn't shrink the shadowed footprint. `radius` is how far the torch
-/// reaches before darkness.
+/// Torch placement for this frame. `pos` is above the player; `groundRef` is the
+/// walkable ground height under it (0 on flat floor, ledge height on a rampart) — the
+/// overhead shadow camera aims at and sizes its cone against THAT plane, so raised
+/// ground doesn't shrink the footprint. `radius` is the torch's reach before darkness.
 pub const LightParams = struct {
     pos: rl.Vector3,
     radius: f32,
     groundRef: f32 = 0,
 };
 
-/// A moving fireball light. `pos` sits above the projectile (like the torch, an
-/// overhead pool so its downward shadow map is well-oriented); `groundRef` as in
-/// LightParams; `intensity` of 0 disables it entirely (no light, no shadow,
-/// second depth pass skipped).
+/// A moving fireball light. `pos` sits above the projectile (overhead, like the torch,
+/// so its downward shadow map is well-oriented); `groundRef` as in LightParams;
+/// `intensity` of 0 disables it entirely (no light/shadow, second depth pass skipped).
 pub const FireParams = struct {
     pos: rl.Vector3,
     radius: f32,
@@ -261,8 +252,8 @@ pub const FireParams = struct {
 };
 
 /// The fog-of-war memory layer sampled by the scene shader. `texId` is the GPU id of a
-/// grayscale exploration map (see fog.zig); `halfW`/`halfD` are the arena half-extents
-/// it covers, so the shader can map a fragment's XZ into the map's [0,1] range.
+/// grayscale exploration map (fog.zig); `halfW`/`halfD` are the arena half-extents it
+/// covers, so the shader can map a fragment's XZ into [0,1].
 pub const FogParams = struct {
     texId: u32,
     halfW: f32,
@@ -285,7 +276,7 @@ pub const Torch = struct {
     loc_fireIntensity: i32,
     lightVP: rl.Matrix = undefined,
     fireVP: rl.Matrix = undefined,
-    fogTexId: u32 = 0, // GPU id of the fog map to bind on SLOT_FOG; set by applyFogUniforms
+    fogTexId: u32 = 0, // fog-map GPU id to bind on SLOT_FOG; set by applyFogUniforms
     saved_near: @TypeOf(rl.gl.rlGetCullDistanceNear()) = 0,
     saved_far: @TypeOf(rl.gl.rlGetCullDistanceFar()) = 0,
 
@@ -295,7 +286,7 @@ pub const Torch = struct {
         const depthShader = try rl.loadShaderFromMemory(depthVS, depthFS);
         const scene = try rl.loadShaderFromMemory(sceneVS, sceneFS);
 
-        // Constant uniforms, exactly as the demo sets them.
+        // Constant uniforms.
         const lc = [4]f32{ 1.0, 0.95, 0.85, 1.0 };
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "lightColor"), &lc, .vec4);
         const amb = [4]f32{ 0.6, 0.6, 0.7, 1.0 };
@@ -322,8 +313,8 @@ pub const Torch = struct {
             .loc_fireColor = rl.getShaderLocation(scene, "fireColor"),
             .loc_fireRadius = rl.getShaderLocation(scene, "fireRadius"),
             .loc_fireIntensity = rl.getShaderLocation(scene, "fireIntensity"),
-            // Seed both light matrices to identity: applyFireUniforms uploads fireVP
-            // every frame, including before the first fireball sets it in a depth pass.
+            // Seed both matrices to identity: applyFireUniforms uploads fireVP every
+            // frame, including before the first fireball sets it in a depth pass.
             .lightVP = rl.math.matrixIdentity(),
             .fireVP = rl.math.matrixIdentity(),
         };
@@ -336,12 +327,10 @@ pub const Torch = struct {
         rl.unloadRenderTexture(self.fireMap);
     }
 
-    // The shadow camera: at the torch, looking straight down at the ground under it,
-    // Shared by the torch and the fireball: an overhead light looking straight down,
-    // its cone FOV sized to just cover `radius` on the LOCAL ground plane (groundY)
-    // — sizing against absolute y=0 would shrink the covered disc whenever the
-    // light stands on raised terrain. `up` must not be parallel to the view
-    // direction or MatrixLookAt goes NaN.
+    // Shadow camera shared by torch and fireball: an overhead light looking straight
+    // down, cone FOV sized to just cover `radius` on the LOCAL ground plane (groundY)
+    // — sizing against absolute y=0 would shrink the disc on raised terrain. `up` must
+    // not be parallel to the view direction or MatrixLookAt goes NaN.
     fn overheadCamera(pos: rl.Vector3, radius: f32, groundY: f32) rl.Camera3D {
         const coverTarget = radius * SHADOW_COVER_MARGIN;
         const height = @max(pos.y - groundY, 0.5);
@@ -355,10 +344,9 @@ pub const Torch = struct {
         };
     }
 
-    // Shared depth-pass scaffold: save the clip planes, render into `map` from `cam`,
-    // capture the light view-projection into `vpOut`, and enter the depth shader.
-    // Draw the casters, then endDepthPass. The torch and fireball passes are this
-    // with different target maps and VP fields.
+    // Shared depth-pass scaffold: save clip planes, render into `map` from `cam`,
+    // capture the light view-projection into `vpOut`, enter the depth shader. Caller
+    // draws casters, then endDepthPass. Torch/fireball passes differ only in map + VP.
     fn beginDepthPass(self: *Torch, map: rl.RenderTexture2D, vpOut: *rl.Matrix, cam: rl.Camera3D) void {
         self.saved_near = rl.gl.rlGetCullDistanceNear();
         self.saved_far = rl.gl.rlGetCullDistanceFar();
@@ -377,7 +365,7 @@ pub const Torch = struct {
         rl.gl.rlSetClipPlanes(self.saved_near, self.saved_far);
     }
 
-    // Torch depth pass: call this, draw the casters, then endShadowPass().
+    // Torch depth pass: call this, draw casters, then endShadowPass().
     pub fn beginShadowPass(self: *Torch, lp: LightParams) void {
         self.beginDepthPass(self.shadowMap, &self.lightVP, overheadCamera(lp.pos, lp.radius, lp.groundRef));
     }
@@ -386,8 +374,8 @@ pub const Torch = struct {
         self.endDepthPass();
     }
 
-    // Fireball depth pass: only worth running when a fireball is live (fp.intensity>0),
-    // into the smaller fireMap from the fireball's overhead camera.
+    // Fireball depth pass: only run when a fireball is live (fp.intensity>0), into the
+    // smaller fireMap from the fireball's overhead camera.
     pub fn beginFireShadowPass(self: *Torch, fp: FireParams) void {
         self.beginDepthPass(self.fireMap, &self.fireVP, overheadCamera(fp.pos, fp.radius, fp.groundRef));
     }
@@ -396,7 +384,7 @@ pub const Torch = struct {
         self.endDepthPass();
     }
 
-    // Main pass: call after beginDrawing()+clear and BEFORE beginMode3D(cam).
+    // Main-pass uniforms: call after beginDrawing()+clear and BEFORE beginMode3D(cam).
     pub fn applyUniforms(self: *Torch, lp: LightParams) void {
         const p = [3]f32{ lp.pos.x, lp.pos.y, lp.pos.z };
         rl.setShaderValue(self.scene, self.loc_lightPos, &p, .vec3);
@@ -405,12 +393,12 @@ pub const Torch = struct {
         rl.setShaderValueMatrix(self.scene, self.loc_lightVP, self.lightVP);
     }
 
-    // Fireball light uniforms. Pass intensity 0 (any pos/radius/color) when no
-    // fireball is live; the scene shader then skips the whole fireball term.
+    // Fireball light uniforms. Pass intensity 0 when no fireball is live; the shader
+    // then skips the whole fireball term.
     pub fn applyFireUniforms(self: *Torch, fp: FireParams) void {
-        // The shader skips the whole fireball term when intensity is 0, so on the
-        // common no-fireball frame only intensity matters — uploading pos/color/
-        // radius/VP would be four wasted setShaderValue calls the shader ignores.
+        // Shader skips the fireball term at intensity 0, so on the common no-fireball
+        // frame only intensity matters — uploading pos/color/radius/VP would be four
+        // wasted setShaderValue calls.
         const i = fp.intensity;
         rl.setShaderValue(self.scene, self.loc_fireIntensity, &i, .float);
         if (i <= 0) return;
@@ -423,23 +411,23 @@ pub const Torch = struct {
         rl.setShaderValueMatrix(self.scene, self.loc_fireVP, self.fireVP);
     }
 
-    // Per-area torch personality: each area re-tints the light itself (a touch warmer,
-    // paler, sicklier...) so the SAME torch pipeline gives every floor its own night.
-    // Called once per area transition, not per frame.
+    // Per-area torch personality: re-tint the light per area (warmer, paler, sicklier)
+    // so one pipeline gives every floor its own night. Once per area transition, not
+    // per frame.
     pub fn setLightColor(self: *Torch, rgb: [3]f32) void {
         const lc = [4]f32{ rgb[0], rgb[1], rgb[2], 1.0 };
         rl.setShaderValue(self.scene, rl.getShaderLocation(self.scene, "lightColor"), &lc, .vec4);
     }
 
-    // Fog-of-war uniforms. Stash the map's GPU id for beginScene to bind on slot 12,
-    // and upload the arena half-extent so the shader can map fragments into the map.
+    // Fog-of-war uniforms. Stash the map's GPU id for beginScene to bind on SLOT_FOG,
+    // and upload the arena half-extents so the shader can map fragments into the map.
     pub fn applyFogUniforms(self: *Torch, fog: FogParams) void {
         self.fogTexId = fog.texId;
         const h = [2]f32{ fog.halfW, fog.halfD };
         rl.setShaderValue(self.scene, self.loc_fogHalf, &h, .vec2);
     }
 
-    // Wrap the lit geometry between beginScene()/endScene(), inside beginMode3D(cam).
+    // Wrap lit geometry between beginScene()/endScene(), inside beginMode3D(cam).
     pub fn beginScene(self: *Torch) void {
         rl.beginShaderMode(self.scene);
         rl.gl.rlActiveTextureSlot(SLOT_SHADOW);

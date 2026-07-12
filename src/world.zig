@@ -1,14 +1,13 @@
 ﻿const std = @import("std");
 const rl = @import("raylib");
 const mathx = @import("mathx.zig");
-const monster = @import("monster.zig");
 
 const v3 = mathx.v3;
 const rgba = mathx.rgba;
 const ground = mathx.ground;
 const dist2XZ = mathx.dist2XZ;
 
-// Obstacle is a blocking piece of scenery. Collision is circular in the XZ plane.
+// Blocking scenery; collision is circular in the XZ plane.
 pub const ObstacleKind = enum(u8) { rock, tree, gravestone };
 
 pub const Obstacle = struct {
@@ -19,14 +18,11 @@ pub const Obstacle = struct {
     Tint: rl.Color = rgba(255, 255, 255, 255),
 };
 
-// Scenery is bounded (a few dozen per area), so the world owns a fixed array â€”
-// no allocator, no per-area free. Well above the max any area generates.
+// Bounded scenery, so a fixed array (no allocator). Above any area's max.
 pub const MAX_OBSTACLES = 160;
 
-// Decor is non-blocking ground dressing (pebbles, grass tufts, mushrooms, old
-// bones): no collision, no shadows worth speaking of â€” just scale cues so the floor
-// between obstacles isn't a featureless plane. Baked into the scene mesh with the
-// obstacles.
+// Decor is non-blocking ground dressing (pebbles/tufts/shrooms/bones): scale cues
+// only, no collision. Baked into the scene mesh with the obstacles.
 pub const DecorKind = enum(u8) { pebble, tuft, shroom, bone };
 
 pub const Decor = struct {
@@ -38,15 +34,14 @@ pub const Decor = struct {
 
 pub const MAX_DECOR = 512;
 
-// TERRAIN â€” prototype "ledge" verticality. The world stays a SINGLE-VALUED
-// heightfield (one walkable height per XZ point, nothing walkable underneath
-// anything), which is exactly the constraint that keeps the overhead shadow rig
-// and the planar fog grid working. A Ledge is a raised axis-aligned platform; a
-// Ramp is a sloped rectangle joining the floor to a ledge edge.
+// TERRAIN — "ledge" verticality. World stays a SINGLE-VALUED heightfield (one
+// walkable height per XZ, nothing walkable underneath) — the constraint that keeps
+// the overhead shadow rig and planar fog grid valid. Ledge = raised AABB platform;
+// Ramp = sloped rect joining floor to a ledge edge.
 pub const STEP_MAX = 0.6; // tallest height difference feet can walk over
 
-// Point-in-AABB in the XZ plane — the ledge/ramp footprint test that groundY,
-// onFeature, picking, and the editor's erase/hover/context all share.
+// Point-in-AABB in XZ — shared footprint test for groundY, onFeature, picking,
+// and the editor's erase/hover/context.
 pub fn inRect(minX: f32, maxX: f32, minZ: f32, maxZ: f32, x: f32, z: f32) bool {
     return x >= minX and x <= maxX and z >= minZ and z <= maxZ;
 }
@@ -63,8 +58,8 @@ pub const Ledge = struct {
     }
 };
 
-// Which way a ramp's slope climbs: height is 0 at the opposite edge and h here.
-// Named (not an anonymous field enum) so the map format can round-trip it by tag.
+// Which way a ramp climbs: h at this edge, 0 at the opposite. Named (not anonymous)
+// so the map format round-trips it by tag.
 pub const RampRise = enum(u8) { xpos, xneg, zpos, zneg };
 
 pub const Ramp = struct {
@@ -79,10 +74,9 @@ pub const Ramp = struct {
         return inRect(r.minX, r.maxX, r.minZ, r.maxZ, x, z);
     }
 
-    // The ramp's top surface as y = kx*x + kz*z + c (it's a plane).
-    // A degenerate (zero-extent) rect on the rise axis would divide by zero and
-    // spread inf/NaN through groundY and picking — the editor enforces a min span,
-    // but a hand-edited map can't, so a collapsed ramp reads as a flat shelf at h.
+    // Ramp top surface as the plane y = kx*x + kz*z + c. A zero-extent rect on the
+    // rise axis would divide by zero (inf/NaN through groundY/picking), so a
+    // collapsed ramp falls back to a flat shelf at h.
     pub fn planeCoeffs(r: Ramp) [3]f32 {
         const dx = r.maxX - r.minX;
         const dz = r.maxZ - r.minZ;
@@ -93,12 +87,19 @@ pub const Ramp = struct {
             .zneg => if (dz > 1e-4) .{ 0, -r.h / dz, r.h * r.maxZ / dz } else .{ 0, 0, r.h },
         };
     }
+
+    // Height of the ramp's top surface at (x,z) — the plane eval `k·(x,z)+c`. The one
+    // source for the slope so groundY and the mesh bake can't drift from each other.
+    pub fn heightAt(r: Ramp, x: f32, z: f32) f32 {
+        const k = r.planeCoeffs();
+        return k[0] * x + k[1] * z + k[2];
+    }
 };
 
 pub const MAX_LEDGES = 4;
 pub const MAX_RAMPS = 4;
 
-// World holds the static level: extents, scenery, and the exit portal.
+// Static level: extents, scenery, and the exit portal.
 pub const World = struct {
     HalfW: f32 = 0, // arena spans -HalfW..HalfW on X
     HalfD: f32 = 0, // ...and -HalfD..HalfD on Z (rectangular arenas welcome)
@@ -132,14 +133,11 @@ pub const World = struct {
         return self.ramps[0..self.ramp_count];
     }
 
-    /// Walkable ground height at an XZ point. Ramps win over ledges (a ramp is cut
-    /// against a ledge edge), everything else is the flat floor at 0.
+    /// Walkable ground height at XZ. Ramps win over ledges (a ramp is cut against a
+    /// ledge edge); everything else is the flat floor at 0.
     pub fn groundY(self: *const World, x: f32, z: f32) f32 {
         for (self.rmp()) |r| {
-            if (r.contains(x, z)) {
-                const k = r.planeCoeffs();
-                return k[0] * x + k[1] * z + k[2];
-            }
+            if (r.contains(x, z)) return r.heightAt(x, z);
         }
         for (self.led()) |l| {
             if (l.contains(x, z)) return l.h;
@@ -152,8 +150,7 @@ pub const World = struct {
         return v3(p.x, self.groundY(p.x, p.z), p.z);
     }
 
-    /// Whether an XZ point lies inside any ledge or ramp footprint (used to keep
-    /// worldgen scatter off the terrain features).
+    /// Whether XZ lies inside any ledge/ramp footprint (keeps scatter off features).
     pub fn onFeature(self: *const World, x: f32, z: f32) bool {
         for (self.rmp()) |r| {
             if (r.contains(x, z)) return true;
@@ -174,15 +171,15 @@ pub const World = struct {
         return false;
     }
 
-    // A step is passable when it's clear of scenery AND the ground doesn't rise or
-    // drop more than feet can manage â€” cliff faces are walls, ramps are gradual.
+    // Passable when clear of scenery AND the height change is within STEP_MAX —
+    // cliff faces are walls, ramps are gradual.
     fn passable(self: *const World, p: rl.Vector3, radius: f32, fromY: f32) bool {
         if (self.blocked(p, radius)) return false;
         return @abs(self.groundY(p.x, p.z) - fromY) <= STEP_MAX;
     }
 
-    /// Move from pos by delta, sliding along obstacles (full, then X-only, then
-    /// Z-only). The returned position carries the correct ground height in y.
+    /// Move by delta, sliding along obstacles (full, then X-only, then Z-only). The
+    /// result carries the correct ground height in y.
     pub fn moveWithCollision(self: *const World, pos: rl.Vector3, delta: rl.Vector3, radius: f32) rl.Vector3 {
         const fromY = self.groundY(pos.x, pos.z);
         const tryPos = v3(pos.x + delta.x, 0, pos.z + delta.z);
@@ -194,9 +191,9 @@ pub const World = struct {
         return self.snapY(pos);
     }
 
-    /// Whether a projectile at p struck scenery tall enough to block it (a shot
-    /// flying above an obstacle clears it), the arena edge, or terrain (cliff
-    /// faces are cover: a bolt below a ledge top splats against its side).
+    /// Whether a projectile at p hit blocking scenery (a shot above an obstacle
+    /// clears it), the arena edge, or terrain (a bolt below a ledge top splats on
+    /// its side — cliff faces are cover).
     pub fn rayHitsObstacle(self: *const World, p: rl.Vector3, radius: f32) bool {
         if (@abs(p.x) > self.HalfW or @abs(p.z) > self.HalfD) return true;
         if (self.groundY(p.x, p.z) > p.y) return true;
@@ -209,10 +206,9 @@ pub const World = struct {
         return false;
     }
 
-    /// Terrain-aware mouse picking: intersect the ray with the floor plane, every
-    /// ledge top, and every ramp plane; return the NEAREST hit that actually lies
-    /// on that surface (so a click on a rampart lands on the rampart, not on the
-    /// floor plane hidden beneath it).
+    /// Terrain-aware mouse picking: intersect the ray with floor, every ledge top,
+    /// and every ramp plane; return the NEAREST hit that lies on its surface (a
+    /// click on a rampart lands on the rampart, not the floor beneath it).
     pub fn pickGround(self: *const World, ray: rl.Ray) ?rl.Vector3 {
         var best: ?rl.Vector3 = null;
         var bestT: f32 = std.math.floatMax(f32);
@@ -243,7 +239,7 @@ pub const World = struct {
     }
 };
 
-// Intersect a ray with the plane y = kx*x + kz*z + c (horizontal when kx=kz=0).
+// Ray vs. plane y = kx*x + kz*z + c (horizontal when kx=kz=0).
 fn rayAtPlane(ray: rl.Ray, kx: f32, kz: f32, c: f32) ?struct { p: rl.Vector3, t: f32 } {
     const denom = ray.direction.y - kx * ray.direction.x - kz * ray.direction.z;
     if (@abs(denom) < 1e-6) return null;
@@ -254,7 +250,5 @@ fn rayAtPlane(ray: rl.Ray, kx: f32, kz: f32, c: f32) ?struct { p: rl.Vector3, t:
     return .{ .p = v3(x, kx * x + kz * z + c, z), .t = t };
 }
 
-// The world is AUTHORED: areas come from maps/*.map files (map.zig) - the old
-// procgen (areaDef table, buildWorld scatter passes) was frozen into the starter
-// maps by a one-shot exporter and then removed. map.toWorld() is the only
-// constructor of a World now.
+// Worlds are AUTHORED: areas come from maps/*.map (map.zig); procgen was exported
+// into the starter maps once and removed. map.toWorld() is the only World constructor.

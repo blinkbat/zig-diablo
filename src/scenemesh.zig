@@ -10,18 +10,16 @@ const sinf = mathx.sinf;
 const cosf = mathx.cosf;
 
 // SCENE MESH — the arena's static obstacles (boulders, gravestones, trees) baked
-// into ONE GPU mesh at area load, instead of regenerating ~hundreds of thousands of
-// primitive vertices on the CPU every frame (twice: shadow pass + main pass). That
-// per-frame regen was the FPS bottleneck. Once uploaded, drawing is a single GPU call
-// per pass with zero CPU geometry work.
+// into ONE GPU mesh at area load, instead of regenerating hundreds of thousands of
+// vertices on the CPU every frame (shadow + main pass) — that regen was the FPS
+// bottleneck. Once uploaded, each pass is a single GPU call.
 //
-// Lighting is unchanged: the mesh carries per-vertex colors (the obstacle tints) and
-// normals, exactly what torchlight's scene shader reads (fragColor + fragNormal).
-// Drawn with backface culling disabled so a winding mistake can't hide a face; the
-// normals (which drive shading) are computed outward explicitly.
+// Mesh carries per-vertex tints + outward normals, exactly what torchlight's scene
+// shader reads (fragColor + fragNormal). Drawn backface-culling-off so a winding
+// mistake can't hide a face.
 
-// raylib UnloadMesh frees these arrays with libc free(); the c_allocator is malloc,
-// so ownership transfers cleanly to raylib after uploadMesh.
+// c_allocator is malloc, matching raylib's libc free() in UnloadMesh, so ownership
+// transfers cleanly after uploadMesh.
 const alloc = std.heap.c_allocator;
 
 const Builder = struct {
@@ -71,7 +69,7 @@ const Builder = struct {
                 const n01 = spherePt(lat0, lon1);
                 const n10 = spherePt(lat1, lon0);
                 const n11 = spherePt(lat1, lon1);
-                // Smooth normals = radial direction; positions = center + n*radius.
+                // Smooth normals = radial dir; positions = center + n*radius.
                 self.vert(scaleAdd(center, n00, radius), n00, col);
                 self.vert(scaleAdd(center, n10, radius), n10, col);
                 self.vert(scaleAdd(center, n11, radius), n11, col);
@@ -103,7 +101,7 @@ const Builder = struct {
     // Tapered cylinder wall (no caps) from `a` (radius ra) to `b` (radius rb).
     fn addCylinder(self: *Builder, a: rl.Vector3, b: rl.Vector3, ra: f32, rb: f32, sides: i32, col: rl.Color) void {
         const axis = norm(v3(b.x - a.x, b.y - a.y, b.z - a.z));
-        // An arbitrary vector not parallel to axis, to build a perpendicular basis.
+        // A vector not parallel to axis, to build a perpendicular basis.
         const seed = if (@abs(axis.y) < 0.99) v3(0, 1, 0) else v3(1, 0, 0);
         const u = norm(cross(axis, seed));
         const w = norm(cross(axis, u));
@@ -148,21 +146,20 @@ fn cross(a: rl.Vector3, b: rl.Vector3) rl.Vector3 {
 
 // ---- Obstacle shapes (same geometry as the immediate-mode versions, baked once) ----
 
-// Every obstacle/decor bake offsets its geometry by Pos.y — props authored on a
-// rampart bake at rampart height (map.toWorld snaps Pos.y to the terrain).
+// Every bake offsets geometry by Pos.y — props on a rampart bake at rampart height
+// (map.toWorld snaps Pos.y to the terrain).
 
 fn bakeBoulder(b: *Builder, o: world.Obstacle) void {
     const gy = o.Pos.y;
     b.addSphere(v3(o.Pos.x, gy + o.Height * 0.35, o.Pos.z), o.Radius, 8, 8, o.Tint);
     b.addSphere(v3(o.Pos.x + o.Radius * 0.4, gy + o.Height * 0.22, o.Pos.z + o.Radius * 0.3), o.Radius * 0.6, 8, 8, lerpColor(o.Tint, rl.Color.black, 0.15));
-    // A shed chip resting against the parent stone: boulders come in families.
+    // A shed chip against the parent stone: boulders come in families.
     b.addSphere(v3(o.Pos.x - o.Radius * 0.85, gy + o.Radius * 0.16, o.Pos.z - o.Radius * 0.45), o.Radius * 0.28, 6, 6, lerpColor(o.Tint, rl.Color.white, 0.08));
 }
 
 fn bakeGravestone(b: *Builder, o: world.Obstacle) void {
-    // Slab + a rounded RIDGE along its top (a horizontal cylinder as wide as the
-    // slab, matching its thickness) — the old full sphere ballooned out past the
-    // slab's faces and read as a stone lollipop. Plus a settled plinth at the foot.
+    // Slab + a rounded top RIDGE (horizontal cylinder matching slab width/thickness;
+    // a full sphere ballooned past the faces into a lollipop) + a foot plinth.
     const gy = o.Pos.y;
     const dark = lerpColor(o.Tint, rl.Color.black, 0.3);
     b.addCube(v3(o.Pos.x, gy + o.Height / 2, o.Pos.z), v3(o.Radius * 2, o.Height, 0.35), o.Tint);
@@ -179,7 +176,7 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
     const gy = o.Pos.y;
     const segs_n = 4;
     const lean = v3(0.12, 0, 0.05);
-    // Root flares gripping the ground: old trees don't rise out of a clean socket.
+    // Root flares gripping the ground: old trees don't rise from a clean socket.
     const rootCol = lerpColor(bark, rl.Color.black, 0.25);
     var r: i32 = 0;
     while (r < 4) : (r += 1) {
@@ -210,9 +207,8 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
         b.addCylinder(crown, tip, 0.16, 0.05, 5, branchCol);
     }
 
-    // Deep forest green. NOTE: the scene shader's output gamma (pow 1/2.2) lifts
-    // dark albedos hard, so the canopy must start near-black to read as rich green
-    // under the torch instead of washed-out sage.
+    // Deep forest green. The scene shader's output gamma (pow 1/2.2) lifts dark
+    // albedos hard, so the canopy starts near-black to read as rich green, not sage.
     const canopy = lerpColor(o.Tint, rgba(12, 24, 14, 255), 0.9);
     const cr = o.Radius * 1.15;
     b.addSphere(v3(crown.x, crown.y + 0.5, crown.z), cr, 8, 8, canopy);
@@ -228,15 +224,14 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
 // ---- Ground decor (non-blocking dressing; see world.Decor) ----
 
 fn bakePebble(b: *Builder, d: world.Decor) void {
-    // Sunk to ~40% so it reads as half-buried in the dirt.
+    // Sunk to ~40% so it reads as half-buried.
     b.addSphere(v3(d.Pos.x, d.Pos.y + d.Size * 0.4, d.Pos.z), d.Size, 6, 6, d.Tint);
 }
 
 fn bakeTuft(b: *Builder, d: world.Decor) void {
-    // A clump of grass blades arcing outward from a common root: each blade is TWO
-    // segments (stiff below, drooping above) so it curves like grass instead of
-    // spiking like a caltrop, dark at the root and sun-bleached toward the tip.
-    // Deterministic per-tuft variation comes from its own position (no bake-time rng).
+    // Grass blades arcing from a common root: each is TWO segments (stiff below,
+    // drooping above) so it curves like grass, dark at root, bleached at tip.
+    // Per-tuft variation is deterministic from position (no bake-time rng).
     const seed = d.Pos.x * 3.7 + d.Pos.z * 5.3;
     var i: i32 = 0;
     while (i < 5) : (i += 1) {
@@ -263,8 +258,8 @@ fn bakeShroom(b: *Builder, d: world.Decor) void {
 }
 
 fn bakeBone(b: *Builder, d: world.Decor) void {
-    // A scatter of old bones: two crossed shafts, each with knobbed ends, lying
-    // just proud of the dirt. Deterministic per-scatter variation from position.
+    // Two crossed knob-ended shafts lying just proud of the dirt. Per-scatter
+    // variation is deterministic from position.
     const seed = d.Pos.x * 7.1 + d.Pos.z * 3.3;
     var i: i32 = 0;
     while (i < 2) : (i += 1) {
@@ -286,11 +281,11 @@ fn bakeLedge(b: *Builder, w: *const world.World, l: world.Ledge) void {
     const cz = (l.minZ + l.maxZ) / 2;
     const sx = l.maxX - l.minX;
     const sz = l.maxZ - l.minZ;
-    // Same masonry profile as the arena walls: body, paler overhanging capstone
-    // course (the walkable pavement), darker plinth at the foot.
+    // Arena-wall masonry profile: body, paler overhanging capstone (the walkable
+    // pavement), darker foot plinth.
     const body = w.Accent;
     // Barely paler than the floor: the walkway must read as GROUND you fight on
-    // (the output gamma blows bright albedos out under the torch).
+    // (output gamma blows bright albedos out under the torch).
     const cap = lerpColor(w.Ground, rgba(126, 120, 110, 255), 0.22);
     const plinth = lerpColor(body, rl.Color.black, 0.35);
     b.addCube(v3(cx, l.h / 2, cz), v3(sx, l.h, sz), body);
@@ -299,23 +294,23 @@ fn bakeLedge(b: *Builder, w: *const world.World, l: world.Ledge) void {
 }
 
 fn bakeRamp(b: *Builder, w: *const world.World, r: world.Ramp) void {
-    const k = r.planeCoeffs();
+    const k = r.planeCoeffs(); // gradient for the top-face normal below
     const worn = lerpColor(w.Accent, rgba(150, 145, 132, 255), 0.3);
     const side = lerpColor(w.Accent, rl.Color.black, 0.2);
-    // The rect's corners, counter-clockwise seen from above, each at its true
-    // plane height (the ramp top is the plane y = kx*x + kz*z + c).
+    // Rect corners, CCW from above, each lifted to its true ramp-top height (via the
+    // shared Ramp.heightAt, so the mesh sits exactly on the walkable surface).
     const cs = [_][2]f32{
         .{ r.minX, r.minZ }, .{ r.maxX, r.minZ },
         .{ r.maxX, r.maxZ }, .{ r.minX, r.maxZ },
     };
     var top: [4]rl.Vector3 = undefined;
     for (cs, 0..) |c, i| {
-        top[i] = v3(c[0], k[0] * c[0] + k[1] * c[1] + k[2] + 0.02, c[1]);
+        top[i] = v3(c[0], r.heightAt(c[0], c[1]) + 0.02, c[1]);
     }
-    // Top surface: one planar quad whose normal is the plane gradient.
+    // Top surface: one planar quad, normal = plane gradient.
     b.quad(top[0], top[3], top[2], top[1], norm(v3(-k[0], 1, -k[1])), worn);
-    // Skirt walls down to the floor on all four sides (zero-height edges emit
-    // degenerate triangles, which cost nothing and keep this loop uniform).
+    // Skirt walls to the floor on all four sides (zero-height edges emit harmless
+    // degenerate triangles, keeping the loop uniform).
     const outN = [_]rl.Vector3{ v3(0, 0, -1), v3(1, 0, 0), v3(0, 0, 1), v3(-1, 0, 0) };
     for (0..4) |i| {
         const j = (i + 1) % 4;
@@ -325,10 +320,9 @@ fn bakeRamp(b: *Builder, w: *const world.World, r: world.Ramp) void {
     }
 }
 
-// The baked mesh plus the CPU arrays backing it. After uploadMesh copies the data to
-// GPU buffers we detach the CPU pointers from the mesh (raylib's unloadMesh frees with
-// libc free, which would corrupt the heap on our Zig-allocated memory) and free them
-// ourselves in deinit/rebuild.
+// Baked mesh plus its backing CPU arrays. After uploadMesh copies to GPU buffers we
+// detach the mesh's CPU pointers (raylib's unloadMesh would libc-free them) and free
+// them ourselves in deinit/rebuild.
 const Baked = struct {
     mesh: rl.Mesh,
     pos: []f32,
@@ -369,7 +363,7 @@ fn bakeMesh(w: *const world.World) Baked {
     mesh.texcoords = uv.ptr;
     mesh.colors = col.ptr;
     rl.uploadMesh(&mesh, false);
-    // GPU owns a copy now; detach CPU pointers so unloadMesh only frees GPU buffers.
+    // GPU owns a copy; detach CPU pointers so unloadMesh only frees GPU buffers.
     mesh.vertices = null;
     mesh.normals = null;
     mesh.texcoords = null;
@@ -396,8 +390,8 @@ pub const SceneMesh = struct {
         return .{ .mesh = baked.mesh, .sceneMat = sceneMat, .depthMat = depthMat, .pos = baked.pos, .nrm = baked.nrm, .uv = baked.uv, .col = baked.col };
     }
 
-    // Swap in a new area's obstacle mesh, freeing the old one but KEEPING the shared
-    // materials — so per-area transitions don't leak a default material each time.
+    // Swap in a new area's mesh, freeing the old but KEEPING the shared materials
+    // so per-area transitions don't leak a default material each time.
     pub fn rebuild(self: *SceneMesh, w: *const world.World) void {
         self.freeMesh();
         const baked = bakeMesh(w);
@@ -409,7 +403,7 @@ pub const SceneMesh = struct {
     }
 
     fn freeMesh(self: *SceneMesh) void {
-        rl.unloadMesh(self.mesh); // frees GPU VAO/VBO only (CPU pointers were nulled)
+        rl.unloadMesh(self.mesh); // GPU VAO/VBO only (CPU pointers were nulled)
         alloc.free(self.pos);
         alloc.free(self.nrm);
         alloc.free(self.uv);
@@ -419,11 +413,11 @@ pub const SceneMesh = struct {
     pub fn deinit(self: *SceneMesh) void {
         self.freeMesh();
         // Materials only wrap torchlight's shaders (freed by the Torch); their tiny
-        // default-map array is left to the OS at exit rather than risk a shader double-free.
+        // default-map array is left to the OS at exit to avoid a shader double-free.
     }
 
     // Draw with backface culling off (winding-safe). Caller sets up the pass + shadow
-    // map binding; identity transform since positions are already in world space.
+    // map; identity transform since positions are already world-space.
     pub fn drawScene(self: *const SceneMesh) void {
         if (self.mesh.vertexCount == 0) return; // an obstacle-less area bakes nothing
         rl.gl.rlDisableBackfaceCulling();
