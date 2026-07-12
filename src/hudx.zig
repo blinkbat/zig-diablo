@@ -178,14 +178,12 @@ pub fn draw(g: *Game) void {
     }
 }
 
-// Foe owning the top-center plate: cursor target first, else attack target, else an
-// aggro'd boss in vision — so a boss fight keeps its bar up as the cursor wanders.
+// Foe owning the top-center plate: the SELECTED target (always-on nearest / sticky pick)
+// owns it, so the HUD always names who you'd hit; an aggro'd boss in vision is the
+// fallback so a boss fight keeps its bar up even between selections.
 fn pickEnemyPlate(g: *Game) ?*const monster.Monster {
-    if (g.monsterByID(g.hoverMonster)) |m| {
-        if (m.alive() and g.inVision(m.Pos)) return m;
-    }
     if (g.monsterByID(g.p.targetMonster)) |m| {
-        if (m.alive() and g.inVision(m.Pos)) return m;
+        if (g.targetable(m)) return m;
     }
     for (g.liveMonsters()) |*m| {
         if (m.boss and m.alive() and m.aggro and g.inVision(m.Pos)) return m;
@@ -205,9 +203,9 @@ fn drawEnemyPlate(g: *Game) void {
     const cx = @divTrunc(W, 2);
     const bx = cx - @divTrunc(bw, 2);
     const by = 16 + size + 6;
-    // Heavy-stun meter: a thin channel under the HP bar, only for kinds that can be
-    // heavy-stunned and only once there's something to show.
-    const showStun = m.heavyStunMax > 0 and (m.stunFill > 0 or m.stunned());
+    // Heavy-stun meter: a thin channel under the HP bar, shown for every kind that can
+    // be heavy-stunned — ALWAYS, even at empty, so the player can read stun progress.
+    const showStun = m.heavyStunMax > 0;
     const sbh: i32 = if (boss) 6 else 4;
     const stunPad: i32 = if (showStun) sbh + 3 else 0;
     // Soft backing behind name + bar(s) so they read over any scene.

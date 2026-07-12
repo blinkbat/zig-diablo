@@ -251,6 +251,11 @@ fn meleeReach(atkRange: f32, targetRadius: f32) f32 {
 // threat beam, and lit eyes each carry their own hostile red at their draw sites).
 const THREAT_TINT = rgba(255, 80, 40, 255);
 
+// Cool bright wash the SELECTED target's body flushes toward, so it reads as "this is who
+// I'd hit" at a glance. A base tint (state tints like THREAT still override it), paired
+// with the feet reticle in drawMonstersFX and the HUD plate.
+const TARGET_TINT = rgba(180, 235, 255, 255);
+
 // How far ahead of the zombie's radius its overhead slam lands. Shared by the dust-kick
 // (resolveMonsterAttack) and the drawn fists (drawMonsterBody).
 const ZOMBIE_SLAM_FWD = 0.7;
@@ -509,6 +514,13 @@ pub const Game = struct {
         return dist2XZ(p, g.p.Pos) <= CULL * CULL; // squared: pure threshold, called per monster/frame
     }
 
+    // The one "can I select/name this foe" rule — alive AND inside the lit disc. Every
+    // targeting scan (nearest default, hover, right-stick, plate) funnels through this so
+    // the rule lives once (add an LOS/range clause here and all of them follow).
+    pub fn targetable(g: *const Game, m: *const monster.Monster) bool {
+        return m.alive() and g.inVision(m.Pos);
+    }
+
     pub fn objectCount(g: *Game) usize {
         return g.monsterCount + g.projs.count + g.lootList.items.len;
     }
@@ -544,6 +556,7 @@ fn updatePlaying(g: *Game, dt_in: f32) void {
     updateAim(g);
     handleInput(g);
     handleGamepad(g);
+    updateTargeting(g); // after manual picks (hover/stick/click); fills the nearest default
     updateTimers(g, dt);
 
     updatePlayerMovement(g, dt);
@@ -620,7 +633,7 @@ fn handleInput(g: *Game) void {
     if (kbLen > 0) {
         g.kbMove = v3(kb.x / kbLen, 0, kb.z / kbLen);
         p.hasMoveTarget = false;
-        p.targetMonster = -1;
+        p.chaseMonster = -1; // manual movement cancels the chase (still faces the selection)
     } else {
         g.kbMove = mathx.zero3;
     }
@@ -635,14 +648,15 @@ fn handleInput(g: *Game) void {
     const mouse = rl.getMousePosition();
     const overHUD = mouse.y > @as(f32, @floatFromInt(rl.getScreenHeight() - hudReserve));
 
-    // Left mouse: walk to point, or chase+attack the hovered monster.
+    // Left mouse: chase+attack the hovered foe, else walk to the point.
     if (rl.isMouseButtonDown(.left) and !overHUD and lenXZ(g.kbMove) == 0 and !p.rolling()) {
         const hm = g.monsterByID(g.hoverMonster);
         if (hm != null and hm.?.alive()) {
-            p.targetMonster = hm.?.id;
+            p.targetMonster = hm.?.id; // click a foe: select AND engage (chase into melee)
+            p.chaseMonster = hm.?.id;
             p.hasMoveTarget = false;
         } else {
-            p.targetMonster = -1;
+            p.chaseMonster = -1; // click the ground: disengage and walk there (selection holds)
             p.moveTarget = g.mouseGround;
             p.hasMoveTarget = true;
         }
@@ -661,7 +675,19 @@ fn castFirebolt(g: *Game) void {
         if (p.Mana < p.spellCost) g.setToast("Not enough mana", .{});
         return;
     }
-    var dir = dirXZ(p.Pos, g.mouseGround);
+    // Fire at the selected target when there is one (you're already facing it, terrain
+    // height and all); otherwise at the cursor / aim point.
+    var aimPt = g.mouseGround;
+    var aimY = g.mouseGround.y + 0.9;
+    if (g.monsterByID(p.targetMonster)) |m| {
+        if (m.alive()) {
+            aimPt = m.Pos;
+            // Hitbox center — deliberately NOT the drawn chest (+MONSTER_TORSO_BASE): the
+            // bolt collides against the body volume, not the sprite.
+            aimY = m.Pos.y + m.Height * 0.5;
+        }
+    }
+    var dir = dirXZ(p.Pos, aimPt);
     if (lenXZ(dir) < 1e-4) dir = p.Facing;
     p.Facing = dir;
     p.Mana -= p.spellCost;
@@ -671,7 +697,7 @@ fn castFirebolt(g: *Game) void {
     var roll = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(8)));
     if (g.rng.float() < p.derived.critChance) roll *= stats.CRIT_MULT;
     const dmg = stats.Damage.one(.fire, roll);
-    g.projs.add(projectile.newFirebolt(p.Pos, dir, dmg, aimYVel(p.Pos.y + projectile.fireboltMuzzleDY, g.mouseGround.y + 0.9, distXZ(p.Pos, g.mouseGround), projectile.fireboltSpeed)));
+    g.projs.add(projectile.newFirebolt(p.Pos, dir, dmg, aimYVel(p.Pos.y + projectile.fireboltMuzzleDY, aimY, distXZ(p.Pos, aimPt), projectile.fireboltSpeed)));
     g.rumble.play(rumble.cast);
 }
 
@@ -715,7 +741,7 @@ fn padAcquireTarget(g: *Game, aimDir: rl.Vector3) ?i32 {
     var bestScore: f32 = -std.math.floatMax(f32);
     const aiming = lenXZ(aimDir) > 0;
     for (g.liveMonsters()) |*m| {
-        if (!m.alive() or !g.inVision(m.Pos)) continue;
+        if (!g.targetable(m)) continue;
         const to = dirXZ(g.p.Pos, m.Pos);
         // Near foes score higher; when aiming, alignment with the stick dominates.
         var score = -distXZ(g.p.Pos, m.Pos);
@@ -738,7 +764,7 @@ fn handleGamepad(g: *Game) void {
     if (lenXZ(mv) > 0) {
         g.kbMove = mv;
         p.hasMoveTarget = false;
-        p.targetMonster = -1;
+        p.chaseMonster = -1; // manual movement cancels the chase (still faces the selection)
     }
 
     // Right stick: aim. Project a ground point ahead of the hero so Firebolt/dodge/hover
@@ -751,14 +777,18 @@ fn handleGamepad(g: *Game) void {
     var scannedAim = false;
     if (aiming) {
         g.mouseGround = v3(p.Pos.x + aimDir.x * AIM_REACH, 0, p.Pos.z + aimDir.z * AIM_REACH);
-        aimTarget = padAcquireTarget(g, aimDir); // highlight who we'd hit
+        aimTarget = padAcquireTarget(g, aimDir); // best-aligned foe under the stick
         scannedAim = true;
+        if (aimTarget) |id| p.targetMonster = id; // sticky manual pick via the right stick
     }
 
-    // X: attack — engage the best foe; auto-attack + chase drive it like a mouse click.
+    // X: engage — commit to chase+melee the selected foe (the stick pick, the nearest
+    // default, or a fresh nearest scan), driving movement like a mouse click on a foe.
     if (input.padAttackDown() and !p.rolling()) {
-        if (if (scannedAim) aimTarget else padAcquireTarget(g, aimDir)) |id| {
-            p.targetMonster = id;
+        const id = if (scannedAim) aimTarget else if (p.targetMonster >= 0) p.targetMonster else padAcquireTarget(g, aimDir);
+        if (id) |tid| {
+            p.targetMonster = tid;
+            p.chaseMonster = tid;
             p.hasMoveTarget = false;
         }
     }
@@ -790,7 +820,7 @@ fn updateAim(g: *Game) void {
     g.hoverMonster = -1;
     var best2: f32 = std.math.floatMax(f32); // squared: a pure threshold pick needs no @sqrt
     for (g.liveMonsters()) |*m| {
-        if (!m.alive() or !g.inVision(m.Pos)) continue; // can't target what darkness hides
+        if (!g.targetable(m)) continue; // can't target what darkness hides
         const d2 = dist2XZ(m.Pos, g.mouseGround);
         const rr = m.Radius + 0.6;
         if (d2 < rr * rr and d2 < best2) {
@@ -798,6 +828,41 @@ fn updateAim(g: *Game) void {
             g.hoverMonster = m.id;
         }
     }
+    // Hovering a foe is a manual, STICKY target pick: it overrides the nearest-default and
+    // holds after the cursor drifts back onto the ground (until the foe dies/leaves sight
+    // or you pick another). It only changes the SELECTION — never engages the chase.
+    if (g.hoverMonster >= 0) g.p.targetMonster = g.hoverMonster;
+}
+
+// Resolve the selected target each frame so you ALWAYS have the nearest foe selected by
+// default. A valid pick (hover/right-stick sticky, or a prior default) is kept; otherwise
+// fall back to the nearest foe in sight. Manual picks are applied earlier (updateAim /
+// handleGamepad); this only validates and fills the default.
+fn updateTargeting(g: *Game) void {
+    const p = &g.p;
+    if (g.monsterByID(p.targetMonster)) |m| {
+        if (g.targetable(m)) return; // current selection still valid
+    }
+    // No valid selection: take the nearest in-sight foe. Only fill the SELECTION default —
+    // never touch the chase here. A fresh default isn't an engage, and the chase may point
+    // at a DIFFERENT, still-valid foe (you clicked A, then hovered B); its lifecycle is
+    // owned by movement/attack (null-clear), killMonster, startRoll, and manual move.
+    p.targetMonster = nearestTargetID(g) orelse -1;
+}
+
+// Nearest live, in-sight monster to the hero, or null if none. Squared distance (no sqrt).
+fn nearestTargetID(g: *Game) ?i32 {
+    var best2: f32 = std.math.floatMax(f32);
+    var bestID: ?i32 = null;
+    for (g.liveMonsters()) |*m| {
+        if (!g.targetable(m)) continue;
+        const d2 = dist2XZ(g.p.Pos, m.Pos);
+        if (d2 < best2) {
+            best2 = d2;
+            bestID = m.id;
+        }
+    }
+    return bestID;
 }
 
 // ---- Player movement + attack ----
@@ -821,20 +886,17 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
     var moving = false;
 
     if (lenXZ(g.kbMove) > 0) {
-        dir = g.kbMove;
+        dir = g.kbMove; // manual strafe — facing is set from the target below, not from dir
         moving = true;
-    } else if (p.targetMonster >= 0) {
-        if (g.monsterByID(p.targetMonster)) |m| {
-            if (m.alive()) {
-                p.Facing = dirXZ(p.Pos, m.Pos);
-                // Stop half a body-radius inside reach so the hero settles into solid
-                // striking range, not hovering at the edge.
-                if (distXZ(p.Pos, m.Pos) > playerReach(p.atkRange, m.Radius) - m.Radius * 0.5) {
-                    dir = p.Facing;
-                    moving = true;
-                }
-            } else p.targetMonster = -1;
-        } else p.targetMonster = -1;
+    } else if (p.chaseMonster >= 0) {
+        // Engaged: close on the committed foe until inside striking range. Stop half a
+        // body-radius inside reach so the hero settles into solid range, not at the edge.
+        if (g.monsterByID(p.chaseMonster)) |m| {
+            if (m.alive() and distXZ(p.Pos, m.Pos) > playerReach(p.atkRange, m.Radius) - m.Radius * 0.5) {
+                dir = dirXZ(p.Pos, m.Pos);
+                moving = true;
+            }
+        } else p.chaseMonster = -1;
     } else if (p.hasMoveTarget) {
         if (distXZ(p.Pos, p.moveTarget) > 0.25) {
             dir = dirXZ(p.Pos, p.moveTarget);
@@ -843,7 +905,6 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
     }
 
     if (moving and lenXZ(dir) > 0) {
-        p.Facing = dir;
         const step = v3(dir.x * p.Speed * dt, 0, dir.z * p.Speed * dt);
         p.Pos = g.w.moveWithCollision(p.Pos, step, playermod.radius);
         p.walkBob += dt * 12;
@@ -866,17 +927,31 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
             }
         }
     }
+
+    // Facing is DECOUPLED from movement: always face the selected target, so the hero
+    // strafes and back-pedals while staying trained on it (full twin-stick facing). With
+    // no target in sight, face the way you're moving.
+    if (g.monsterByID(p.targetMonster)) |m| {
+        if (m.alive()) {
+            const f = dirXZ(p.Pos, m.Pos);
+            if (lenXZ(f) > 0) p.Facing = f; // keep last facing if exactly coincident (dirXZ→0)
+        }
+    } else if (moving and lenXZ(dir) > 0) {
+        p.Facing = dir;
+    }
 }
 
 fn updatePlayerAttack(g: *Game) void {
     const p = &g.p;
-    if (p.rolling() or p.stunned() or p.targetMonster < 0 or p.atkCD > 0) return;
-    const m = g.monsterByID(p.targetMonster) orelse {
-        p.targetMonster = -1;
+    // Melee only swings at the foe you EXPLICITLY engaged (chaseMonster) — a merely
+    // selected/hovered target never triggers an auto-swing.
+    if (p.rolling() or p.stunned() or p.chaseMonster < 0 or p.atkCD > 0) return;
+    const m = g.monsterByID(p.chaseMonster) orelse {
+        p.chaseMonster = -1;
         return;
     };
     if (!m.alive()) {
-        p.targetMonster = -1;
+        p.chaseMonster = -1;
         return;
     }
     if (distXZ(p.Pos, m.Pos) <= playerReach(p.atkRange, m.Radius) and @abs(m.Pos.y - p.Pos.y) < SAME_GROUND_DY) {
@@ -944,7 +1019,10 @@ fn killMonster(g: *Game, m: *Monster) void {
     loot.rollLoot(m, &g.rng, &g.lootList);
     for (g.lootList.items[firstNew..]) |*d| d.Pos = g.w.snapY(d.Pos);
     if (m.boss) g.setToast("{s} has been slain!", .{m.name()});
+    // Drop the slain foe from selection AND the chase; both re-resolve next frame
+    // (selection to the new nearest, the chase stays off until you re-engage).
     if (g.p.targetMonster == m.id) g.p.targetMonster = -1;
+    if (g.p.chaseMonster == m.id) g.p.chaseMonster = -1;
 }
 
 fn onLevelUp(g: *Game) void {
@@ -1127,7 +1205,7 @@ fn dodgeFromBolt(g: *Game, m: *const Monster) ?rl.Vector3 {
         const vz = pr.Vel.z / vlen;
         // Bolt heading vs the direction to the archer: below this it's aimed elsewhere
         // or already sailing past, not worth spending a dodge on.
-        if ((vx * rx + vz * rz) / d < 0.5) continue;
+        if ((vx * rx + vz * rz) / d < monster.skel_dodge_align) continue;
         // Perp of the bolt heading is perpXZ(v) = (v.z, 0, -v.x); pick the side the
         // archer is already offset toward so the strafe increases the miss distance.
         const px = vz;
@@ -1875,7 +1953,7 @@ fn monsterTorsoLean(m: *const Monster) rl.Vector3 {
 // Body + per-kind silhouette. Every appendage is drawn here (not FX) so it exists in
 // BOTH the depth and lit passes: horns and arms cast. Body lifted by terrain height.
 // (pub: the editor draws encounter previews with the same bodies.)
-pub fn drawMonsterBody(m: *const Monster) void {
+pub fn drawMonsterBody(m: *const Monster, highlight: bool) void {
     // Flush the batch NOW, while the matrix stack is clean. rlgl uploads matModel from
     // the CURRENT stack at every flush, and the scene shader derives all lighting from
     // matModel against world-space verts (correct only at identity). A mid-body overflow
@@ -1888,6 +1966,9 @@ pub fn drawMonsterBody(m: *const Monster) void {
     rl.gl.rlTranslatef(0, m.Pos.y, 0);
     const bob = monsterBob(m);
     var col = m.Color;
+    // Selected-target wash goes on FIRST, as a base: the state tints below (hit-flash,
+    // threat flush) still layer over it, so being targeted never hides a wind-up.
+    if (highlight) col = lerpColor(col, TARGET_TINT, 0.4);
     var shrink: f32 = 1;
     if (m.dying) {
         shrink = clampF(m.deathTimer / monster.monster_death_fade, 0.12, 1);
@@ -2138,20 +2219,20 @@ fn drawMonstersCast(ms: []const Monster, lightXZ: rl.Vector3, torchR: f32, fp: t
     for (ms) |*m| {
         if (m.dying) continue;
         if (!bodyVisible(m.Pos, lightXZ, torchR, fp)) continue;
-        drawMonsterBody(m);
+        drawMonsterBody(m, false); // depth pass: color unused, so never highlight here
     }
 }
 
-fn drawMonstersLit(ms: []const Monster, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams) void {
+fn drawMonstersLit(ms: []const Monster, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams, targetID: i32) void {
     for (ms) |*m| {
         if (!bodyVisible(m.Pos, lightXZ, torchR, fp)) continue;
-        drawMonsterBody(m);
+        drawMonsterBody(m, m.id == targetID);
     }
 }
 
 // Emissive pass (no shadow): glowing eyes + the red attack telegraph + boss ring +
-// the hover highlight under the monster the cursor (or pad aim) has picked out.
-fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, torchR: f32, fp: tl.FireParams, hoverID: i32, t: f32) void {
+// the reticle under the SELECTED target (pairs with the body wash + HUD plate).
+fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, torchR: f32, fp: tl.FireParams, targetID: i32, t: f32) void {
     for (ms) |*m| {
         if (m.dying or !m.alive()) continue;
         if (!bodyVisible(m.Pos, lightXZ, torchR, fp)) continue;
@@ -2159,9 +2240,13 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
         rl.gl.rlPushMatrix();
         defer rl.gl.rlPopMatrix();
         rl.gl.rlTranslatef(0, m.Pos.y, 0);
-        if (m.id == hoverID) {
-            const pulse = 0.12 * sinf(t * 6);
-            rl.drawCircle3D(v3(m.Pos.x, 0.05, m.Pos.z), m.Radius + 0.3 + pulse, v3(1, 0, 0), 90, rgba(255, 245, 220, 210));
+        if (m.id == targetID) {
+            // Bright double reticle at the feet — a crisp, pulsing bracket that reads as
+            // "locked on", distinct from the boss's red ring and any telegraph.
+            const pulse = 0.1 * sinf(t * 5);
+            const tc = TARGET_TINT;
+            rl.drawCircle3D(v3(m.Pos.x, 0.05, m.Pos.z), m.Radius + 0.34 + pulse, v3(1, 0, 0), 90, mathx.withAlpha(tc, 235));
+            rl.drawCircle3D(v3(m.Pos.x, 0.05, m.Pos.z), m.Radius + 0.5 + pulse, v3(1, 0, 0), 90, mathx.withAlpha(tc, 120));
         }
         if (m.boss) {
             rl.drawCircle3D(v3(m.Pos.x, 0.06, m.Pos.z), m.Radius + 0.4, v3(1, 0, 0), 90, rgba(255, 60, 60, 200));
@@ -2667,11 +2752,11 @@ fn drawWorld(g: *Game) void {
     g.sceneMesh.drawScene();
     rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(g.w.HalfW * 2, g.w.HalfD * 2), g.w.Ground);
     drawWalls(&g.w);
-    drawMonstersLit(ms, lightGround, lp.radius, fp);
+    drawMonstersLit(ms, lightGround, lp.radius, fp, g.p.targetMonster);
     if (drawHero) drawHeroBody(&g.p);
     g.torch.endScene();
     if (drawHero) drawHeroFX(&g.p, t);
-    drawMonstersFX(ms, lightGround, g.p.Pos, lp.radius, fp, g.hoverMonster, t);
+    drawMonstersFX(ms, lightGround, g.p.Pos, lp.radius, fp, g.p.targetMonster, t);
     drawGasClouds(g, lightGround, lp.radius, fp, t);
     drawLoot(&g.lootList, lightGround, lp.radius, fp);
     drawProjectiles(&g.projs, t);

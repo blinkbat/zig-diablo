@@ -107,7 +107,13 @@ pub const Player = struct {
     // Movement intent (click-to-move).
     moveTarget: rl.Vector3 = mathx.zero3,
     hasMoveTarget: bool = false,
-    targetMonster: i32 = -1, // monster id, or -1
+    // Targeting. `targetMonster` is the SELECTED foe — always-on nearest by default, or a
+    // sticky manual pick (mouse hover / right-stick). It drives facing, firebolt aim, and
+    // the on-model + HUD indicator, but never moves the hero. `chaseMonster` is the foe you
+    // EXPLICITLY engaged (click / pad X) to chase into melee — the only one the hero walks
+    // toward and auto-attacks. Both are monster ids, or -1.
+    targetMonster: i32 = -1,
+    chaseMonster: i32 = -1,
 
     // Combat timers.
     atkCD: f32 = 0,
@@ -253,7 +259,7 @@ pub const Player = struct {
         p.iframe = p.rollIframeDur();
         // A roll interrupts whatever you were doing.
         p.hasMoveTarget = false;
-        p.targetMonster = -1;
+        p.chaseMonster = -1; // drop the chase; the selection re-resolves next frame
         return true;
     }
 
@@ -285,6 +291,7 @@ pub const Player = struct {
         p.castCD = 0;
         p.hasMoveTarget = false;
         p.targetMonster = -1;
+        p.chaseMonster = -1;
     }
 
     pub fn regen(p: *Player, dt: f32) void {

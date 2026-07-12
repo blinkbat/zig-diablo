@@ -145,7 +145,7 @@ pub const RES_MIN: f32 = -1.0; // -100% (double damage) is the floor
 // monster.zig.
 pub const LIGHT_STUN_HP_FRAC: f32 = 0.25;
 pub const LIGHT_STUN_DUR: f32 = 0.35; // seconds of interrupt
-pub const HEAVY_STUN_DECAY_PER_SEC: f32 = 0.45; // fraction of the meter drained/sec
+pub const HEAVY_STUN_DECAY_PER_SEC: f32 = 0.11; // fraction of the meter drained/sec (slow: the meter lingers)
 
 // ── Attributes ───────────────────────────────────────────────────────────────
 pub const Attribs = struct {

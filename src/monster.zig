@@ -57,6 +57,7 @@ pub const skel_dodge_cd_rand = 1.2;
 pub const skel_dodge_time = 0.4; // duration of the strafe
 pub const skel_dodge_speed = 1.5; // strafe speed as a multiple of walk Speed
 pub const skel_dodge_sense = 6.5; // react to a player bolt closing within this range
+pub const skel_dodge_align = 0.5; // min (bolt heading · dir-to-archer): below this the bolt is aimed elsewhere
 
 // Monster is a hostile entity. AI is a simple wander/aggro/chase/attack loop.
 pub const Monster = struct {

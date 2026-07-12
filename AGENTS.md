@@ -1,6 +1,9 @@
 # AGENTS.md — zig-diablo
 
 Ground rules for anyone (human or agent) working in this repo. Keep this file lean.
+Never, EVER write long verbose comments. Prefer no comments. Write succinct comments for novel or edge cases.
+ALWAYS look for existing tools before writing new code, sharpen the codebase towards de-duplication at all times.
+Avoid making ad hoc product decisions when writing code -- ask if unsure.
 
 ## Build & verify
 - `zig` is NOT on PATH. Build with `build.cmd` (debug) or `build-release.cmd`; the
