@@ -32,3 +32,17 @@ pub const ink = rgba(8, 6, 5, 255);
 // Muted parchment label text: panel captions, stepper labels, modal field labels.
 // One hue (alpha varies per site via withAlpha) so every chrome label reads the same.
 pub const labelColor = rgba(200, 190, 172, 255);
+
+// Bright brass highlight: active button text, latched swatch/tab borders, the text
+// caret, the minimap view square. The lit end of the trim metal.
+pub const highlightColor = rgba(255, 235, 190, 255);
+
+// Warm parchment value text: stepper readouts, focused field text — brighter than
+// labelColor so the editable value stands out from its caption.
+pub const valueColor = rgba(255, 240, 205, 255);
+
+// Panel/modal title text (small-caps captions, the topbar map name).
+pub const titleColor = rgba(255, 230, 190, 255);
+
+// The void behind the arena: the main-pass clear color in both game and editor.
+pub const voidColor = rgba(16, 16, 22, 255);

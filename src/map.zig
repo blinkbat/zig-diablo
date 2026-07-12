@@ -43,6 +43,9 @@ pub const MAX_PACKS = 24;
 pub const MAX_MAPS = 16;
 pub const ext = ".map";
 pub const dir = "maps";
+// Capacity of a stored map-file path: the campaign list, the game's cached paths,
+// and the editor's Ctrl+S target all size to this so none silently truncates.
+pub const PATH_CAP = 96;
 
 // The default moor palette: the Map field defaults AND the editor's "Moor" preset
 // both read these, so a fresh map and the preset can't drift to different browns.
@@ -76,7 +79,7 @@ pub const Pack = struct {
 
 pub const Map = struct {
     name: StrBuf(48) = .{},
-    boss: StrBuf(48) = .{},
+    boss: StrBuf(monster.NAME_CAP) = .{}, // copied into Monster.nameBuf; caps must match
     halfW: f32 = 30,
     halfD: f32 = 30,
     ground: rl.Color = DEFAULT_GROUND,
@@ -147,6 +150,12 @@ pub fn defaultMap() Map {
     var m = Map{};
     m.name.set("Empty Field");
     m.boss.set("The Absence");
+    // Place the anchors from the INSET constants (same as the editor's New Map),
+    // not hand-computed literals — retune an inset or the default half-extent and
+    // the fallback map follows instead of silently drifting.
+    m.spawn = v3(0, 0, m.halfD - SPAWN_INSET);
+    m.portal = v3(0, 0, -(m.halfD - PORTAL_INSET));
+    m.bossPos = v3(0, 0, -(m.halfD - BOSS_INSET));
     m.packs[0] = .{ .kind = .fallen, .count = 3, .x = 0, .z = 0 };
     m.pack_count = 1;
     return m;
@@ -387,6 +396,12 @@ pub fn load(path: []const u8) LoadError!Map {
         } else {
             return fail(lineNo, line, "unknown key");
         }
+        // Leftover tokens mean a typo'd or merge-mangled line, not a longer
+        // format — reject loudly, same philosophy as unknown keys. `name` and
+        // `boss` hold free text and never consume their tokens.
+        if (!std.mem.eql(u8, key, "name") and !std.mem.eql(u8, key, "boss") and it.next() != null) {
+            return fail(lineNo, line, "trailing data");
+        }
     }
     if (!sawVersion) {
         std.debug.print("map load error: {s} has no 'version:' header\n", .{path});
@@ -414,6 +429,11 @@ fn sanitize(m: *Map) void {
     m.spawn = v3(std.math.clamp(m.spawn.x, -hw, hw), 0, std.math.clamp(m.spawn.z, -hd, hd));
     m.portal = v3(std.math.clamp(m.portal.x, -hw, hw), 0, std.math.clamp(m.portal.z, -hd, hd));
     m.bossPos = v3(std.math.clamp(m.bossPos.x, -hw, hw), 0, std.math.clamp(m.bossPos.z, -hd, hd));
+    // Sizes/heights/light get the same treatment as coordinates: wider than the
+    // editor ever authors (hand-edited maps stay welcome), but a finite-but-HUGE
+    // value can't reach the renderer — a 1e18 ledge height puts the hero, camera,
+    // and shadow rig in orbit, and bakes cubes with absurd extents.
+    for (&m.light) |*c| c.* = std.math.clamp(c.*, 0, 4);
     for (m.ledges[0..m.ledge_count]) |*l| {
         if (l.minX > l.maxX) std.mem.swap(f32, &l.minX, &l.maxX);
         if (l.minZ > l.maxZ) std.mem.swap(f32, &l.minZ, &l.maxZ);
@@ -421,6 +441,7 @@ fn sanitize(m: *Map) void {
         l.maxX = std.math.clamp(l.maxX, -hw, hw);
         l.minZ = std.math.clamp(l.minZ, -hd, hd);
         l.maxZ = std.math.clamp(l.maxZ, -hd, hd);
+        l.h = std.math.clamp(l.h, 0.4, 8);
     }
     for (m.ramps[0..m.ramp_count]) |*r| {
         if (r.minX > r.maxX) std.mem.swap(f32, &r.minX, &r.maxX);
@@ -429,14 +450,18 @@ fn sanitize(m: *Map) void {
         r.maxX = std.math.clamp(r.maxX, -hw, hw);
         r.minZ = std.math.clamp(r.minZ, -hd, hd);
         r.maxZ = std.math.clamp(r.maxZ, -hd, hd);
+        r.h = std.math.clamp(r.h, 0.4, 8);
     }
     for (m.obstacles[0..m.obstacle_count]) |*o| {
         o.Pos.x = std.math.clamp(o.Pos.x, -hw, hw);
         o.Pos.z = std.math.clamp(o.Pos.z, -hd, hd);
+        o.Radius = std.math.clamp(o.Radius, 0.2, 6);
+        o.Height = std.math.clamp(o.Height, 0.3, 12);
     }
     for (m.decor[0..m.decor_count]) |*d| {
         d.Pos.x = std.math.clamp(d.Pos.x, -hw, hw);
         d.Pos.z = std.math.clamp(d.Pos.z, -hd, hd);
+        d.Size = std.math.clamp(d.Size, 0.02, 3);
     }
     for (m.packs[0..m.pack_count]) |*p| {
         p.count = std.math.clamp(p.count, 1, 16);
@@ -447,7 +472,7 @@ fn sanitize(m: *Map) void {
 
 /// The campaign: every maps/*.map, lexicographically ordered (name files
 /// 01_xxx.map, 02_xxx.map ... to order them). Returns how many were found.
-pub fn listCampaign(paths: *[MAX_MAPS][96]u8, lens: *[MAX_MAPS]usize) usize {
+pub fn listCampaign(paths: *[MAX_MAPS][PATH_CAP]u8, lens: *[MAX_MAPS]usize) usize {
     var n: usize = 0;
     var d = std.fs.cwd().openDir(dir, .{ .iterate = true }) catch return 0;
     defer d.close();
@@ -471,7 +496,7 @@ pub fn listCampaign(paths: *[MAX_MAPS][96]u8, lens: *[MAX_MAPS]usize) usize {
     while (i < n) : (i += 1) {
         var j = i;
         while (j > 0 and std.mem.order(u8, paths[j][0..lens[j]], paths[j - 1][0..lens[j - 1]]) == .lt) : (j -= 1) {
-            std.mem.swap([96]u8, &paths[j], &paths[j - 1]);
+            std.mem.swap([PATH_CAP]u8, &paths[j], &paths[j - 1]);
             std.mem.swap(usize, &lens[j], &lens[j - 1]);
         }
     }

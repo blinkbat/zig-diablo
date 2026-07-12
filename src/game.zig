@@ -71,6 +71,14 @@ const TORCH_GRIP_RIGHT = 0.45;
 const TORCH_GRIP_FWD = 0.05;
 const TORCH_FLAME_Y = 1.64; // flame-heart height in the hero's ground-local frame
 
+// The bow-hand grip in the hero's ground-local frame: back off the chest, out to
+// the draw side, at chest height. ONE anchor (heroBowHand) for the drawn bow limbs
+// AND the emissive string, so the string can't detach from the tips — the string
+// used to omit the walk bob the limbs carried and slid off them every stride.
+const BOW_GRIP_BACK = 0.18;
+const BOW_GRIP_SIDE = 0.4;
+const BOW_GRIP_Y = 1.15;
+
 // A live player fireball is its own moving light: a warm pool that follows the bolt
 // and lights (+ shadows) whatever it flies past, even out beyond the torch radius.
 // Modeled overhead like the torch so its downward shadow map stays well-oriented.
@@ -103,6 +111,23 @@ const ProjList = struct {
     fn items(self: *ProjList) []Projectile {
         return self.buf[0..self.count];
     }
+};
+
+// A slain zombie's miasma: a stationary poison cloud that ticks damage on anyone
+// standing inside it. Fixed capacity like ProjList; overflow drops the NEW cloud,
+// which takes 24 zombie corpses gassing at once to even reach.
+const MAX_GAS = 24;
+const GAS_RADIUS = 2.2; // the DoT footprint — the drawn blobs must visually fill it
+const GAS_LIFE = 7.0;
+const GAS_GROW = 0.5; // seconds to billow out to full size after the corpse drops
+const GAS_TICK = 0.45; // seconds between hurt pulses while standing in any cloud
+const GAS_DPS_FRAC = 0.3; // cloud dps as a fraction of the dead zombie's MaxDmg
+
+const GasCloud = struct {
+    Pos: rl.Vector3 = mathx.zero3,
+    life: f32 = 0,
+    dps: f32 = 0,
+    seed: f32 = 0, // per-cloud churn phase so neighbouring clouds don't boil in sync
 };
 
 // A fixed-capacity, self-contained transient text field: format into an inline buffer
@@ -144,8 +169,8 @@ pub const DisplayMode = enum { windowed, borderless, fullscreen };
 // hudx) and the dispatch (menuActivate) can't drift out of order — reorder or add
 // a row and both follow the enum. The label array mirrors the enum 1:1; the
 // assert pins them to the same length so a lone edit is a compile error.
-pub const RootItem = enum(i32) { adventure, editor, options, quit };
-pub const menuRootItems = [_][:0]const u8{ "Adventure", "Editor", "Options", "Quit" };
+pub const RootItem = enum(i32) { adventure, editor, options, debug, quit };
+pub const menuRootItems = [_][:0]const u8{ "Adventure", "Editor", "Options", "Debug Log", "Quit" };
 comptime {
     std.debug.assert(menuRootItems.len == @typeInfo(RootItem).@"enum".fields.len);
 }
@@ -153,9 +178,11 @@ comptime {
 // Entering the options screen and every return-from-options lands the cursor on
 // the Options row; its index derives from the enum so it tracks any reordering.
 pub const MENU_OPTIONS_IDX: i32 = @intFromEnum(RootItem.options);
-// The options screen has two rows — [display-mode cycler, Back] (see hudx) — and
-// key-nav wrap must agree with that count.
-pub const MENU_OPTIONS_COUNT = 2;
+// The options screen's rows, same enum discipline as RootItem: the row labels
+// (hudx builds them 1:1 with a comptime assert) and the dispatch below both follow
+// this, and key-nav wrap derives its count from it — add a row in one place.
+pub const OptionsItem = enum(i32) { display, back };
+pub const MENU_OPTIONS_COUNT: i32 = @typeInfo(OptionsItem).@"enum".fields.len;
 
 // Switch the window's display mode, unwinding whatever mode is active first so
 // the raylib toggles never stack (each toggle is its own on/off latch).
@@ -184,9 +211,9 @@ pub fn cycleDisplayMode(g: *Game, fwd: bool) void {
 // Activate a menu item (shared by keyboard Enter and mouse click in hudx).
 pub fn menuActivate(g: *Game, idx: i32) void {
     if (g.menuMode == .options) {
-        switch (idx) {
-            0 => cycleDisplayMode(g, true),
-            else => {
+        switch (@as(OptionsItem, @enumFromInt(idx))) {
+            .display => cycleDisplayMode(g, true),
+            .back => {
                 g.menuMode = .root;
                 g.menuSel = MENU_OPTIONS_IDX;
             },
@@ -198,6 +225,7 @@ pub fn menuActivate(g: *Game, idx: i32) void {
     switch (@as(RootItem, @enumFromInt(idx))) {
         .adventure => g.startRun(),
         .editor => editor.enter(g),
+        .debug => toggleDebugLog(g),
         .options => {
             g.menuMode = .options;
             g.menuSel = 0;
@@ -213,6 +241,16 @@ const MELEE_LUNGE = 0.35;
 fn meleeReach(atkRange: f32, targetRadius: f32) f32 {
     return atkRange + targetRadius + MELEE_LUNGE;
 }
+
+// The red a monster's body flushes toward while a committed strike winds up and
+// swings — the same tint at both ends of the telegraph, so the threat reads as one
+// color whether it's charging or cutting.
+const THREAT_TINT = rgba(255, 80, 40, 255);
+
+// How far ahead of the zombie's own radius its overhead slam lands. The dust-kick
+// (resolveMonsterAttack) and the drawn slamming fists (drawMonsterBody) both read
+// this, so the punctuation and the pose strike the same spot.
+const ZOMBIE_SLAM_FWD = 0.7;
 
 // The hero's own strike reach against a target: attack range plus the target's radius.
 // One helper so the chase-stop distance and the hit check can't drift apart.
@@ -260,6 +298,17 @@ fn torchFlameWorld(p: *const Player) rl.Vector3 {
     );
 }
 
+// The bow-hand anchor in the hero-local frame (see BOW_GRIP_*). Both the body's bow
+// limbs and the FX pass's emissive string derive their endpoints from this, passing
+// the same walk `bob`, so the string always meets the tips.
+fn heroBowHand(base: rl.Vector3, f: rl.Vector3, right: rl.Vector3, bob: f32) rl.Vector3 {
+    return v3(
+        base.x - f.x * BOW_GRIP_BACK + right.x * BOW_GRIP_SIDE,
+        BOW_GRIP_Y + bob,
+        base.z - f.z * BOW_GRIP_BACK + right.z * BOW_GRIP_SIDE,
+    );
+}
+
 // ---- Game state ----
 
 pub const Game = struct {
@@ -273,7 +322,7 @@ pub const Game = struct {
     // CURRENT area's parsed file — the world, monster spawns, and displayed
     // area name all come from it.
     map: mapmod.Map,
-    mapPaths: [mapmod.MAX_MAPS][96]u8 = undefined,
+    mapPaths: [mapmod.MAX_MAPS][mapmod.PATH_CAP]u8 = undefined,
     mapPathLens: [mapmod.MAX_MAPS]usize = undefined,
     mapCount: usize = 0,
     areaIndex: usize = 0,
@@ -286,6 +335,7 @@ pub const Game = struct {
     menuSel: i32 = 0,
     quit: bool = false,
     displayMode: DisplayMode = .windowed,
+    debugLog: bool = false, // main menu → Debug Log: per-frame light-state log (lightlog.txt)
 
     p: Player,
     monsters: [MAX_MONSTERS]Monster = undefined,
@@ -293,6 +343,9 @@ pub const Game = struct {
     nextID: i32 = 0,
     projs: ProjList = .{},
     lootList: std.ArrayList(LootDrop),
+    gas: [MAX_GAS]GasCloud = undefined,
+    gasCount: usize = 0,
+    gasHurtCD: f32 = 0, // countdown to the next DoT pulse while standing in miasma
 
     rig: CamRig,
 
@@ -347,8 +400,7 @@ pub const Game = struct {
         g.areaIndex = 0;
         g.torch.setLightColor(g.map.light);
         g.spawnPacks();
-        g.rig.snap(g.p.Pos);
-        g.torchXZ = torchFlameWorld(&g.p);
+        teleportHero(&g, g.p.Pos);
         g.setBanner(AREA_BANNER_DUR, "{s}", .{g.map.name.slice()});
         return g;
     }
@@ -374,6 +426,10 @@ pub const Game = struct {
         g.torch.deinit();
         g.lootList.deinit();
         hudx.unloadOrbRT();
+        if (lightLogFile) |f| {
+            f.close();
+            lightLogFile = null;
+        }
     }
 
     // startRun resets a finished/dead game back to area 0 with a fresh hero.
@@ -394,24 +450,13 @@ pub const Game = struct {
         g.w = mapmod.toWorld(&g.map, g.areaIndex == g.lastArea);
         g.torch.setLightColor(g.map.light); // each floor gets its own night
         g.sceneMesh.rebuild(&g.w);
-        g.fog.reset(g.w.HalfW, g.w.HalfD); // each area is a fresh layout: forget the old exploration
-        g.fog.sync(); // upload the cleared grid now: a restart from dead/victory draws
-        // this frame WITHOUT running updatePlaying, so it would otherwise render the new
-        // area against the previous area's still-resident fog mask for one frame.
-        g.monsterCount = 0;
-        g.projs.count = 0;
-        g.lootList.clearRetainingCapacity();
-        g.parts.clear(); // stray sparks must not carry across the portal
-        g.spawnPacks();
-        g.p.Pos = g.map.spawn;
+        resetArena(g); // dynamic bodies, FX pools, fog, presentation timers, packs
         g.p.hasMoveTarget = false;
         g.p.targetMonster = -1;
         g.p.HP = g.p.MaxHP;
         g.p.Mana = g.p.MaxMana;
-        g.rig.snap(g.p.Pos);
-        g.torchXZ = torchFlameWorld(&g.p); // snap the light with the teleport
+        teleportHero(g, g.map.spawn);
         g.setBanner(AREA_BANNER_DUR, "{s}", .{g.map.name.slice()});
-        g.setToast("", .{});
     }
 
     // spawnPacks deploys the map's authored packs (members jittered around each
@@ -514,9 +559,10 @@ fn updatePlaying(g: *Game, dt_in: f32) void {
     updateProjectiles(g, dt);
     updateLoot(g, dt);
     updateDeaths(g, dt);
+    updateGasClouds(g, dt);
     updatePortal(g);
     updateAmbientFX(g, dt);
-    g.parts.update(dt);
+    g.parts.update(dt, &g.w);
 
     g.rig.follow(g.p.Pos, dt);
 
@@ -657,7 +703,7 @@ fn useManaPotion(g: *Game) void {
 // ---- Gamepad ----
 // Left stick moves; right stick aims (and targets a nearby foe); X attacks, Y casts
 // Firebolt, B dodges, L1/R1 drink potions, Start opens the menu (handled in run()).
-const PAD = 0; // first connected controller
+const PAD = rumble.PAD; // first connected controller (shared with the rumble backend)
 const STICK_DEADZONE = 0.25; // ignore small stick drift
 const AIM_REACH = 6.0; // how far ahead the right stick projects the aim point
 
@@ -708,15 +754,20 @@ fn handleGamepad(g: *Game) void {
     // Firebolt / dodge / hover logic can all key off g.mouseGround.
     const aimDir = stickXZ(.right_x, .right_y); // already a unit heading (or zero)
     const aiming = lenXZ(aimDir) > 0;
+    // The aim highlight and the X-attack acquire are the SAME O(monsters) scan; run
+    // it at most once per frame and reuse the result across both.
+    var aimTarget: ?i32 = null;
+    var scannedAim = false;
     if (aiming) {
         g.mouseGround = v3(p.Pos.x + aimDir.x * AIM_REACH, 0, p.Pos.z + aimDir.z * AIM_REACH);
-        _ = padAcquireTarget(g, aimDir); // highlight who we'd hit
+        aimTarget = padAcquireTarget(g, aimDir); // highlight who we'd hit
+        scannedAim = true;
     }
 
     // X: attack — engage the best foe (nearest, biased to the aim direction). The
     // auto-attack + chase then drive it, exactly like clicking a monster with the mouse.
     if (rl.isGamepadButtonDown(PAD, .right_face_left) and !p.rolling()) {
-        if (padAcquireTarget(g, aimDir)) |id| {
+        if (if (scannedAim) aimTarget else padAcquireTarget(g, aimDir)) |id| {
             p.targetMonster = id;
             p.hasMoveTarget = false;
         }
@@ -754,12 +805,13 @@ fn updateAim(g: *Game) void {
     if (g.w.pickGround(ray)) |pt| g.mouseGround = pt;
 
     g.hoverMonster = -1;
-    var best: f32 = std.math.floatMax(f32);
+    var best2: f32 = std.math.floatMax(f32); // squared: a pure threshold pick needs no @sqrt
     for (g.liveMonsters()) |*m| {
         if (!m.alive() or !g.inVision(m.Pos)) continue; // can't target what darkness hides
-        const d = distXZ(m.Pos, g.mouseGround);
-        if (d < m.Radius + 0.6 and d < best) {
-            best = d;
+        const d2 = dist2XZ(m.Pos, g.mouseGround);
+        const rr = m.Radius + 0.6;
+        if (d2 < rr * rr and d2 < best2) {
+            best2 = d2;
             g.hoverMonster = m.id;
         }
     }
@@ -775,7 +827,7 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
     // A dodge roll overrides all other movement and steering.
     if (p.rolling()) {
         const step = v3(p.rollDir.x * playermod.rollSpeed * dt, 0, p.rollDir.z * playermod.rollSpeed * dt);
-        p.Pos = g.w.moveWithCollision(p.Pos, step, p.Radius);
+        p.Pos = g.w.moveWithCollision(p.Pos, step, playermod.radius);
         return;
     }
 
@@ -807,7 +859,7 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
     if (moving and lenXZ(dir) > 0) {
         p.Facing = dir;
         const step = v3(dir.x * p.Speed * dt, 0, dir.z * p.Speed * dt);
-        p.Pos = g.w.moveWithCollision(p.Pos, step, p.Radius);
+        p.Pos = g.w.moveWithCollision(p.Pos, step, playermod.radius);
         p.walkBob += dt * 12;
         // Each stride kicks a little dust off the road — the ground answers the boot.
         g.stepPuff -= dt;
@@ -883,13 +935,24 @@ fn killMonster(g: *Game, m: *Monster) void {
     const n: usize = if (m.boss) 34 else 16;
     g.parts.burst(&g.rng, at, n, 6.0, 0.13, 0.7, lerpColor(m.Color, rl.Color.white, 0.25), 10);
     g.parts.burst(&g.rng, at, n / 2, 3.5, 0.16, 0.9, lerpColor(m.Color, rl.Color.black, 0.45), 12);
+    // Pib packs break: a packmate dying in view sends every nearby pib scattering
+    // (Diablo's Fallen). maxF, not overwrite: a kill-chain must never SHORTEN an
+    // already-running panic.
+    for (g.liveMonsters()) |*other| {
+        if (other.Kind == .fallen and other.alive() and distXZ(other.Pos, m.Pos) < monster.flee_trigger_radius) {
+            other.fleeTimer = maxF(other.fleeTimer, monster.flee_time_min + g.rng.float() * monster.flee_time_rand);
+        }
+    }
+    // The zombie's last act: the corpse exhales its rot as a lingering miasma
+    // cloud — the kill is safe, standing in the remains is not.
+    if (m.Kind == .zombie) spawnGasCloud(g, m.Pos, m.MaxDmg * GAS_DPS_FRAC);
     if (g.p.addXP(m.XP)) onLevelUp(g);
     // rollLoot scatters in XZ without terrain knowledge: re-seat each new drop on
     // the ground it actually landed on (a rampart kill may scatter off the edge).
     const firstNew = g.lootList.items.len;
     loot.rollLoot(m, &g.rng, &g.lootList);
     for (g.lootList.items[firstNew..]) |*d| d.Pos = g.w.snapY(d.Pos);
-    if (m.boss) g.setToast("{s} has been slain!", .{m.Name});
+    if (m.boss) g.setToast("{s} has been slain!", .{m.name()});
     if (g.p.targetMonster == m.id) g.p.targetMonster = -1;
 }
 
@@ -915,18 +978,49 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
     if (m.atkCD > 0) m.atkCD -= dt;
     m.bob += dt * (m.Speed + 2);
 
-    // Committed strike: freeze + telegraph, then land it (the player's window to roll).
+    // Strike follow-through: the blade/arms sweep their arc, and the damage lands
+    // as the arc crosses its MIDPOINT — for anim-telegraphed kinds the swing is
+    // the only warning, so the hit must land where the swing visibly is.
+    if (m.swing > 0) {
+        const before = m.swing;
+        m.swing -= dt;
+        const half = m.swingTime * 0.5;
+        if (before > half and m.swing <= half) resolveMonsterAttack(g, m);
+        return; // committed: no steering mid-swing
+    }
+
+    // Committed strike: freeze + telegraph, then release (the player's window to roll).
     if (m.windup > 0) {
         m.windup -= dt;
         if (g.p.alive()) m.Facing = dirXZ(m.Pos, g.p.Pos);
         if (m.windup <= 0) {
-            resolveMonsterAttack(g, m);
             m.atkCD = m.atkRate;
+            if (m.swingTime > 0) {
+                m.swing = m.swingTime; // melee arc: damage lands mid-swing above
+            } else {
+                resolveMonsterAttack(g, m); // no follow-through: the arrow looses NOW
+            }
         }
         return;
     }
 
-    const toPlayer = distXZ(m.Pos, g.p.Pos);
+    // Panic (a pib whose packmate just died): drop everything and run from the
+    // player — Diablo's Fallen. Aggro survives, so when the timer runs out they
+    // turn straight around and come back.
+    if (m.fleeTimer > 0) {
+        m.fleeTimer -= dt;
+        if (g.p.alive()) {
+            m.Facing = dirXZ(g.p.Pos, m.Pos); // face AWAY: they run with their backs to you
+            moveMonster(g, m, m.Facing, dt * 1.15); // panic legs beat charging legs
+        }
+        return;
+    }
+
+    // Distance AND facing come from the same hero-delta: compute it once (one @sqrt
+    // per live monster per frame instead of two — distXZ then dirXZ on the same vec).
+    const pdx = g.p.Pos.x - m.Pos.x;
+    const pdz = g.p.Pos.z - m.Pos.z;
+    const toPlayer = @sqrt(pdx * pdx + pdz * pdz);
     if (!g.p.alive()) {
         m.aggro = false;
     } else if (!m.aggro and toPlayer < m.sightRange) {
@@ -949,13 +1043,22 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
         return;
     }
 
-    m.Facing = dirXZ(m.Pos, g.p.Pos);
+    // Face the hero, reusing the delta above (guard matches dirXZ's own 1e-5).
+    m.Facing = if (toPlayer < 1e-5) mathx.zero3 else v3(pdx / toPlayer, 0, pdz / toPlayer);
     if (m.Ranged) {
         // Kite: hold at range, back off if the player gets close, then shoot.
         if (toPlayer > m.atkRange * 0.85) {
             moveMonster(g, m, m.Facing, dt); // == dirXZ(m.Pos, g.p.Pos), already set above
         } else if (toPlayer < m.atkRange * 0.35) {
-            moveMonster(g, m, dirXZ(g.p.Pos, m.Pos), dt * 0.7);
+            moveMonster(g, m, v3(-m.Facing.x, 0, -m.Facing.z), dt * 0.7); // away from the hero
+        } else if (m.atkCD > 0.25) {
+            // Between shots: sidestep an arc around the target, id parity picking
+            // the direction so a pack splits both ways — a planted archer reads
+            // as a turret, a circling one reads as a hunter. Facing stays on the
+            // player throughout, so the bow keeps pointing at you as they slide.
+            const tang = mathx.perpXZ(m.Facing);
+            const sdir = if (@rem(m.id, 2) == 0) tang else v3(-tang.x, 0, -tang.z);
+            moveMonster(g, m, sdir, dt * 0.45);
         }
         if (toPlayer <= m.atkRange and m.atkCD <= 0) m.windup = m.windupTime;
         return;
@@ -975,10 +1078,24 @@ fn resolveMonsterAttack(g: *Game, m: *Monster) void {
     if (!g.p.alive()) return;
     const dmg = g.rng.range(m.MinDmg, m.MaxDmg);
     if (m.Ranged) {
+        // The arrow looses from the drawn bow itself (not the body center), so
+        // the nocked shaft and the flying shaft are one continuous motion.
         // Arrows angle up or down to the player's actual elevation — a rampart is
         // cover from the cliff side, never from an archer with a clean line.
-        g.projs.add(projectile.newArrow(m.Pos, dirXZ(m.Pos, g.p.Pos), dmg, aimYVel(m.Pos.y + projectile.arrowMuzzleDY, g.p.Pos.y + 1.0, distXZ(m.Pos, g.p.Pos), projectile.arrowSpeed)));
+        const bowHead = skelBow(m).head;
+        const from = v3(bowHead.x, m.Pos.y, bowHead.z);
+        g.projs.add(projectile.newArrow(from, dirXZ(from, g.p.Pos), dmg, aimYVel(from.y + projectile.arrowMuzzleDY, g.p.Pos.y + 1.0, distXZ(from, g.p.Pos), projectile.arrowSpeed)));
+        // String-snap: a flick of pale sparks off the arrowhead at release.
+        g.parts.burst(&g.rng, v3(bowHead.x, m.Pos.y + bowHead.y, bowHead.z), 5, 2.6, 0.05, 0.3, rgba(255, 240, 210, 230), 4);
         return;
+    }
+    // The zombie's slam hits the GROUND whether or not it hits you: a dust kick at
+    // the impact point is the strike's punctuation (it has no telegraph ring).
+    if (m.Kind == .zombie) {
+        const f = mathx.orFacing(m.Facing, 0, 1);
+        const at = v3(m.Pos.x + f.x * (m.Radius + ZOMBIE_SLAM_FWD), m.Pos.y + 0.15, m.Pos.z + f.z * (m.Radius + ZOMBIE_SLAM_FWD));
+        g.parts.burst(&g.rng, at, 8, 3.2, 0.09, 0.4, mathx.withAlpha(DUST_COLOR, 150), 6);
+        g.shake = maxF(g.shake, 0.12); // the ground answers even a miss
     }
     // Use the module radius constant — the SAME source the drawn telegraph ring reads
     // (drawMonstersFX) — so standing just outside the red ring is genuinely safe.
@@ -1010,6 +1127,15 @@ fn separateMonsters(g: *Game) void {
     }
 }
 
+// The shared tail of every damage source: if that blow was lethal, fire the death
+// rumble (stronger than any hurt, so it takes over the fade) and switch to the death
+// screen. One place for a future death hook (stats, autosave) to land.
+fn onPlayerDeath(g: *Game) void {
+    if (g.p.alive()) return;
+    g.rumble.play(rumble.death);
+    g.scene = .dead;
+}
+
 fn hitPlayer(g: *Game, dmg: f32) void {
     // I-frames from a dodge roll negate the blow entirely.
     if (g.p.invulnerable()) {
@@ -1020,10 +1146,7 @@ fn hitPlayer(g: *Game, dmg: f32) void {
     g.shake = maxF(g.shake, 0.25);
     g.rumble.play(rumble.hurt);
     g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 1.35, g.p.Pos.z), 8, 4.5, 0.1, 0.45, rgba(220, 40, 40, 255), 9);
-    if (!g.p.alive()) {
-        g.rumble.play(rumble.death); // stronger than `hurt`, so it takes over the fade
-        g.scene = .dead;
-    }
+    onPlayerDeath(g);
 }
 
 // Retain-in-place: advance every item, keep those for which `keepFn` returns true,
@@ -1080,7 +1203,7 @@ fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
                 return false;
             }
         }
-    } else if (g.p.alive() and dist2XZ(g.p.Pos, pr.Pos) < (g.p.Radius + pr.Radius) * (g.p.Radius + pr.Radius) and @abs(pr.Pos.y - (g.p.Pos.y + 1.1)) < 1.7) {
+    } else if (g.p.alive() and dist2XZ(g.p.Pos, pr.Pos) < (playermod.radius + pr.Radius) * (playermod.radius + pr.Radius) and @abs(pr.Pos.y - (g.p.Pos.y + 1.1)) < 1.7) {
         hitPlayer(g, pr.Damage);
         impactBurst(g, pr);
         return false;
@@ -1107,7 +1230,7 @@ fn keepLoot(c: SweepCtx, d: *LootDrop) bool {
     d.bob += c.dt * 3;
     // Same-level pickup only: standing on the rampart edge must not hoover the
     // drops glittering on the floor below.
-    if (distXZ(d.Pos, c.g.p.Pos) < c.g.p.Radius + 1.3 and @abs(d.Pos.y - c.g.p.Pos.y) < 1.2) {
+    if (distXZ(d.Pos, c.g.p.Pos) < playermod.radius + 1.3 and @abs(d.Pos.y - c.g.p.Pos.y) < 1.2) {
         // Only remove the drop if it was actually picked up; a full belt leaves the
         // potion glittering on the ground instead of destroying it with a lying toast.
         if (collect(c.g, d.*)) return false;
@@ -1154,6 +1277,65 @@ fn keepMonster(c: SweepCtx, m: *Monster) bool {
 }
 fn updateDeaths(g: *Game, dt: f32) void {
     g.monsterCount = retain(Monster, g.liveMonsters(), SweepCtx{ .g = g, .dt = dt }, keepMonster);
+}
+
+fn spawnGasCloud(g: *Game, pos: rl.Vector3, dps: f32) void {
+    if (g.gasCount >= g.gas.len) return;
+    g.gas[g.gasCount] = .{ .Pos = pos, .life = GAS_LIFE, .dps = dps, .seed = g.rng.float() * std.math.tau };
+    g.gasCount += 1;
+    // The transformation itself: the body's rot boiling OUT — buoyant, sickly.
+    g.parts.burst(&g.rng, v3(pos.x, pos.y + 0.7, pos.z), 18, 2.4, 0.15, 1.2, rgba(188, 228, 112, 230), -2);
+}
+
+// Advance one miasma cloud: age it out, and exhale slow wisps while it lives. Wisp
+// spawning is gated at the torch radius (like the gold glint and ambient dust): a
+// glow boiling out in the fog would break the "nothing dynamic beyond the light" rule.
+fn keepGas(c: SweepCtx, gc: *GasCloud) bool {
+    const g = c.g;
+    gc.life -= c.dt;
+    if (gc.life <= 0) return false;
+    if (distXZ(gc.Pos, g.p.Pos) <= TORCH_RADIUS and g.rng.float() < c.dt * 14) {
+        const ang = g.rng.float() * std.math.tau;
+        const r = g.rng.float() * GAS_RADIUS * 0.85;
+        g.parts.spawn(.{
+            .Pos = v3(gc.Pos.x + cosf(ang) * r, gc.Pos.y + 0.15 + g.rng.float() * 0.5, gc.Pos.z + sinf(ang) * r),
+            .Vel = v3((g.rng.float() - 0.5) * 0.3, 0.25 + g.rng.float() * 0.3, (g.rng.float() - 0.5) * 0.3),
+            .Life = 1.1 + g.rng.float() * 0.6,
+            .maxLife = 1.7,
+            .Size = 0.12 + g.rng.float() * 0.09,
+            // Bright enough that the pool's alpha blend can only lift the ground
+            // under it, never dim it (the pool has no additive mode to lean on).
+            .Color = rgba(198, 235, 124, 190),
+            .grav = -0.35, // rot gas rises
+            .drag = 1.2,
+        });
+    }
+    return true;
+}
+
+fn updateGasClouds(g: *Game, dt: f32) void {
+    g.gasCount = retain(GasCloud, g.gas[0..g.gasCount], SweepCtx{ .g = g, .dt = dt }, keepGas);
+    if (g.gasHurtCD > 0) g.gasHurtCD -= dt;
+    if (!g.p.alive() or g.p.invulnerable()) return; // a roll carries you clean through the fumes
+    // Overlapping clouds stack: standing in a zombie pile's remains is its own mistake.
+    var dps: f32 = 0;
+    for (g.gas[0..g.gasCount]) |*gc| {
+        if (dist2XZ(g.p.Pos, gc.Pos) <= GAS_RADIUS * GAS_RADIUS and @abs(g.p.Pos.y - gc.Pos.y) < SAME_GROUND_DY) dps += gc.dps;
+    }
+    if (dps > 0 and g.gasHurtCD <= 0) {
+        g.gasHurtCD = GAS_TICK;
+        gasHurtPlayer(g, dps * GAS_TICK);
+    }
+}
+
+// Miasma damage arrives as discrete choking pulses rather than a silent per-frame
+// drain, so each tick is FELT (flash + rumble + a cough of green) and reads "get out".
+fn gasHurtPlayer(g: *Game, dmg: f32) void {
+    g.p.takeDamage(dmg);
+    g.damageFlash = maxF(g.damageFlash, DAMAGE_FLASH_DUR * 0.5);
+    g.rumble.play(rumble.gas_tick);
+    g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 1.3, g.p.Pos.z), 4, 1.8, 0.08, 0.5, rgba(140, 180, 80, 200), -1);
+    onPlayerDeath(g);
 }
 
 // Ambient, non-combat particles: violet motes spiraling up the open portal, a faint
@@ -1248,7 +1430,9 @@ fn updatePortal(g: *Game) void {
         g.w.PortalOpen = true;
         g.setToast("Area cleared - a portal has opened!", .{});
     }
-    if (g.w.PortalOpen and distXZ(g.p.Pos, g.w.PortalPos) < 2.4) {
+    // Lingering gas or a final in-flight arrow can kill in the same frame the
+    // hero stands in the ring — the death must win, not the portal.
+    if (g.w.PortalOpen and g.p.alive() and distXZ(g.p.Pos, g.w.PortalPos) < 2.4) {
         if (g.playtest) {
             endPlaytest(g);
             g.ed.status("portal reached - playtest complete", .{});
@@ -1260,6 +1444,36 @@ fn updatePortal(g: *Game) void {
     }
 }
 
+// Clear all per-arena dynamic state — dynamic bodies, FX pools, the fog mask, and
+// the presentation timers that only decay in .playing — then repopulate the
+// authored packs. Shared by enterArea (new map) and startPlaytest so a killing
+// blow's flash/shake or a stale toast can never bleed across the transition (the
+// drift that once let a playtest death replay its flash over the next F5).
+fn resetArena(g: *Game) void {
+    g.monsterCount = 0;
+    g.projs.count = 0;
+    g.lootList.clearRetainingCapacity();
+    g.gasCount = 0; // miasma stays with its corpse — it never rides the portal
+    g.parts.clear(); // stray sparks must not carry across the portal
+    g.damageFlash = 0; // timers only decay in .playing, so a killing blow's
+    g.shake = 0; // flash/shake would otherwise replay over the fresh area
+    g.fog.reset(g.w.HalfW, g.w.HalfD); // each area is a fresh layout: forget the old exploration
+    g.fog.sync(); // upload the cleared grid now: a restart from dead/victory draws this
+    // frame WITHOUT running updatePlaying, so it would otherwise render the new area
+    // against the previous area's still-resident fog mask for one frame.
+    g.spawnPacks();
+    g.setToast("", .{});
+}
+
+// Teleport the hero: set position AND snap the camera and the smoothed torch anchor
+// to it. All three move together — a bare Pos change leaves the shadow rig lerping
+// across the map for a few frames.
+fn teleportHero(g: *Game, pos: rl.Vector3) void {
+    g.p.Pos = pos;
+    g.rig.snap(pos);
+    g.torchXZ = torchFlameWorld(&g.p);
+}
+
 // Launch a playtest of the CURRENT in-memory map from the editor: real spawns,
 // real fog of war, real HUD. Every exit (Esc, death, portal) leads back to the
 // editor with the author's map untouched — no disk round-trip.
@@ -1267,16 +1481,9 @@ pub fn startPlaytest(g: *Game) void {
     g.playtest = true;
     g.paused = false;
     g.p = playermod.newPlayer(g.map.spawn);
-    g.monsterCount = 0;
-    g.projs.count = 0;
-    g.lootList.clearRetainingCapacity();
-    g.parts.clear();
     g.w.PortalOpen = false;
-    g.fog.reset(g.w.HalfW, g.w.HalfD);
-    g.fog.sync();
-    g.spawnPacks();
-    g.rig.snap(g.p.Pos);
-    g.torchXZ = torchFlameWorld(&g.p);
+    resetArena(g);
+    teleportHero(g, g.p.Pos);
     g.setBanner(AREA_BANNER_DUR, "Playtest: {s}", .{g.map.name.slice()});
     g.scene = .playing;
 }
@@ -1284,9 +1491,7 @@ pub fn startPlaytest(g: *Game) void {
 // Ctrl+F5 (crawler): playtest starting from the editor's cursor, not the spawn.
 pub fn startPlaytestAt(g: *Game, at: rl.Vector3) void {
     startPlaytest(g);
-    g.p.Pos = g.w.snapY(at);
-    g.rig.snap(g.p.Pos);
-    g.torchXZ = torchFlameWorld(&g.p);
+    teleportHero(g, g.w.snapY(at));
 }
 
 fn endPlaytest(g: *Game) void {
@@ -1301,6 +1506,11 @@ fn endPlaytest(g: *Game) void {
 // Drawn HERO_SCALE bigger about the feet (depth pass included, so the shadow grows
 // with the body).
 fn drawHeroBody(p: *const Player) void {
+    // Same clean-stack pre-flush as drawMonsterBody: a batch overflow inside the
+    // hero's scale-about-feet transform would light the whole flushed scene
+    // through that scale — and the hero is the BIGGEST body (~6.3k verts), drawn
+    // last at maximum batch fill. (See the matModel note on drawMonsterBody.)
+    rl.gl.rlDrawRenderBatchActive();
     const base = p.Pos;
     beginHeroScale(base);
     defer rl.gl.rlPopMatrix();
@@ -1343,7 +1553,7 @@ fn drawHeroBody(p: *const Player) void {
     // Sleeved arms out to the tools of the trade: bow hand forward-right, torch
     // hand out left — without them the props float beside the body.
     const sleeve = lerpColor(hood, rl.Color.black, 0.1);
-    const bhandB = v3(base.x - f.x * 0.18 + right.x * 0.4, 1.15 + bob, base.z - f.z * 0.18 + right.z * 0.4);
+    const bhandB = heroBowHand(base, f, right, bob);
     rl.drawCapsule(v3(base.x + right.x * 0.28 + f.x * 0.05, 1.3 + bob, base.z + right.z * 0.28 + f.z * 0.05), bhandB, 0.1, 6, 4, sleeve);
     const thandB = v3(base.x - right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD, 1.28, base.z - right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD);
     rl.drawCapsule(v3(base.x - right.x * 0.28 + f.x * 0.02, 1.3 + bob, base.z - right.z * 0.28 + f.z * 0.02), thandB, 0.1, 6, 4, sleeve);
@@ -1361,7 +1571,7 @@ fn drawHeroBody(p: *const Player) void {
     rl.drawCylinderEx(qt, v3(qt.x - right.x * 0.03, qt.y + 0.16, qt.z - right.z * 0.03), 0.08, 0.05, 5, rgba(190, 185, 165, 255));
 
     const bowCol = rgba(96, 66, 38, 255);
-    const bhand = v3(base.x - f.x * 0.18 + right.x * 0.4, 1.15 + bob, base.z - f.z * 0.18 + right.z * 0.4);
+    const bhand = heroBowHand(base, f, right, bob);
     rl.drawCylinderEx(bhand, v3(bhand.x - f.x * 0.18, bhand.y + 0.62, bhand.z - f.z * 0.18), 0.07, 0.03, 5, bowCol);
     rl.drawCylinderEx(bhand, v3(bhand.x - f.x * 0.18, bhand.y - 0.62, bhand.z - f.z * 0.18), 0.07, 0.03, 5, bowCol);
 
@@ -1380,11 +1590,13 @@ fn drawHeroFX(p: *const Player, t: f32) void {
 
     if (p.rolling()) {
         const tt = p.rollTimer / playermod.rollDur;
-        rl.drawCircle3D(v3(base.x, 0.05, base.z), p.Radius + 0.4 * (1 - tt), v3(1, 0, 0), 90, rgba(200, 210, 230, mathx.u8f(120 * tt)));
+        rl.drawCircle3D(v3(base.x, 0.05, base.z), playermod.radius + 0.4 * (1 - tt), v3(1, 0, 0), 90, rgba(200, 210, 230, mathx.u8f(120 * tt)));
         return;
     }
 
-    const bhand = v3(base.x - f.x * 0.18 + right.x * 0.4, 1.15, base.z - f.z * 0.18 + right.z * 0.4);
+    // Same bob as the body's limbs (heroBowHand) so the string meets the tips.
+    const bob = 0.05 * sinf(p.walkBob);
+    const bhand = heroBowHand(base, f, right, bob);
     rl.drawLine3D(v3(bhand.x - f.x * 0.18, bhand.y + 0.62, bhand.z - f.z * 0.18), v3(bhand.x - f.x * 0.18, bhand.y - 0.62, bhand.z - f.z * 0.18), rgba(200, 200, 190, 200));
 
     // Melee swing arc.
@@ -1412,9 +1624,9 @@ fn drawHeroFX(p: *const Player, t: f32) void {
     sphere(flame, 0.32 * flick, rgba(235, 95, 25, 120));
     const tongueH = 0.44 + 0.11 * sinf(t * 13) + 0.06 * sinf(t * 29);
     const sway = 0.055 * sinf(t * 9) + 0.03 * sinf(t * 17);
-    rl.drawCylinderEx(v3(flame.x, flame.y - 0.1, flame.z), v3(flame.x + sway, flame.y + tongueH, flame.z + sway * 0.6), 0.15, 0.0, 6, rgba(255, 150, 40, 215));
+    rl.drawCylinderEx(v3(flame.x, flame.y - 0.1, flame.z), v3(flame.x + sway, flame.y + tongueH, flame.z + sway * 0.6), 0.15, 0.0, 6, mathx.withAlpha(projectile.fireboltColor, 215));
     rl.drawCylinderEx(v3(flame.x, flame.y - 0.06, flame.z), v3(flame.x + sway * 0.7, flame.y + tongueH * 0.6, flame.z + sway * 0.42), 0.08, 0.0, 6, rgba(255, 240, 175, 255));
-    sphere(v3(flame.x, flame.y + 0.02, flame.z), 0.115 * flick, rgba(255, 246, 205, 255));
+    sphere(v3(flame.x, flame.y + 0.02, flame.z), 0.115 * flick, projectile.flameHeartColor);
     var i: i32 = 0;
     while (i < 6) : (i += 1) {
         const iff: f32 = @floatFromInt(i);
@@ -1424,7 +1636,7 @@ fn drawHeroFX(p: *const Player, t: f32) void {
         sphere(ep, 0.045 * (1 - ph), rgba(255, 160, 60, mathx.u8f((1 - ph) * 170)));
     }
 
-    rl.drawCircle3D(v3(base.x, 0.045, base.z), p.Radius + 0.15, v3(1, 0, 0), 90, rgba(150, 190, 255, 90));
+    rl.drawCircle3D(v3(base.x, 0.045, base.z), playermod.radius + 0.15, v3(1, 0, 0), 90, rgba(150, 190, 255, 90));
 }
 
 pub fn drawWalls(w: *const world.World) void {
@@ -1479,26 +1691,97 @@ fn monsterBob(m: *const Monster) f32 {
     return MONSTER_BOB_AMP * sinf(m.bob);
 }
 
-// Where a pib's knife hand sits this frame, and how far the blade is raised into its
-// overhead strike pose. Shared by the body draw (grip + blade) and the emissive FX
-// pass (the blade glint), so the sparkle always rides the actual blade tip.
-const PibGrip = struct { hand: rl.Vector3, raise: f32, f: rl.Vector3 };
-fn pibGrip(m: *const Monster) PibGrip {
+// The pib's knife arm through every pose, evaluated in one place. The body draw
+// (arm + blade), the FX glint, and the swing's afterimage trail all call this, so
+// the drawn blade, its sparkle, and its ghosts can never disagree.
+//
+// The strike is an ARC, and that arc is the pib's entire telegraph (no ground
+// marking): rest shoulders the blade near-vertical on the right — a proud little
+// mast; windup hauls the arm back and UP behind the shoulder, blade cocked; the
+// swing whips it around the front in a falling arc (damage lands at midpoint,
+// where the blade visibly crosses you); flee throws it overhead, waving madly.
+const PibGrip = struct { hand: rl.Vector3, tip: rl.Vector3, out: rl.Vector3, f: rl.Vector3 };
+
+// Azimuth anchors of the swing arc in the body frame (0 = out the right side,
+// pi/2 = straight ahead): cocked BEHIND the right shoulder, released across the
+// front, following through to the far left. The front-crossing sits at the arc's
+// midpoint — the same instant updateMonster lands the damage.
+const PIB_A_REST = 0.25;
+const PIB_A_COCK = -0.9;
+const PIB_A_END = 2.4;
+
+fn pibGripAt(m: *const Monster, wp: f32, sp: f32) PibGrip {
     const f = mathx.orFacing(m.Facing, 0, 1);
     const right = mathx.perpXZ(f);
-    const raise: f32 = m.windupProgress() * 0.7;
+    var a: f32 = PIB_A_REST;
+    var handY: f32 = MONSTER_TORSO_BASE + 0.42 + monsterBob(m);
+    var reach: f32 = m.Radius * 0.95;
+    var up: f32 = 0.66; // blade tip's rise off the grip...
+    var out: f32 = 0.05; // ...and its lean along the swing's radial
+    if (sp > 0) {
+        const e = 1 - (1 - sp) * (1 - sp); // the whip: fast out of the cock, easing late
+        a = PIB_A_COCK + (PIB_A_END - PIB_A_COCK) * e;
+        handY += 0.55 * (1 - e); // falls from the cocked height through the cut
+        reach = m.Radius * (0.95 + 0.4 * sinf(e * std.math.pi)); // arm extends mid-arc
+        up = 0.1 + 0.31 * (1 - clampF(sp * 3, 0, 1)); // blade levels out into the slash
+        out = 0.6;
+    } else if (wp > 0) {
+        a = PIB_A_REST + (PIB_A_COCK - PIB_A_REST) * wp;
+        handY += 0.55 * wp;
+        up = 0.66 - 0.25 * wp;
+        out = 0.05 + 0.15 * wp;
+    } else if (m.fleeing()) {
+        a = PIB_A_REST - 0.4 + 0.5 * sinf(m.bob * 2.7); // waved overhead as it runs
+        handY += 0.62 + 0.06 * sinf(m.bob * 5);
+        up = 0.7;
+        out = 0;
+    }
+    const dir = v3(right.x * cosf(a) + f.x * sinf(a), 0, right.z * cosf(a) + f.z * sinf(a));
+    const hand = v3(m.Pos.x + dir.x * reach, handY, m.Pos.z + dir.z * reach);
     return .{
-        .hand = v3(m.Pos.x + right.x * m.Radius * 0.95 + f.x * 0.15, MONSTER_TORSO_BASE + 0.42 + monsterBob(m) + raise, m.Pos.z + right.z * m.Radius * 0.95 + f.z * 0.15),
-        .raise = raise,
+        .hand = hand,
+        .tip = v3(hand.x + dir.x * out, hand.y + up, hand.z + dir.z * out),
+        .out = dir,
         .f = f,
     };
 }
-// The knife's point, given the grip: carried near-vertical over the shoulder (so the
-// blade is a proud mast at gameplay zoom), leaning forward and reaching higher as the
-// overhead strike builds.
-fn pibKnifeTip(grip: PibGrip) rl.Vector3 {
-    const fwd = 0.05 + grip.raise * 0.45;
-    return v3(grip.hand.x + grip.f.x * fwd, grip.hand.y + 0.66 + grip.raise * 0.3, grip.hand.z + grip.f.z * fwd);
+
+fn pibGrip(m: *const Monster) PibGrip {
+    return pibGripAt(m, m.windupProgress(), m.swingProgress());
+}
+
+// The archer's bow through idle and draw, evaluated in one place — the body pass
+// (limbs, string, arms, arrow), the FX pass (arrowhead glint), and the actual
+// arrow spawn all read this, the same contract pibGrip keeps for the knife. With
+// the red aiming beam gone, the bow IS the skeleton's whole threat language: it
+// tracks the aim, the string comes back, the arrowhead heats — all must agree.
+const SkelBow = struct {
+    grip: rl.Vector3, // bow hand, held out front along the aim
+    nock: rl.Vector3, // string hand: slides back as the draw builds
+    head: rl.Vector3, // arrowhead past the bow — the glint and the loosed arrow ride here
+    axis: rl.Vector3, // unit bow axis (canted): tips sit at grip +/- axis * BOW_HALF
+    f: rl.Vector3,
+    right: rl.Vector3,
+};
+const BOW_HALF = 0.62;
+
+fn skelBow(m: *const Monster) SkelBow {
+    const f = mathx.orFacing(m.Facing, 0, 1);
+    const right = mathx.perpXZ(f);
+    const wp = m.windupProgress();
+    const gy = MONSTER_TORSO_BASE + (m.Height - 0.5) * 0.72 + monsterBob(m);
+    const grip = v3(m.Pos.x + f.x * (m.Radius + 0.5), gy, m.Pos.z + f.z * (m.Radius + 0.5));
+    // Canted like a hunter's bow (~35 deg off vertical): the top-down camera sees
+    // the full arc and the string, instead of a vertical bow edge-on as a line.
+    const axis = v3(right.x * 0.574, 0.819, right.z * 0.574);
+    return .{
+        .grip = grip,
+        .nock = v3(grip.x - f.x * (0.18 + 0.42 * wp), gy - 0.02, grip.z - f.z * (0.18 + 0.42 * wp)),
+        .head = v3(grip.x + f.x * 0.34, gy + 0.02, grip.z + f.z * 0.34),
+        .axis = axis,
+        .f = f,
+        .right = right,
+    };
 }
 fn monsterHeadY(m: *const Monster, shrink: f32) f32 {
     return MONSTER_TORSO_BASE + (m.Height - 0.5) * shrink + MONSTER_HEAD_GAP * shrink + monsterBob(m);
@@ -1517,11 +1800,59 @@ fn monsterHeadFwd(m: *const Monster) f32 {
     };
 }
 
+// How far the torso TOP (and everything hung off it: head, hump, shoulders) leans
+// off vertical this frame, in world XZ. Posture in motion: the pib rolls with its
+// waddle; the zombie LISTS side to side — lumbering is posture, not just speed —
+// rears back under its overhead raise, then heaves forward through the slam.
+// Shared by the body pass and the FX pass so the glowing eyes ride the leaning head.
+fn monsterTorsoLean(m: *const Monster) rl.Vector3 {
+    const f = mathx.orFacing(m.Facing, 0, 1);
+    const right = mathx.perpXZ(f);
+    switch (m.Kind) {
+        .fallen => {
+            const roll = sinf(m.bob * 1.6) * 0.07;
+            return v3(right.x * roll, 0, right.z * roll);
+        },
+        .zombie => {
+            const sway = sinf(m.bob * 0.55) * 0.2;
+            var pitch: f32 = 0.1; // resting slouch, ahead of the hunch
+            if (m.swing > 0) {
+                const e = 1 - (1 - m.swingProgress()) * (1 - m.swingProgress());
+                pitch = -0.18 + 0.6 * e; // the whole body crashes into the slam
+            } else if (m.windup > 0) {
+                pitch = 0.1 - 0.28 * m.windupProgress(); // rears back under the raise
+            }
+            return v3(right.x * sway + f.x * pitch, 0, right.z * sway + f.z * pitch);
+        },
+        .skeleton => {
+            // The archer leans INTO the draw: weight shifting toward the target
+            // as the string comes back — the aim reads off the whole frame.
+            const wl = 0.14 * m.windupProgress();
+            return v3(f.x * wl, 0, f.z * wl);
+        },
+        // Exhaustive like the sibling posture tables: a new kind forces a lean
+        // decision here rather than silently defaulting to no lean.
+        .brute => return mathx.zero3,
+    }
+}
+
 // Body + per-kind silhouette. Every appendage is drawn here (not in the FX pass) so
 // it exists in BOTH the shadow depth pass and the lit pass: horns and arms cast.
 // The whole (ground-relative) body is lifted by the monster's terrain height.
 // (pub: the editor draws statuesque encounter previews with the same bodies.)
 pub fn drawMonsterBody(m: *const Monster) void {
+    // Flush the batch NOW, while the matrix stack is clean. rlgl uploads matModel
+    // (and matNormal) from the CURRENT transform stack at every flush, and the
+    // scene shader derives fragPosition — ALL of its lighting — from matModel
+    // against already-world-space vertices (correct only when it's identity). With
+    // enough bodies on screen the batch used to overflow MID-BODY, inside this
+    // pushMatrix, and the whole accumulated scene got lit through that transform:
+    // the torch disc/fog blew out for exactly one flush segment. UNCONDITIONAL
+    // flush (not a headroom check): every body then starts against an empty batch,
+    // so no body under the full ~32k batch can trip the overflow inside its own
+    // push — a reservation-sized check proved too easy to under-provision (the
+    // hero alone tessellates past 6k verts).
+    rl.gl.rlDrawRenderBatchActive();
     rl.gl.rlPushMatrix();
     defer rl.gl.rlPopMatrix();
     rl.gl.rlTranslatef(0, m.Pos.y, 0);
@@ -1533,7 +1864,10 @@ pub fn drawMonsterBody(m: *const Monster) void {
     } else if (m.hitFlash > 0) {
         col = lerpColor(col, rl.Color.white, 0.75);
     } else if (m.windup > 0) {
-        col = lerpColor(col, rgba(255, 80, 40, 255), 0.35 + 0.45 * m.windupProgress());
+        col = lerpColor(col, THREAT_TINT, 0.35 + 0.45 * m.windupProgress());
+    } else if (m.swing > 0) {
+        // The flush holds through the cut and drains with the follow-through.
+        col = lerpColor(col, THREAT_TINT, 0.8 * (1 - m.swingProgress()));
     }
     const htop = (m.Height - 0.5) * shrink;
     const x = m.Pos.x;
@@ -1547,22 +1881,29 @@ pub fn drawMonsterBody(m: *const Monster) void {
         const spread = m.Radius * (0.55 + 1.25 * (1 - shrink));
         rl.drawCylinderEx(v3(x, 0.012, z), v3(x, 0.03, z), spread, spread, 16, rgba(74, 12, 14, 255));
     }
-    rl.drawCapsule(v3(x, MONSTER_TORSO_BASE + bob, z), v3(x, MONSTER_TORSO_BASE + htop + bob, z), m.Radius, 8, 4, col);
+    // The torso top carries the frame's lean (waddle roll, lumbering list, slam
+    // pitch); shrink collapses it with the rest of the death fade. The skeleton
+    // draws GAUNT — a slimmer spine than its hitbox, with the bony fittings
+    // (shoulders, ribs, bow) carrying the width.
+    const lean = monsterTorsoLean(m);
+    const torsoR = if (m.Kind == .skeleton) m.Radius * 0.72 else m.Radius;
+    rl.drawCapsule(v3(x, MONSTER_TORSO_BASE + bob, z), v3(x + lean.x * shrink, MONSTER_TORSO_BASE + htop + bob, z + lean.z * shrink), torsoR, 8, 4, col);
     const headY = monsterHeadY(m, shrink);
     const headR = m.Radius * 0.7 * shrink;
     // Posture: the head sits forward of the spine by a per-kind amount (hunch, jut,
-    // snout-lead); every face feature below hangs off this shared head center.
+    // snout-lead) and rides the torso lean; every face feature hangs off this center.
     const fwd = monsterHeadFwd(m) * shrink;
-    const hcx = x + f.x * fwd;
-    const hcz = z + f.z * fwd;
+    const hcx = x + f.x * fwd + lean.x * shrink;
+    const hcz = z + f.z * fwd + lean.z * shrink;
     sphere(v3(hcx, headY, hcz), headR, col);
 
     switch (m.Kind) {
         // Pib: a cute little knife pig. Round ears, a pink snout, a stubby curl of
-        // tail, a happy waddle — and a genuinely dangerous knife, raised high for
-        // the whole windup so the cuteness stays a threat you must respect.
+        // tail, trotter feet under a happy waddle — and a genuinely dangerous knife
+        // whose cocked-back arc is the pib's entire strike telegraph.
         .fallen => {
-            const waddle = sinf(m.bob * 1.6) * 0.05; // side-to-side toddle
+            const gait = m.bob * 1.6;
+            const waddle = sinf(gait) * 0.05; // side-to-side toddle
             const hx = hcx + right.x * waddle;
             const hz = hcz + right.z * waddle;
             // Perky triangle pig ears pointing UP — they read from the top-down
@@ -1576,20 +1917,48 @@ pub fn drawMonsterBody(m: *const Monster) void {
             // Curly tail nub, offset opposite the waddle so it wags as it walks.
             const tail = v3(x - f.x * m.Radius * 1.05 - right.x * waddle * 2, MONSTER_TORSO_BASE + 0.25 + bob, z - f.z * m.Radius * 1.05 - right.z * waddle * 2);
             sphere(tail, 0.09 * shrink, lerpColor(col, rgba(255, 150, 150, 255), 0.35));
+            // Trotter feet peeking out under the belly, stepping in antiphase —
+            // the waddle finally has legs under it (they read from top-down as
+            // little dark toes poking past the silhouette in turn).
+            const hoof = lerpColor(col, rl.Color.black, 0.35);
+            for ([_]f32{ -1, 1 }) |s| {
+                const step = sinf(gait + s * 1.57) * 0.16;
+                sphere(v3(x + f.x * (0.18 + step) + right.x * 0.28 * s, 0.09, z + f.z * (0.18 + step) + right.z * 0.28 * s), 0.1 * shrink, hoof);
+            }
+            const armCol = lerpColor(col, rl.Color.black, 0.15);
             // The knife: a comically OVERSIZED blade in its trotter — shouldered like
-            // a little pikeman on the march, thrust overhead as the strike telegraph
-            // builds. It has to read at gameplay zoom: a big knife on a small pig is
-            // funnier AND scarier, and the blade is the pib's whole threat language.
+            // a little pikeman on the march, cocked back behind the shoulder as the
+            // strike builds, then whipped around the front. It has to read at gameplay
+            // zoom: a big knife on a small pig is funnier AND scarier, and the blade
+            // is the pib's whole threat language.
             const grip = pibGrip(m);
             const hand = grip.hand;
-            const tip = pibKnifeTip(grip);
-            // A stubby trotter arm up to the grip, so the knife is HELD, not floating.
-            rl.drawCapsule(v3(x + right.x * m.Radius * 0.6, MONSTER_TORSO_BASE + 0.28 + bob, z + right.z * m.Radius * 0.6), v3(hand.x, hand.y - 0.08, hand.z), 0.09 * shrink, 6, 4, lerpColor(col, rl.Color.black, 0.15));
+            const tip = grip.tip;
+            // The knife arm has an ELBOW: two segments bent around a joint pushed
+            // out from the spine, so cocks and swings read as an arm articulating,
+            // not a stick pivoting.
+            const sh = v3(x + right.x * m.Radius * 0.6, MONSTER_TORSO_BASE + 0.28 + bob, z + right.z * m.Radius * 0.6);
+            const wrist = v3(hand.x, hand.y - 0.08, hand.z);
+            const eo = dirXZ(v3(x, 0, z), v3((sh.x + wrist.x) * 0.5, 0, (sh.z + wrist.z) * 0.5));
+            const elbow = v3((sh.x + wrist.x) * 0.5 + eo.x * 0.13, (sh.y + wrist.y) * 0.5 - 0.05 * shrink, (sh.z + wrist.z) * 0.5 + eo.z * 0.13);
+            rl.drawCapsule(sh, elbow, 0.09 * shrink, 6, 4, armCol);
+            rl.drawCapsule(elbow, wrist, 0.08 * shrink, 6, 4, armCol);
+            sphere(elbow, 0.095 * shrink, armCol);
+            // The off arm: a stubby counter-swinging trotter — thrown straight up
+            // beside the knife when the pib panics, which sells the flee in one glance.
+            const osh = v3(x - right.x * m.Radius * 0.6, MONSTER_TORSO_BASE + 0.3 + bob, z - right.z * m.Radius * 0.6);
+            var ohand = v3(osh.x + f.x * (0.14 + sinf(gait) * 0.14) - right.x * 0.1, osh.y + 0.04, osh.z + f.z * (0.14 + sinf(gait) * 0.14) - right.z * 0.1);
+            if (m.fleeing() and m.windup <= 0 and m.swing <= 0) {
+                ohand = v3(osh.x - right.x * 0.16 + f.x * 0.05, osh.y + 0.5 + 0.05 * sinf(m.bob * 5 + 1.3), osh.z - right.z * 0.16 + f.z * 0.05);
+            }
+            rl.drawCapsule(osh, ohand, 0.075 * shrink, 6, 4, armCol);
             // Leather grip with a brass pommel bead.
             rl.drawCylinderEx(v3(hand.x, hand.y - 0.15, hand.z), v3(hand.x, hand.y + 0.05, hand.z), 0.06 * shrink, 0.055 * shrink, 5, rgba(70, 50, 34, 255));
             sphere(v3(hand.x, hand.y - 0.17, hand.z), 0.06 * shrink, theme.trimColor);
-            // Crossguard: a proper brass bar across the blade root.
-            rl.drawCylinderEx(v3(hand.x - right.x * 0.17, hand.y + 0.06, hand.z - right.z * 0.17), v3(hand.x + right.x * 0.17, hand.y + 0.06, hand.z + right.z * 0.17), 0.04 * shrink, 0.04 * shrink, 4, theme.trimColor);
+            // Crossguard: a proper brass bar across the blade root, perpendicular to
+            // the swing's radial so it stays square to the blade through the arc.
+            const gd = mathx.perpXZ(grip.out);
+            rl.drawCylinderEx(v3(hand.x - gd.x * 0.17, hand.y + 0.06, hand.z - gd.z * 0.17), v3(hand.x + gd.x * 0.17, hand.y + 0.06, hand.z + gd.z * 0.17), 0.04 * shrink, 0.04 * shrink, 4, theme.trimColor);
             // The blade itself: bright cold steel tapering to the point, with a pale
             // edge-bevel line up the spine so it catches light like ground metal.
             // (The death fade shortens it toward the hand with everything else.)
@@ -1597,40 +1966,109 @@ pub fn drawMonsterBody(m: *const Monster) void {
             rl.drawCylinderEx(v3(hand.x, hand.y + 0.07, hand.z), tipDrawn, 0.095 * shrink, 0.0, 5, rgba(206, 214, 228, 255));
             rl.drawCylinderEx(v3(hand.x + f.x * 0.03, hand.y + 0.1, hand.z + f.z * 0.03), tipDrawn, 0.032 * shrink, 0.0, 4, rgba(240, 246, 252, 255));
         },
-        // Zombie: hunched over reaching arms — one out farther than the other,
-        // because symmetry reads "healthy" and this thing is not.
+        // Zombie: a lumbering hunch that lists side to side as it shuffles — and a
+        // slow two-handed OVERHEAD slam whose long raise is its entire telegraph.
         .zombie => {
             const shY = MONSTER_TORSO_BASE + htop * 0.8 + bob;
             const flesh = lerpColor(col, rgba(205, 215, 165, 255), 0.3); // paler rot
+            const lurch = m.bob * 0.55; // the slow heave of the lumber
             // The hump: a swollen back rising over the shoulders, shoving the head
             // forward and down — the corpse never learned to stand back up straight.
-            sphere(v3(x - f.x * m.Radius * 0.4, MONSTER_TORSO_BASE + htop * 0.98 + bob, z - f.z * m.Radius * 0.4), m.Radius * 0.8 * shrink, lerpColor(col, rl.Color.black, 0.15));
+            sphere(v3(x - f.x * m.Radius * 0.4 + lean.x * shrink, MONSTER_TORSO_BASE + htop * 0.98 + bob, z - f.z * m.Radius * 0.4 + lean.z * shrink), m.Radius * 0.8 * shrink, lerpColor(col, rl.Color.black, 0.15));
+            // Arms: elbowed, claw-tipped, asymmetric at rest (symmetry reads
+            // "healthy"). The windup hauls BOTH overhead — elbows flared, body
+            // rearing — and the swing crashes them down to the impact point out
+            // front, the same spot resolveMonsterAttack kicks its dust from.
+            const wp = m.windupProgress();
+            const sp = m.swingProgress();
             for ([_]f32{ -1, 1 }) |s| {
-                const reach: f32 = if (s > 0) 0.9 else 0.68;
-                const sh = v3(x + right.x * m.Radius * 0.7 * s, shY, z + right.z * m.Radius * 0.7 * s);
-                const hand = v3(sh.x + f.x * reach * shrink, shY - 0.12, sh.z + f.z * reach * shrink);
-                rl.drawCapsule(sh, hand, 0.13 * shrink, 6, 4, flesh);
+                const sh = v3(x + (right.x * m.Radius * 0.7 * s + lean.x) * shrink, shY, z + (right.z * m.Radius * 0.7 * s + lean.z) * shrink);
+                const baseReach: f32 = if (s > 0) 0.9 else 0.68;
+                const reach = baseReach + sinf(lurch + s * 1.6) * 0.16;
+                var hand = v3(sh.x + f.x * reach * shrink, shY - 0.12, sh.z + f.z * reach * shrink);
+                if (sp > 0) {
+                    const e = 1 - (1 - sp) * (1 - sp); // crash out of the raise
+                    const hTop = v3(x + right.x * 0.4 * s - f.x * 0.2, headY + 0.85 * shrink, z + right.z * 0.4 * s - f.z * 0.2);
+                    const hGnd = v3(x + f.x * (m.Radius + ZOMBIE_SLAM_FWD) + right.x * 0.3 * s, 0.22, z + f.z * (m.Radius + ZOMBIE_SLAM_FWD) + right.z * 0.3 * s);
+                    hand = v3(hTop.x + (hGnd.x - hTop.x) * e, hTop.y + (hGnd.y - hTop.y) * e, hTop.z + (hGnd.z - hTop.z) * e);
+                } else if (wp > 0) {
+                    const hTop = v3(x + right.x * 0.4 * s - f.x * 0.2, headY + 0.85 * shrink, z + right.z * 0.4 * s - f.z * 0.2);
+                    hand = v3(hand.x + (hTop.x - hand.x) * wp, hand.y + (hTop.y - hand.y) * wp, hand.z + (hTop.z - hand.z) * wp);
+                }
+                // Elbow: pushed out from the spine and sagging — the arm hangs heavy.
+                const eo = dirXZ(v3(x, 0, z), v3((sh.x + hand.x) * 0.5, 0, (sh.z + hand.z) * 0.5));
+                const elbow = v3((sh.x + hand.x) * 0.5 + eo.x * (0.16 + 0.14 * wp), (sh.y + hand.y) * 0.5 - 0.1 * shrink * (1 - wp), (sh.z + hand.z) * 0.5 + eo.z * (0.16 + 0.14 * wp));
+                rl.drawCapsule(sh, elbow, 0.13 * shrink, 6, 4, flesh);
+                rl.drawCapsule(elbow, hand, 0.11 * shrink, 6, 4, flesh);
+                sphere(elbow, 0.13 * shrink, flesh);
+                // A knotted claw of a hand — the slam needs a visible fist to follow.
+                sphere(hand, 0.16 * shrink, lerpColor(flesh, rl.Color.black, 0.2));
+            }
+            // Feet: one stepping, one DRAGGING — a healthy alternating gait would
+            // read alive; the stiff leg never lifts into a proper stride.
+            const bootCol = lerpColor(col, rl.Color.black, 0.4);
+            for ([_]f32{ -1, 1 }) |s| {
+                var step = sinf(lurch + s * 1.57) * 0.22;
+                if (s < 0) step = clampF(step, -0.22, 0.06);
+                sphere(v3(x + f.x * (0.1 + step) + right.x * 0.3 * s, 0.09, z + f.z * (0.1 + step) + right.z * 0.3 * s), 0.13 * shrink, bootCol);
             }
             // A slack jaw hanging off the front of the skull: the head lolls.
             sphere(v3(hcx + f.x * headR * 0.85, headY - headR * 0.5, hcz + f.z * headR * 0.85), headR * 0.38, flesh);
         },
-        // Archer: a drawn bow held out front — the ranged threat reads at a glance.
+        // Archer: a gaunt bone frame behind a proper hunter's bow — canted arc,
+        // live string, both arms on the weapon. The whole rig points where it
+        // aims, and the draw is the entire warning a shot is coming.
         .skeleton => {
-            const bh = v3(x + f.x * (m.Radius + 0.25), MONSTER_TORSO_BASE + htop * 0.72 + bob, z + f.z * (m.Radius + 0.25));
-            const bowCol = rgba(110, 78, 46, 255);
-            rl.drawCylinderEx(bh, v3(bh.x - f.x * 0.14, bh.y + 0.62 * shrink, bh.z - f.z * 0.14), 0.06, 0.02, 5, bowCol);
-            rl.drawCylinderEx(bh, v3(bh.x - f.x * 0.14, bh.y - 0.62 * shrink, bh.z - f.z * 0.14), 0.06, 0.02, 5, bowCol);
-            // While the shot telegraphs, an arrow sits nocked and draws back — the
-            // red beam says a shot is coming; the arrow says from where.
+            const wp = m.windupProgress();
+            const bow = skelBow(m);
+            const boneCol = lerpColor(col, rl.Color.white, 0.15);
+            // Pale ashwood, not dark: the bow must read against scuffed dark ground
+            // at gameplay zoom — it's the skeleton's entire threat silhouette.
+            const bowCol = rgba(158, 118, 68, 255);
+            // Bow limbs: swept back off the canted axis, tapering to the tips.
+            // (Death fade folds the whole rig toward the grip via shrink.)
+            const tipU = v3(bow.grip.x + (bow.axis.x * BOW_HALF - f.x * 0.14) * shrink, bow.grip.y + bow.axis.y * BOW_HALF * shrink, bow.grip.z + (bow.axis.z * BOW_HALF - f.z * 0.14) * shrink);
+            const tipD = v3(bow.grip.x - (bow.axis.x * BOW_HALF + f.x * 0.14) * shrink, bow.grip.y - bow.axis.y * BOW_HALF * shrink, bow.grip.z - (bow.axis.z * BOW_HALF + f.z * 0.14) * shrink);
+            rl.drawCylinderEx(bow.grip, tipU, 0.07 * shrink, 0.025 * shrink, 5, bowCol);
+            rl.drawCylinderEx(bow.grip, tipD, 0.07 * shrink, 0.025 * shrink, 5, bowCol);
+            // The string: tip to tip through the nock hand. At rest it sits nearly
+            // straight; the draw vees it back — THE aggression cue, readable from
+            // the top-down camera because the bow is canted.
+            const stringCol = rgba(235, 235, 245, 255);
+            rl.drawCylinderEx(tipU, bow.nock, 0.02, 0.02, 3, stringCol);
+            rl.drawCylinderEx(bow.nock, tipD, 0.02, 0.02, 3, stringCol);
+            // Bow arm: off shoulder straight out to the grip, locked.
+            const shY = MONSTER_TORSO_BASE + htop * 0.85 + bob;
+            const shL = v3(x - right.x * m.Radius * 0.85, shY, z - right.z * m.Radius * 0.85);
+            const shR = v3(x + right.x * m.Radius * 0.85, shY, z + right.z * m.Radius * 0.85);
+            rl.drawCapsule(shL, v3(bow.grip.x, bow.grip.y - 0.02, bow.grip.z), 0.065 * shrink, 6, 4, boneCol);
+            // Draw arm: hangs at the hip until a shot telegraphs, then snaps to
+            // the string and hauls it back, elbow flaring high behind.
+            const reachT = clampF(wp * 2.5, 0, 1); // hand finds the string early in the draw
+            const rest = v3(x + right.x * m.Radius * 0.95 + f.x * 0.1, MONSTER_TORSO_BASE + htop * 0.35 + bob, z + right.z * m.Radius * 0.95 + f.z * 0.1);
+            const dhand = v3(rest.x + (bow.nock.x - rest.x) * reachT, rest.y + (bow.nock.y - rest.y) * reachT, rest.z + (bow.nock.z - rest.z) * reachT);
+            const delbow = v3((shR.x + dhand.x) * 0.5 - f.x * (0.1 + 0.2 * wp) + right.x * 0.1, (shR.y + dhand.y) * 0.5 + 0.08 * reachT, (shR.z + dhand.z) * 0.5 - f.z * (0.1 + 0.2 * wp) + right.z * 0.1);
+            rl.drawCapsule(shR, delbow, 0.065 * shrink, 6, 4, boneCol);
+            rl.drawCapsule(delbow, dhand, 0.055 * shrink, 6, 4, boneCol);
+            sphere(delbow, 0.07 * shrink, boneCol);
+            // The nocked arrow rides the string back — shaft, pale head past the
+            // bow, grey fletch at the nock. It says a shot is coming AND from where.
             if (m.windup > 0) {
-                const pull = m.windupProgress();
-                const nock = v3(bh.x - f.x * (0.2 + 0.3 * pull), bh.y, bh.z - f.z * (0.2 + 0.3 * pull));
-                rl.drawCylinderEx(nock, v3(bh.x + f.x * 0.3, bh.y, bh.z + f.z * 0.3), 0.03, 0.03, 4, rgba(140, 108, 70, 255));
-                rl.drawCylinderEx(v3(bh.x + f.x * 0.3, bh.y, bh.z + f.z * 0.3), v3(bh.x + f.x * 0.42, bh.y, bh.z + f.z * 0.42), 0.055, 0.0, 4, rgba(225, 220, 200, 255));
+                rl.drawCylinderEx(bow.nock, bow.head, 0.035, 0.035, 4, rgba(165, 128, 82, 255));
+                rl.drawCylinderEx(bow.head, v3(bow.head.x + f.x * 0.16, bow.head.y, bow.head.z + f.z * 0.16), 0.07, 0.0, 4, rgba(235, 230, 210, 255));
+                rl.drawCylinderEx(bow.nock, v3(bow.nock.x + f.x * 0.14, bow.nock.y, bow.nock.z + f.z * 0.14), 0.085, 0.02, 4, rgba(210, 210, 220, 230));
+            }
+            // Quiver: a fan of fletched shafts over the off shoulder — the archer
+            // reads as an archer from BEHIND too, where the bow is hidden.
+            for ([_]f32{ -0.14, 0.0, 0.14 }) |qa| {
+                const qb = v3(x - f.x * m.Radius * 0.55 - right.x * m.Radius * 0.35, MONSTER_TORSO_BASE + htop * 0.6 + bob, z - f.z * m.Radius * 0.55 - right.z * m.Radius * 0.35);
+                const qt = v3(qb.x + (-f.x * 0.22 + right.x * qa) * shrink, qb.y + 0.62 * shrink, qb.z + (-f.z * 0.22 + right.z * qa) * shrink);
+                rl.drawCylinderEx(qb, qt, 0.02 * shrink, 0.02 * shrink, 3, rgba(126, 96, 62, 255));
+                sphere(qt, 0.045 * shrink, rgba(205, 205, 215, 255));
             }
             // Bony shoulder knobs so the pale frame looks skeletal, not smooth.
             for ([_]f32{ -1, 1 }) |s| {
-                sphere(v3(x + right.x * m.Radius * 0.85 * s, MONSTER_TORSO_BASE + htop * 0.85 + bob, z + right.z * m.Radius * 0.85 * s), 0.14 * shrink, lerpColor(col, rl.Color.white, 0.15));
+                sphere(v3(x + right.x * m.Radius * 0.85 * s, shY, z + right.z * m.Radius * 0.85 * s), 0.14 * shrink, boneCol);
             }
             // Ribcage: three darker bands arced across the front of the frame — the
             // one detail that says "bones" instead of "pale ghost" at gameplay zoom.
@@ -1638,8 +2076,8 @@ pub fn drawMonsterBody(m: *const Monster) void {
             for ([_]f32{ 0.42, 0.58, 0.74 }) |rf| {
                 const ry = MONSTER_TORSO_BASE + htop * rf + bob;
                 rl.drawCylinderEx(
-                    v3(x + f.x * m.Radius * 0.55 - right.x * m.Radius * 0.68, ry, z + f.z * m.Radius * 0.55 - right.z * m.Radius * 0.68),
-                    v3(x + f.x * m.Radius * 0.55 + right.x * m.Radius * 0.68, ry, z + f.z * m.Radius * 0.55 + right.z * m.Radius * 0.68),
+                    v3(x + f.x * m.Radius * 0.45 - right.x * m.Radius * 0.62, ry, z + f.z * m.Radius * 0.45 - right.z * m.Radius * 0.62),
+                    v3(x + f.x * m.Radius * 0.45 + right.x * m.Radius * 0.62, ry, z + f.z * m.Radius * 0.45 + right.z * m.Radius * 0.62),
                     0.035 * shrink,
                     0.035 * shrink,
                     4,
@@ -1728,7 +2166,10 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
             rl.drawCircle3D(v3(m.Pos.x, 0.06, m.Pos.z), m.Radius + 0.4, v3(1, 0, 0), 90, rgba(255, 60, 60, 200));
             rl.drawCircle3D(v3(m.Pos.x, 0.06, m.Pos.z), m.Radius + 0.55 + 0.1 * sinf(t * 3), v3(1, 0, 0), 90, rgba(255, 60, 60, 90));
         }
-        if (m.windup > 0) {
+        // Ground telegraph — only for kinds that still use one. The pib, zombie,
+        // and skeleton carry their warning entirely in the body anim (cocked
+        // knife, overhead raise, drawn bow): no marking or beam for them, by design.
+        if (m.windup > 0 and !monster.animTelegraph(m.Kind)) {
             const tp = m.windupProgress();
             const a = mathx.u8f(clampF(110 + 130 * tp, 0, 255));
             if (m.Ranged) {
@@ -1745,24 +2186,93 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
             }
         }
         // The pib knife catches the torchlight: a white star twinkling at the point
-        // whenever the pig is in view, flaring hard as the strike comes down. The
-        // knife IS the pib's telegraph — you should never lose track of it.
+        // whenever the pig is in view, flaring as the cock builds and the cut flies.
+        // The knife IS the pib's telegraph — you should never lose track of it.
         if (m.Kind == .fallen) {
-            const tp = m.windupProgress();
-            const tip = pibKnifeTip(pibGrip(m));
+            const wp = m.windupProgress();
+            const sp = m.swingProgress();
+            const tip = pibGrip(m).tip;
+            const flare = maxF(wp, sinf(sp * std.math.pi)); // peaks as the blade crosses you
             const tw = 0.7 + 0.3 * sinf(t * 9 + m.Pos.x * 3 + m.Pos.z * 5); // idle twinkle
-            sphere(tip, (0.035 + 0.07 * tp) * tw, rgba(255, 255, 245, 255));
-            sphere(tip, (0.1 + 0.15 * tp) * tw, rgba(255, 250, 220, mathx.u8f(40 + 110 * tp)));
+            sphere(tip, (0.035 + 0.07 * flare) * tw, rgba(255, 255, 245, 255));
+            sphere(tip, (0.1 + 0.15 * flare) * tw, rgba(255, 250, 220, mathx.u8f(40 + 110 * flare)));
+            // The cut leaves a trail: fading ghosts of the tip strung back along
+            // the arc it just carved — the swing reads as a sweep, not a teleport.
+            if (sp > 0) {
+                var k: f32 = 1;
+                while (k <= 5) : (k += 1) {
+                    const gsp = sp - k * 0.055;
+                    if (gsp <= 0) break;
+                    const ghost = pibGripAt(m, 1, gsp).tip;
+                    sphere(ghost, 0.05 * (1 - k * 0.15), rgba(235, 240, 250, mathx.u8f(150 - k * 26)));
+                }
+            }
+        }
+        // The arrowhead heats as the draw builds: the "you are targeted" cue now
+        // lives on the weapon itself, growing from ember to flare at full draw.
+        if (m.Kind == .skeleton and m.windup > 0) {
+            const wp = m.windupProgress();
+            const head = skelBow(m).head;
+            sphere(head, 0.03 + 0.05 * wp, rgba(255, 235, 200, 255));
+            sphere(head, 0.08 + 0.14 * wp, rgba(255, 150, 55, mathx.u8f(50 + 150 * wp)));
         }
         const headY = monsterHeadY(m, 1);
         const f = mathx.orFacing(m.Facing, 0, 1);
         const right = mathx.perpXZ(f);
-        const eyeCol = if (m.windup > 0) rgba(255, 70, 40, 255) else rgba(255, 210, 60, 255);
-        // Eyes ride the same forward-shifted head center the body pass drew.
+        // Skeleton sockets burn cold when idle — everyone flares red on the attack.
+        const idleEye = if (m.Kind == .skeleton) rgba(150, 225, 255, 255) else rgba(255, 210, 60, 255);
+        const eyeCol = if (m.windup > 0 or m.swing > 0) rgba(255, 70, 40, 255) else idleEye;
+        // Eyes ride the same forward-shifted, lean-carried head center the body drew.
+        const lean = monsterTorsoLean(m);
         const eyeFwd = m.Radius * 0.5 + monsterHeadFwd(m);
         for ([_]f32{ -1, 1 }) |s| {
-            const e = v3(m.Pos.x + f.x * eyeFwd + right.x * m.Radius * 0.3 * s, headY + 0.02, m.Pos.z + f.z * eyeFwd + right.z * m.Radius * 0.3 * s);
+            const e = v3(m.Pos.x + f.x * eyeFwd + right.x * m.Radius * 0.3 * s + lean.x, headY + 0.02, m.Pos.z + f.z * eyeFwd + right.z * m.Radius * 0.3 * s + lean.z);
             sphere(e, 0.07, eyeCol);
+        }
+    }
+}
+
+// The miasma made visible: a low churning stack of rot-green blobs filling the
+// DoT footprint, over a ground stain at the TRUE damage radius — what you see is
+// what hurts, without painting a hard warning ring. Emissive pass (after endScene)
+// like all glow FX; gated at the lit radius like every dynamic body.
+//
+// ADDITIVE, with depth WRITES off: gas is glowing vapor, so it may only ever ADD
+// light. Default alpha blending filmed these mid-green blobs over the torch-lit
+// ground and visibly DARKENED it (the cloud "ate" the light), and their depth
+// writes clipped loot beams/particles that passed behind the invisible parts of
+// each sphere. Depth is still TESTED, so walls occlude the cloud correctly.
+fn drawGasClouds(g: *Game, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams, t: f32) void {
+    if (g.gasCount == 0) return;
+    rl.beginBlendMode(.additive);
+    rl.gl.rlDisableDepthMask();
+    defer {
+        // endBlendMode FIRST: it flushes the batched gas geometry, which must
+        // still see depth writes disabled; only then restore the mask.
+        rl.endBlendMode();
+        rl.gl.rlEnableDepthMask();
+    }
+    for (g.gas[0..g.gasCount]) |*gc| {
+        if (!bodyVisible(gc.Pos, lightXZ, torchR, fp)) continue;
+        const age = GAS_LIFE - gc.life;
+        const grow = clampF(age / GAS_GROW, 0.15, 1); // billow up out of the corpse
+        const fade = clampF(gc.life / (GAS_LIFE * 0.28), 0, 1); // thin out at the end
+        const r = GAS_RADIUS * grow;
+        const a = fade * (0.8 + 0.2 * sinf(t * 2.3 + gc.seed)); // slow breathing
+        rl.drawCylinderEx(v3(gc.Pos.x, gc.Pos.y + 0.02, gc.Pos.z), v3(gc.Pos.x, gc.Pos.y + 0.05, gc.Pos.z), r, r, 20, rgba(52, 105, 28, mathx.u8f(56 * a)));
+        // A bright heart low in the cloud, so the hazard reads at a glance even
+        // under the churn. (Additive: overlaps brighten, so each layer stays deep.)
+        sphere(v3(gc.Pos.x, gc.Pos.y + 0.45 * grow, gc.Pos.z), r * 0.38 * grow, rgba(98, 175, 50, mathx.u8f(62 * a)));
+        // Blobs churn on slow per-cloud lissajous seats out to the footprint edge.
+        var i: usize = 0;
+        while (i < 5) : (i += 1) {
+            const fi: f32 = @floatFromInt(i);
+            const ph = gc.seed + fi * 1.9;
+            const orbit = r * (0.18 + 0.11 * fi);
+            const bx = gc.Pos.x + cosf(t * (0.5 + 0.09 * fi) + ph) * orbit;
+            const bz = gc.Pos.z + sinf(t * (0.4 + 0.07 * fi) + ph * 1.7) * orbit;
+            const by = gc.Pos.y + (0.3 + 0.22 * fi) * grow + 0.1 * sinf(t * 1.1 + ph);
+            sphere(v3(bx, by, bz), r * (0.5 - 0.05 * fi) * grow, rgba(72, 142, 38, mathx.u8f((48 - 5 * fi) * a)));
         }
     }
 }
@@ -1770,7 +2280,9 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
 // Pick the fireball that lights the scene: the first live player bolt. Its light is
 // modeled overhead (FIRE_HEIGHT above the terrain under the bolt) so the downward
 // shadow map is well-oriented, with a warm colour and a gentle flame flicker.
-// intensity 0 => no fireball, light disabled.
+// intensity 0 => no fireball, light disabled. (The "light blowing out mid-fight"
+// bug was never this light: it was the render batch overflowing mid-body-draw and
+// re-uploading matModel from a pushed transform — see drawMonsterBody.)
 fn fireLight(g: *Game, t: f32) tl.FireParams {
     for (g.projs.items()) |*pr| {
         if (!pr.FromPlayer) continue;
@@ -1797,7 +2309,7 @@ fn drawProjectiles(projs: *ProjList, t: f32) void {
             rl.drawCylinderEx(tail, pr.Pos, 0.04, pr.Radius * 0.75, 6, rgba(255, 120, 30, 120));
             sphere(pr.Pos, pr.Radius * 0.95 * flick, rgba(255, 110, 25, 95));
             sphere(pr.Pos, pr.Radius * 0.6 * flick, rgba(255, 180, 60, 210));
-            sphere(pr.Pos, pr.Radius * 0.32, rgba(255, 246, 205, 255));
+            sphere(pr.Pos, pr.Radius * 0.32, projectile.flameHeartColor);
         } else {
             // Arrow: a real shaft — dark wood, pale bone head, grey fletching — laid
             // along its flight, far more legible (and menacing) than a floating ball.
@@ -1806,6 +2318,9 @@ fn drawProjectiles(projs: *ProjList, t: f32) void {
             const dz = pr.Vel.z * inv;
             const nock = v3(pr.Pos.x - dx * 0.5, pr.Pos.y, pr.Pos.z - dz * 0.5);
             const tip = v3(pr.Pos.x + dx * 0.28, pr.Pos.y, pr.Pos.z + dz * 0.28);
+            // A faint slipstream behind the shaft: with the aiming beam gone, the
+            // arrow itself must stay legible in the dark — the tracer is the warning.
+            rl.drawCylinderEx(v3(pr.Pos.x - dx * 1.5, pr.Pos.y, pr.Pos.z - dz * 1.5), nock, 0.008, 0.05, 4, rgba(220, 226, 238, 70));
             rl.drawCylinderEx(nock, tip, 0.035, 0.035, 5, rgba(120, 90, 60, 255));
             rl.drawCylinderEx(tip, v3(tip.x + dx * 0.16, tip.y, tip.z + dz * 0.16), 0.07, 0.0, 5, rgba(225, 220, 200, 255));
             rl.drawCylinderEx(nock, v3(nock.x + dx * 0.16, nock.y, nock.z + dz * 0.16), 0.09, 0.02, 4, rgba(200, 200, 210, 220));
@@ -1945,6 +2460,185 @@ fn drawFireflies(g: *const Game, t: f32) void {
     }
 }
 
+// LIGHT LOG (main menu → Debug Log) — a measuring instrument, not just a state
+// dump. While enabled, every playing frame:
+//   1. stashes the EXACT lp/fp/camera the frame was rendered with (drawWorld);
+//   2. after endDrawing, READS BACK the rendered frame and MEASURES the lit disc
+//      (dark-edge distance in px along 4 rays from screen center) + its color;
+//   3. logs both, plus clip planes, torch anchor, facing, every projectile's
+//      position/velocity, and NaN checks on all of it;
+//   4. when the measured radius deviates >30% from its rolling median, exports
+//      the offending frame itself to shots/anomaly_N.png and tags the line.
+// The rendered proof and the complete state land in the same line — whatever is
+// corrupting the lighting cannot hide on either side of the GPU boundary.
+var lightLogFile: ?std.fs.File = null;
+var dbgLp: tl.LightParams = .{ .pos = mathx.zero3, .radius = 0 };
+var dbgFp: tl.FireParams = .{ .pos = mathx.zero3, .radius = 0, .color = mathx.zero3, .intensity = 0 };
+var dbgCam: rl.Camera3D = undefined;
+var dbgFrame: u64 = 0;
+var dbgRadHist: [48]f32 = undefined;
+var dbgRadCount: usize = 0;
+var dbgRadIdx: usize = 0;
+var dbgAnomalies: i32 = 0;
+
+fn toggleDebugLog(g: *Game) void {
+    g.debugLog = !g.debugLog;
+    if (g.debugLog) {
+        // Fresh file per enable, header first so a pasted tail is self-describing.
+        if (lightLogFile) |f| f.close();
+        lightLogFile = std.fs.cwd().createFile("lightlog.txt", .{ .truncate = true }) catch null;
+        if (lightLogFile) |f| f.writeAll("# lightlog v2: fr t dt fps | lpR lpPos fpI fpR fpPos | cam->tgt fov zoom clip | torchXZ pPos face | MEASURED mrad(L,R,U,D) med ring(r,g,b) | projs pb arwN=(x,y,z|vy) | flash shake gas parts mons wind hp | nan\n") catch {};
+        dbgFrame = 0;
+        dbgRadCount = 0;
+        dbgRadIdx = 0;
+        dbgAnomalies = 0;
+    } else if (lightLogFile) |f| {
+        f.close();
+        lightLogFile = null;
+    }
+}
+
+fn nanBad(v: rl.Vector3) bool {
+    return std.math.isNan(v.x) or std.math.isNan(v.y) or std.math.isNan(v.z) or
+        std.math.isInf(v.x) or std.math.isInf(v.y) or std.math.isInf(v.z);
+}
+
+// Walk from screen center along (dx,dy) until 16 consecutive near-black pixels
+// begin (the fog beyond the lit disc); returns the px distance where the dark
+// run started, or the distance to the screen edge if it never went dark.
+fn rayDarkEdge(img: *const rl.Image, cx: i32, cy: i32, dx: i32, dy: i32) i32 {
+    var d: i32 = 1;
+    var darkRun: i32 = 0;
+    while (true) : (d += 1) {
+        const x = cx + dx * d;
+        const y = cy + dy * d;
+        if (x < 2 or y < 2 or x >= img.width - 2 or y >= img.height - 2) return d;
+        const c = rl.getImageColor(img.*, x, y);
+        const lum = @max(@max(@as(i32, c.r), @as(i32, c.g)), @as(i32, c.b));
+        if (lum < 26) {
+            darkRun += 1;
+            if (darkRun >= 16) return d - darkRun;
+        } else darkRun = 0;
+    }
+}
+
+// Post-endDrawing probe: measure the frame that was ACTUALLY presented, write the
+// mega-line, and export the frame itself when the measurement jumps.
+fn debugFrameProbe(g: *Game) void {
+    if (!g.debugLog or g.scene != .playing) return;
+    const f = lightLogFile orelse return;
+    dbgFrame += 1;
+    const img = rl.loadImageFromScreen() catch return;
+    defer rl.unloadImage(img);
+    const cx = @divTrunc(img.width, 2);
+    const cy = @divTrunc(img.height, 2);
+    const mL = rayDarkEdge(&img, cx, cy, -1, 0);
+    const mR = rayDarkEdge(&img, cx, cy, 1, 0);
+    const mU = rayDarkEdge(&img, cx, cy, 0, -1);
+    const mD = rayDarkEdge(&img, cx, cy, 0, 1);
+    const mAvg: f32 = @as(f32, @floatFromInt(mL + mR + mU + mD)) / 4.0;
+    // Disc color: mean RGB on a 12-point ring at 0.55x the measured extent —
+    // "turns colors" shows here as the ring hue jumping between lines.
+    var rr: i32 = 0;
+    var rg: i32 = 0;
+    var rb: i32 = 0;
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const a = @as(f32, @floatFromInt(i)) * (std.math.tau / 12.0);
+        const px = cx + @as(i32, @intFromFloat(cosf(a) * mAvg * 0.55));
+        const py = cy + @as(i32, @intFromFloat(sinf(a) * mAvg * 0.55));
+        const c = rl.getImageColor(img, std.math.clamp(px, 0, img.width - 1), std.math.clamp(py, 0, img.height - 1));
+        rr += c.r;
+        rg += c.g;
+        rb += c.b;
+    }
+    // Rolling median of the measured extent; deviation beyond +-30% = anomaly.
+    var med: f32 = mAvg;
+    var anom = false;
+    if (dbgRadCount >= 40) {
+        var sorted: [48]f32 = undefined;
+        const n = @min(dbgRadCount, dbgRadHist.len);
+        @memcpy(sorted[0..n], dbgRadHist[0..n]);
+        std.mem.sort(f32, sorted[0..n], {}, std.sort.asc(f32));
+        med = sorted[n / 2];
+        anom = mAvg > med * 1.3 or mAvg < med * 0.7;
+    }
+    dbgRadHist[dbgRadIdx] = mAvg;
+    dbgRadIdx = (dbgRadIdx + 1) % dbgRadHist.len;
+    if (dbgRadCount < dbgRadHist.len) dbgRadCount += 1;
+    var anomName: []const u8 = "";
+    var nbuf: [48]u8 = undefined;
+    if (anom and dbgAnomalies < 16) {
+        std.fs.cwd().makePath("shots") catch {};
+        if (std.fmt.bufPrintZ(&nbuf, "shots/anomaly_{d}.png", .{dbgAnomalies})) |nm| {
+            _ = rl.exportImage(img, nm);
+            anomName = nm;
+            dbgAnomalies += 1;
+        } else |_| {}
+    }
+    // NaN sweep across everything that feeds a draw this frame.
+    var nanFlags: [96]u8 = undefined;
+    var nanLen: usize = 0;
+    const appendNan = struct {
+        fn go(bufp: []u8, lenp: *usize, tag: []const u8) void {
+            if (lenp.* + tag.len + 1 > bufp.len) return;
+            @memcpy(bufp[lenp.*..][0..tag.len], tag);
+            lenp.* += tag.len;
+            bufp[lenp.*] = ',';
+            lenp.* += 1;
+        }
+    }.go;
+    if (nanBad(g.torchXZ)) appendNan(&nanFlags, &nanLen, "torch");
+    if (nanBad(g.p.Pos)) appendNan(&nanFlags, &nanLen, "pPos");
+    if (nanBad(g.p.Facing)) appendNan(&nanFlags, &nanLen, "face");
+    if (nanBad(dbgCam.position) or nanBad(dbgCam.target)) appendNan(&nanFlags, &nanLen, "cam");
+    if (nanBad(dbgLp.pos) or std.math.isNan(dbgLp.radius)) appendNan(&nanFlags, &nanLen, "lp");
+    var fromPlayer: usize = 0;
+    var windups: usize = 0;
+    for (g.projs.items()) |*pr| {
+        if (pr.FromPlayer) fromPlayer += 1;
+        if (nanBad(pr.Pos) or nanBad(pr.Vel)) appendNan(&nanFlags, &nanLen, "proj");
+    }
+    for (g.liveMonsters()) |*m| {
+        if (m.windup > 0) windups += 1;
+        if (nanBad(m.Pos) or nanBad(m.Facing)) appendNan(&nanFlags, &nanLen, "mons");
+    }
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    w.print("fr={d} t={d:.3} dt={d:.1}ms fps={d} | lpR={d:.2} lpPos=({d:.1},{d:.1},{d:.1}) fpI={d:.3} fpR={d:.1} fpPos=({d:.1},{d:.1},{d:.1})", .{
+        dbgFrame,        g.elapsed,    rl.getFrameTime() * 1000.0, rl.getFPS(),
+        dbgLp.radius,    dbgLp.pos.x,  dbgLp.pos.y,                dbgLp.pos.z,
+        dbgFp.intensity, dbgFp.radius, dbgFp.pos.x,                dbgFp.pos.y,
+        dbgFp.pos.z,
+    }) catch return;
+    w.print(" | cam=({d:.1},{d:.1},{d:.1})->({d:.1},{d:.1},{d:.1}) fov={d:.1} zoom={d:.2} clip=({d:.2},{d:.1}) | torch=({d:.2},{d:.2}) p=({d:.2},{d:.2}) face=({d:.2},{d:.2})", .{
+        dbgCam.position.x, dbgCam.position.y, dbgCam.position.z,
+        dbgCam.target.x,   dbgCam.target.y,   dbgCam.target.z,
+        dbgCam.fovy,       g.rig.zoom,        rl.gl.rlGetCullDistanceNear(), rl.gl.rlGetCullDistanceFar(),
+        g.torchXZ.x,       g.torchXZ.z,       g.p.Pos.x,                     g.p.Pos.z,
+        g.p.Facing.x,      g.p.Facing.z,
+    }) catch return;
+    w.print(" | mrad=({d},{d},{d},{d}) med={d:.0} ring=({d},{d},{d}) | projs={d} pb={d}", .{
+        mL,                mR,                mU, mD, med,
+        @divTrunc(rr, 12), @divTrunc(rg, 12), @divTrunc(rb, 12),
+        g.projs.count,     fromPlayer,
+    }) catch return;
+    for (g.projs.items(), 0..) |*pr, pi| {
+        if (pi >= 4) break;
+        w.print(" a{d}=({d:.1},{d:.1},{d:.1}|{d:.1})", .{ pi, pr.Pos.x, pr.Pos.y, pr.Pos.z, pr.Vel.y }) catch return;
+    }
+    w.print(" | flash={d:.2} shake={d:.2} gas={d} parts={d} mons={d} wind={d} hp={d:.0} | nan={s}", .{
+        g.damageFlash, g.shake, g.gasCount, g.parts.count, g.monsterCount, windups, g.p.HP,
+        if (nanLen == 0) "OK" else nanFlags[0..nanLen],
+    }) catch return;
+    if (anom) {
+        w.print(" !!!ANOM med={d:.0} -> {d:.0} png={s}", .{ med, mAvg, anomName }) catch return;
+    }
+    w.print("\n", .{}) catch return;
+    f.writeAll(fbs.getWritten()) catch {};
+}
+
 // drawWorld renders one frame of the 3D scene through the frozen torch pipeline.
 fn drawWorld(g: *Game) void {
     var cam = g.rig.cam;
@@ -1968,6 +2662,14 @@ fn drawWorld(g: *Game) void {
     // set and the drawn light disc can never diverge.
     const lightGround = v3(g.torchXZ.x, 0, g.torchXZ.z);
     const fp = fireLight(g, t);
+    // Stash EXACTLY what this frame renders with (applyUniforms uploads these lp/fp,
+    // beginMode3D uses this cam) — debugFrameProbe logs them against the frame's
+    // MEASURED pixels after endDrawing, so state and picture can never disagree.
+    if (g.debugLog) {
+        dbgLp = lp;
+        dbgFp = fp;
+        dbgCam = cam;
+    }
     const ms = g.liveMonsters();
     const drawHero = g.p.alive();
 
@@ -1989,8 +2691,8 @@ fn drawWorld(g: *Game) void {
 
     // --- main pass ---
     rl.beginDrawing();
-    rl.clearBackground(rgba(16, 16, 22, 255));
-    g.torch.applyUniforms(cam, lp);
+    rl.clearBackground(theme.voidColor);
+    g.torch.applyUniforms(lp);
     g.torch.applyFireUniforms(fp);
     g.torch.applyFogUniforms(.{ .texId = @intCast(g.fog.tex.id), .halfW = g.fog.halfW, .halfD = g.fog.halfD });
     rl.beginMode3D(cam);
@@ -2006,6 +2708,7 @@ fn drawWorld(g: *Game) void {
     g.torch.endScene();
     if (drawHero) drawHeroFX(&g.p, t);
     drawMonstersFX(ms, lightGround, g.p.Pos, lp.radius, fp, g.hoverMonster, t);
+    drawGasClouds(g, lightGround, lp.radius, fp, t);
     drawLoot(&g.lootList, lightGround, lp.radius, fp);
     drawProjectiles(&g.projs, t);
     drawPortal(&g.w, t);
@@ -2045,9 +2748,7 @@ pub fn run(shot: bool) void {
     };
     if (shot) {
         g.scene = .playing;
-        g.p.Pos = sweep[0];
-        g.rig.snap(g.p.Pos);
-        g.torchXZ = torchFlameWorld(&g.p);
+        teleportHero(&g, sweep[0]);
         // Drain the resources partway so the orbs photograph with a visible liquid
         // surface (a full orb hides the meniscus + fill line entirely).
         g.p.HP = g.p.MaxHP * 0.62;
@@ -2094,7 +2795,10 @@ pub fn run(shot: bool) void {
             },
             .playing => {
                 if (rl.isKeyPressed(.escape) or padStartPressed()) {
-                    if (g.playtest) endPlaytest(&g) else g.scene = .menu;
+                    if (g.playtest) endPlaytest(&g) else {
+                        g.scene = .menu;
+                        g.hoverMonster = -1; // no hover ring pulsing in the menu backdrop
+                    }
                 }
                 if (g.scene == .playing) updatePlaying(&g, dt);
             },
@@ -2102,10 +2806,10 @@ pub fn run(shot: bool) void {
                 if (rl.isKeyPressed(.r) or padStartPressed()) {
                     if (g.playtest) endPlaytest(&g) else g.startRun();
                 }
-                g.parts.update(dt); // let the killing blow's burst finish playing
+                g.parts.update(dt, &g.w); // let the killing blow's burst finish playing
             },
             .victory => {
-                if (rl.isKeyPressed(.enter) or padStartPressed()) g.startRun();
+                if ((rl.isKeyPressed(.enter) and !altHeld) or padStartPressed()) g.startRun();
             },
             .editor => editor.update(&g, dt),
         }
@@ -2124,6 +2828,7 @@ pub fn run(shot: bool) void {
             drawWorld(&g);
             hudx.draw(&g);
             rl.endDrawing();
+            debugFrameProbe(&g); // reads back + measures the frame just presented
         }
 
         if (shot) {
@@ -2149,9 +2854,7 @@ pub fn run(shot: bool) void {
                     }
                     continue;
                 }
-                g.p.Pos = sweep[shotIdx];
-                g.rig.snap(g.p.Pos);
-                g.torchXZ = torchFlameWorld(&g.p); // teleport the light with the hero
+                teleportHero(&g, sweep[shotIdx]);
                 g.banner.time = 0; // the area banner would sit right over the subjects
                 if (shotIdx == 1) {
                     // Family portrait: one of each kind posed around the hero, angled
@@ -2167,9 +2870,22 @@ pub fn run(shot: bool) void {
                     while (mi < g.monsterCount) : (mi += 1) {
                         g.monsters[mi].Facing = v3(-0.66, 0, 0.75);
                     }
-                    // Pose the pib mid-windup so the portrait shows the knife raised
-                    // (and its glint) — the whole point of the little menace.
-                    g.monsters[g.monsterCount - 4].windup = g.monsters[g.monsterCount - 4].windupTime * 0.45;
+                    // Pose the pib mid-SWING so the portrait shows the arc: blade
+                    // crossing the front, flare + afterimage trail behind it. The
+                    // posed dummies get STRETCHED timers: the settle frames before
+                    // the shutter still tick updateMonster, and a real-length swing
+                    // would decay past its readable middle before the shot.
+                    g.monsters[g.monsterCount - 4].swingTime = 3.0;
+                    g.monsters[g.monsterCount - 4].swing = 1.5;
+                    // And the zombie near the top of its raise: both claws hauled
+                    // overhead, body reared back — the slam telegraph in full.
+                    g.monsters[g.monsterCount - 3].windupTime = 6.0;
+                    g.monsters[g.monsterCount - 3].windup = 0.9;
+                    // And the skeleton mid-draw: string hauled back, arrow nocked,
+                    // arrowhead glint burning — aimed at the hero (the windup AI
+                    // keeps its facing on the player through the settle frames).
+                    g.monsters[g.monsterCount - 2].windupTime = 6.0;
+                    g.monsters[g.monsterCount - 2].windup = 2.4;
                     // Engage the brute so the top-center enemy plate is in frame
                     // (updateAim re-derives hover each frame, but the attack target
                     // sticks — and the plate reads from it as its second priority).
@@ -2179,6 +2895,10 @@ pub fn run(shot: bool) void {
                     g.monsters[g.monsterCount - 1].dying = true;
                     g.monsters[g.monsterCount - 1].HP = 0;
                     g.monsters[g.monsterCount - 1].deathTimer = monster.monster_death_fade * 0.5;
+                    // With its miasma already billowed out over it (aged past the
+                    // grow-in so the shot verifies the full cloud, not a seedling).
+                    spawnGasCloud(&g, g.monsters[g.monsterCount - 1].Pos, g.monsters[g.monsterCount - 1].MaxDmg * GAS_DPS_FRAC);
+                    if (g.gasCount > 0) g.gas[g.gasCount - 1].life = GAS_LIFE - 1.5;
                     // A firebolt frozen mid-flight, to verify the bolt + its trail.
                     g.projs.add(projectile.newFirebolt(mathx.ground(px - 1.5, pz + 2.5), v3(-0.8, 0, 0.6), 20, 0));
                     // Ground loot just out of pickup range, to verify the drop beams.
@@ -2188,7 +2908,7 @@ pub fn run(shot: bool) void {
                     g.rig.snap(g.p.Pos);
                 }
                 if (shotIdx == sweep.len - 1) {
-                    g.rig.zoom = 1.4;
+                    g.rig.zoom = cameramod.DEFAULT_ZOOM;
                     g.rig.snap(g.p.Pos);
                     g.w.PortalOpen = true; // show the vortex...
                     // ...and clear the stage: anything camped on the portal hides it.

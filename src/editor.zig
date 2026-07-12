@@ -9,6 +9,7 @@ const hudx = @import("hudx.zig");
 const theme = @import("theme.zig");
 const tl = @import("torchlight.zig");
 const ui = @import("ui.zig");
+const cameramod = @import("camera.zig");
 
 const Game = gamemod.Game;
 const v3 = mathx.v3;
@@ -133,7 +134,8 @@ comptime {
     std.debug.assert(floorBrushes.len == @typeInfo(FloorBrush).@"enum".fields.len);
     std.debug.assert(decorBrushes.len == @typeInfo(world.DecorKind).@"enum".fields.len + 1);
     std.debug.assert(propBrushes.len == @typeInfo(world.ObstacleKind).@"enum".fields.len + 1);
-    std.debug.assert(entityBrushes.len == @typeInfo(monster.MonsterKind).@"enum".fields.len + 4);
+    // packs (one per MonsterKind) + the non-pack EntityBrush variants (all but .pack).
+    std.debug.assert(entityBrushes.len == @typeInfo(monster.MonsterKind).@"enum".fields.len + @typeInfo(EntityBrush).@"enum".fields.len - 1);
 }
 
 // What a floor-layer brush index means (positional, matching floorBrushes).
@@ -146,6 +148,14 @@ const EntityBrush = enum { pack, boss, spawn, portal, erase };
 const SPAWN_COL = rgba(140, 200, 255, 255);
 const PORTAL_COL = rgba(190, 140, 255, 255);
 const BOSS_COL = rgba(255, 80, 80, 255);
+
+// Anchor marker ring radii, shared by the drawn ring AND its hover-pick zone so a
+// resized ring never lies about what's clickable (the PACK_GRAB_R discipline, for
+// the fixed anchors). The hover zone is the ring plus MARKER_HOVER_PAD.
+const SPAWN_R = 1.0;
+const PORTAL_R = 1.4;
+const BOSS_R = 1.2;
+const MARKER_HOVER_PAD = 0.2;
 
 // Pack ring radius doubles as the grab pickup radius, so what looks clickable is.
 const PACK_GRAB_R = 1.6;
@@ -310,7 +320,7 @@ pub const Editor = struct {
 
     // Where Ctrl+S writes. Empty until the map has ever been saved (a New map),
     // in which case Ctrl+S opens Save As instead of guessing a filename.
-    path_buf: [96]u8 = [_]u8{0} ** 96,
+    path_buf: [mapmod.PATH_CAP]u8 = [_]u8{0} ** mapmod.PATH_CAP,
     path_len: usize = 0,
 
     modal: Modal = .none,
@@ -366,17 +376,18 @@ pub const Editor = struct {
     }
 
     fn entityBrush(ed: *const Editor) EntityBrush {
-        // The first N brushes are the N monster-kind packs; tie that boundary to the
-        // enum (not a literal 0..3) so adding a kind can't turn a pack into the boss.
+        // The first N brushes are the N monster-kind packs (all decode to .pack);
+        // the tail maps 1:1 onto EntityBrush's non-pack variants IN ORDER. Deriving
+        // the ordinal (rather than a positional 0=>.boss switch with a silent else)
+        // means a new EntityBrush + brush entry decodes correctly instead of
+        // collapsing to .erase. EntityBrush's order must match entityBrushes' tail;
+        // the comptime assert on the tables pins both length and that contract.
         const nPacks = @typeInfo(monster.MonsterKind).@"enum".fields.len;
         const b = ed.brush();
         if (b < nPacks) return .pack;
-        return switch (b - nPacks) {
-            0 => .boss,
-            1 => .spawn,
-            2 => .portal,
-            else => .erase,
-        };
+        // b is clamped to brushesFor(.entities).len-1 by setBrush, so b - nPacks + 1
+        // is always a valid EntityBrush ordinal (pack occupies 0).
+        return @enumFromInt(b - nPacks + 1);
     }
 
     fn packKind(ed: *const Editor) monster.MonsterKind {
@@ -426,6 +437,7 @@ pub fn apply(g: *Game) void {
     g.monsterCount = 0;
     g.projs.count = 0;
     g.lootList.clearRetainingCapacity();
+    g.gasCount = 0;
     g.parts.clear();
 }
 
@@ -479,6 +491,24 @@ fn freePlace() bool {
     return rl.isKeyDown(.left_alt) or rl.isKeyDown(.right_alt);
 }
 
+// The pick plane is infinite, so a click past the arena wall picks a valid-looking
+// ground point out in the void. Clamp at placement time: out-of-wall content would
+// spawn unreachable monsters (playtest softlock) and be silently relocated by
+// map.sanitize on the next load — the saved map wouldn't match the authored one.
+// Same insets as clampContents/pasteAt: content sits closer to the wall than the
+// three anchors do.
+fn clampContent(m: *const mapmod.Map, p: rl.Vector3) rl.Vector3 {
+    const limW = m.halfW - CONTENT_INSET;
+    const limD = m.halfD - CONTENT_INSET;
+    return v3(clampF(p.x, -limW, limW), p.y, clampF(p.z, -limD, limD));
+}
+
+fn clampAnchor(m: *const mapmod.Map, p: rl.Vector3) rl.Vector3 {
+    const limW = m.halfW - ANCHOR_INSET;
+    const limD = m.halfD - ANCHOR_INSET;
+    return v3(clampF(p.x, -limW, limW), p.y, clampF(p.z, -limD, limD));
+}
+
 fn snapCenter(p: rl.Vector3) rl.Vector3 {
     return v3(@floor(p.x / GRID) * GRID + GRID / 2, p.y, @floor(p.z / GRID) * GRID + GRID / 2);
 }
@@ -499,13 +529,14 @@ fn toolPoint(ed: *const Editor, p: rl.Vector3) rl.Vector3 {
 
 // ---- Editing operations (each returns whether the map changed) ----
 
-fn placeProp(g: *Game, p: rl.Vector3) bool {
+fn placeProp(g: *Game, p_in: rl.Vector3) bool {
     const ed = &g.ed;
     const m = &g.map;
     if (m.obstacle_count >= world.MAX_OBSTACLES) {
         ed.status("prop limit reached", .{});
         return false;
     }
+    const p = clampContent(m, p_in);
     const kind = ed.propKind();
     const h = mapmod.hashAt(p.x, p.z);
     m.obstacles[m.obstacle_count] = .{
@@ -537,13 +568,14 @@ fn decorSize(kind: world.DecorKind, h: f32) f32 {
     };
 }
 
-fn placeDecor(g: *Game, p: rl.Vector3) bool {
+fn placeDecor(g: *Game, p_in: rl.Vector3) bool {
     const ed = &g.ed;
     const m = &g.map;
     if (m.decor_count >= world.MAX_DECOR) {
         ed.status("decor limit reached", .{});
         return false;
     }
+    const p = clampContent(m, p_in); // covers the paint jitter too
     const kind = ed.decorKind();
     m.decor[m.decor_count] = .{
         .Kind = kind,
@@ -554,13 +586,14 @@ fn placeDecor(g: *Game, p: rl.Vector3) bool {
     return true;
 }
 
-fn placePack(g: *Game, p: rl.Vector3) bool {
+fn placePack(g: *Game, p_in: rl.Vector3) bool {
     const ed = &g.ed;
     const m = &g.map;
     if (m.pack_count >= mapmod.MAX_PACKS) {
         ed.status("pack limit reached", .{});
         return false;
     }
+    const p = clampContent(m, p_in);
     m.packs[m.pack_count] = .{ .kind = ed.packKind(), .count = ed.packCount, .x = p.x, .z = p.z };
     m.pack_count += 1;
     return true;
@@ -784,7 +817,9 @@ fn eraseFeatureAt(g: *Game, p: rl.Vector3) bool {
 fn finishDrag(g: *Game, a: rl.Vector3, b: rl.Vector3) bool {
     const ed = &g.ed;
     const m = &g.map;
-    const s = normRect(a, b);
+    // Corners clamp independently (same limits clampContents uses): a rect dragged
+    // past the wall shrinks to fit, and one squeezed under the min span is rejected.
+    const s = normRect(clampContent(m, a), clampContent(m, b));
     const minX = s.minX;
     const maxX = s.maxX;
     const minZ = s.minZ;
@@ -940,6 +975,7 @@ fn requestAction(g: *Game, act: Pending, openIdx: usize) void {
 
 fn doOpen(g: *Game, idx: usize) void {
     const ed = &g.ed;
+    resetTransient(g); // no gesture may straddle two maps
     g.areaIndex = @min(idx, if (g.mapCount == 0) 0 else g.mapCount - 1);
     g.map = g.loadMapAt(g.areaIndex);
     apply(g);
@@ -955,6 +991,7 @@ fn doOpen(g: *Game, idx: usize) void {
 
 fn doNew(g: *Game) void {
     const ed = &g.ed;
+    resetTransient(g); // no gesture may straddle two maps
     g.map = mapmod.defaultMap();
     g.map.halfW = ed.newHalfW;
     g.map.halfD = ed.newHalfD;
@@ -993,7 +1030,7 @@ fn slugTo(dst: []u8, src: []const u8) []const u8 {
 fn doSaveAs(g: *Game) void {
     const ed = &g.ed;
     if (ed.field_len == 0) return ed.status("give it a file name", .{});
-    var buf: [96]u8 = undefined;
+    var buf: [mapmod.PATH_CAP]u8 = undefined;
     var slug: [40]u8 = undefined;
     const s = slugTo(&slug, ed.field_buf[0..ed.field_len]);
     if (s.len == 0) return ed.status("give it a usable file name", .{});
@@ -1039,6 +1076,9 @@ pub fn update(g: *Game, dt: f32) void {
             // Esc = cancel: the pack modal edits live state, so restore it.
             if (ed.modal == .pack_edit) g.map = packEditBefore;
             ed.modal = .none;
+            // Mirror the Cancel buttons: leaving `pending` set would fire the
+            // stale action (exit/new/open) on the NEXT successful save.
+            ed.pending = .none;
         }
         return;
     }
@@ -1184,17 +1224,18 @@ pub fn update(g: *Game, dt: f32) void {
 
     if (rl.isKeyPressed(.home)) {
         ed.camTarget = g.map.spawn;
-        g.rig.zoom = 1.4;
+        g.rig.zoom = cameramod.DEFAULT_ZOOM;
         g.rig.snap(ed.camTarget);
     }
     if (rl.isKeyPressed(.equal) or rl.isKeyPressed(.kp_add)) g.rig.addZoom(1);
     if (rl.isKeyPressed(.minus) or rl.isKeyPressed(.kp_subtract)) g.rig.addZoom(-1);
 
     if (rl.isKeyPressed(.f5)) {
+        resetTransient(g); // an armed grab/stroke/marquee must not survive the round-trip
         // Ctrl+F5 (crawler): playtest FROM THE CURSOR instead of the spawn.
         if (ctrl) {
             if (mousePoint(g)) |p| {
-                gamemod.startPlaytestAt(g, p);
+                gamemod.startPlaytestAt(g, clampAnchor(&g.map, p));
                 return;
             }
         }
@@ -1314,8 +1355,9 @@ pub fn update(g: *Game, dt: f32) void {
                     }
                     if (ed.grabIdx) |gi| {
                         if (rl.isMouseButtonDown(.left)) {
-                            g.map.packs[gi].x = tp.x;
-                            g.map.packs[gi].z = tp.z;
+                            const cp = clampContent(&g.map, tp); // a drag can leave the arena
+                            g.map.packs[gi].x = cp.x;
+                            g.map.packs[gi].z = cp.z;
                         }
                         if (rl.isMouseButtonReleased(.left)) {
                             if (distXZ(p, ed.grabStart) < 0.6) {
@@ -1334,10 +1376,11 @@ pub fn update(g: *Game, dt: f32) void {
                 .boss, .spawn, .portal => {
                     if (rl.isMouseButtonPressed(.left)) {
                         bankUndo(g);
+                        const ap = clampAnchor(&g.map, tp); // anchors keep the deeper inset
                         switch (ed.entityBrush()) {
-                            .boss => g.map.bossPos = v3(tp.x, 0, tp.z),
-                            .spawn => g.map.spawn = v3(tp.x, 0, tp.z),
-                            .portal => g.map.portal = v3(tp.x, 0, tp.z),
+                            .boss => g.map.bossPos = v3(ap.x, 0, ap.z),
+                            .spawn => g.map.spawn = v3(ap.x, 0, ap.z),
+                            .portal => g.map.portal = v3(ap.x, 0, ap.z),
                             else => {},
                         }
                         markDirty(g);
@@ -1354,6 +1397,16 @@ pub fn update(g: *Game, dt: f32) void {
                 },
             },
         }
+    } else if (rl.isMouseButtonReleased(.left)) {
+        // The pick can fail mid-gesture (a cliff face returns no ground point —
+        // everyday over Blood Moor's rampart): a release there must still tear
+        // down like the chrome path above, or the armed grab/marquee/stroke
+        // replays itself on the next press and its undo banking is lost.
+        ed.dragStart = null;
+        ed.selDrag = null;
+        ed.selMove = null;
+        if (ed.strokeActive) endStroke(ed);
+        releaseGrab(g);
     }
 }
 
@@ -1361,6 +1414,22 @@ fn endStroke(ed: *Editor) void {
     if (ed.strokeChanged) pushUndoFrom(&strokeBefore);
     ed.strokeActive = false;
     ed.strokeChanged = false;
+}
+
+// Close out every in-flight gesture (rect drag, paint stroke, pack grab, marquee,
+// pan) so nothing stays armed across a map swap or a playtest round-trip: a grab
+// or selection surviving doOpen would act on the NEW map with the OLD map's
+// indices/rect, and its undo snapshot would restore the wrong map wholesale.
+// Work that already changed the map banks its undo exactly like a normal release.
+fn resetTransient(g: *Game) void {
+    const ed = &g.ed;
+    ed.dragStart = null;
+    ed.panAnchor = null;
+    ed.sel = null;
+    ed.selDrag = null;
+    ed.selMove = null;
+    if (ed.strokeActive) endStroke(ed);
+    releaseGrab(g);
 }
 
 // Release a pack grab that was interrupted before its own mouse-up handler could
@@ -1401,8 +1470,8 @@ pub fn draw(g: *Game) void {
     g.torch.endShadowPass();
 
     rl.beginDrawing();
-    rl.clearBackground(rgba(16, 16, 22, 255));
-    g.torch.applyUniforms(cam, lp);
+    rl.clearBackground(theme.voidColor);
+    g.torch.applyUniforms(lp);
     g.torch.applyFireUniforms(fp);
     g.torch.applyFogUniforms(.{ .texId = @intCast(g.fog.tex.id), .halfW = g.fog.halfW, .halfD = g.fog.halfD });
     rl.beginMode3D(cam);
@@ -1458,17 +1527,15 @@ fn drawRectGrid(m: *const mapmod.Map) void {
 fn drawMarkers(g: *Game) void {
     const ed = &g.ed;
     const m = &g.map;
-    const t = g.elapsed;
 
     if (ed.grid) drawRectGrid(m);
 
-    marker(g, m.spawn, SPAWN_COL, 1.0);
-    marker(g, m.portal, PORTAL_COL, 1.4);
-    marker(g, m.bossPos, BOSS_COL, 1.2);
+    marker(g, m.spawn, SPAWN_COL, SPAWN_R);
+    marker(g, m.portal, PORTAL_COL, PORTAL_R);
+    marker(g, m.bossPos, BOSS_COL, BOSS_R);
 
     // Packs: the LIVE silhouettes (drawEncounterPreviews) show the encounter;
     // here just the grab ring in the kind's color over a dark puck.
-    _ = t;
     for (m.packList()) |pk| {
         const col = packColor(pk.kind);
         const c = g.w.snapY(v3(pk.x, 0, pk.z));
@@ -1592,6 +1659,7 @@ const TOPBAR_H = 40;
 const PALETTE_W = 148;
 const PANEL_W = 224;
 const MM_S = 150; // minimap side
+const LAYER_ROW_H = 30; // vertical stride of a layer/brush button row
 
 pub fn drawOverlay(g: *Game) void {
     const ed = &g.ed;
@@ -1599,12 +1667,27 @@ pub fn drawOverlay(g: *Game) void {
     const W = rl.getScreenWidth();
     const H = rl.getScreenHeight();
 
+    // A modal owns the pointer WHOLESALE, but the chrome under it is processed
+    // first in this same frame (immediate mode hit-tests as it draws): silence
+    // the mouse for those widgets or Undo/Playtest/the steppers keep firing
+    // through the dim backdrop and desync packEditBefore under pack_edit.
+    const modalOpen = ed.modal != .none;
+    const livePressed = ctx.pressed;
+    const liveDown = ctx.down;
+    if (modalOpen) {
+        ctx.pressed = false;
+        ctx.down = false;
+    }
     drawTopbar(g, &ctx, W);
     drawPalette(g, &ctx);
     drawProperties(g, &ctx, W);
     drawMinimap(g, &ctx, W, H);
-    drawStatusBar(g, W, H);
+    drawStatusBar(g, &ctx, W, H);
     drawContextMenu(g, &ctx);
+    if (modalOpen) {
+        ctx.pressed = livePressed;
+        ctx.down = liveDown;
+    }
     drawModal(g, &ctx);
     hoverWorldTip(g, &ctx);
     ui.drawTip(&ctx); // whatever earned a tooltip this frame, drawn over it all
@@ -1631,13 +1714,13 @@ fn hoverWorldTip(g: *Game, ctx: *ui.Ctx) void {
             return;
         }
     }
-    if (distXZ(m.bossPos, p) < 1.4) {
+    if (distXZ(m.bossPos, p) < BOSS_R + MARKER_HOVER_PAD) {
         const s = std.fmt.bufPrint(&buf, "Boss post: {s}", .{m.boss.slice()}) catch return;
         ctx.setTip(s);
         return;
     }
-    if (distXZ(m.spawn, p) < 1.2) return ctx.setTip("Spawn - where the hero enters");
-    if (distXZ(m.portal, p) < 1.6) return ctx.setTip("Portal - the area exit");
+    if (distXZ(m.spawn, p) < SPAWN_R + MARKER_HOVER_PAD) return ctx.setTip("Spawn - where the hero enters");
+    if (distXZ(m.portal, p) < PORTAL_R + MARKER_HOVER_PAD) return ctx.setTip("Portal - the area exit");
     for (m.obstacles[0..m.obstacle_count]) |o| {
         if (distXZ(o.Pos, p) < o.Radius + 0.3) {
             const s = std.fmt.bufPrint(&buf, "{s} (Props layer)", .{@tagName(o.Kind)}) catch return;
@@ -1670,7 +1753,7 @@ fn hoverWorldTip(g: *Game, ctx: *ui.Ctx) void {
 
 fn drawTopbar(g: *Game, ctx: *ui.Ctx, W: i32) void {
     const ed = &g.ed;
-    ui.panel(ui.rect(0, 0, W, TOPBAR_H), null);
+    ui.claimedPanel(ctx, ui.rect(0, 0, W, TOPBAR_H), null); // dead space between buttons is still chrome
     var x: i32 = 8;
     if (ui.buttonTip(ctx, ui.rect(x, 7, 54, 26), "New", 17, false, "Start a blank map (Ctrl+N)")) requestAction(g, .new, 0);
     x += 60;
@@ -1687,7 +1770,7 @@ fn drawTopbar(g: *Game, ctx: *ui.Ctx, W: i32) void {
 
     var nameBuf: [72]u8 = undefined;
     const nm = std.fmt.bufPrintZ(&nameBuf, "{s}{s}", .{ g.map.name.slice(), if (ed.dirty) " *" else "" }) catch "";
-    hudx.text(nm, x + 6, 10, 21, rgba(255, 230, 190, 255));
+    hudx.text(nm, x + 6, 10, 21, theme.titleColor);
 
     var rx: i32 = W - 8;
     rx -= 66;
@@ -1703,15 +1786,16 @@ fn drawPalette(g: *Game, ctx: *ui.Ctx) void {
     const px = 8;
     var y: i32 = TOPBAR_H + 8;
 
-    // LAYERS: the workspace switch (Tab cycles; Alt+1..4 jumps).
-    ui.panel(ui.rect(px, y, PALETTE_W, 152), "LAYERS");
+    // LAYERS: the workspace switch (Tab cycles; Alt+1..4 jumps). Height derived
+    // from Layer.N (like BRUSHES below) so a new layer can't outgrow the panel.
+    ui.claimedPanel(ctx, ui.rect(px, y, PALETTE_W, 26 + @as(i32, Layer.N) * LAYER_ROW_H + 6), "LAYERS");
     y += 26;
     inline for (@typeInfo(Layer).@"enum".fields, 0..) |f, li| {
         const l: Layer = @enumFromInt(f.value);
         if (ui.buttonTip(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 26), l.label(), 16, ed.layer == l, layerTips[li])) {
             ed.layer = l;
         }
-        y += 30;
+        y += LAYER_ROW_H;
     }
     y += 8;
 
@@ -1719,13 +1803,14 @@ fn drawPalette(g: *Game, ctx: *ui.Ctx) void {
     const brushes = brushesFor(ed.layer);
     const tips = brushTipsFor(ed.layer);
     const extraRows: i32 = if (ed.layer == .decor) 2 else 0;
-    ui.panel(ui.rect(px, y, PALETTE_W, 26 + @as(i32, @intCast(brushes.len)) * 30 + extraRows * 28 + 6), "BRUSHES");
+    const brushesRect = ui.rect(px, y, PALETTE_W, 26 + @as(i32, @intCast(brushes.len)) * LAYER_ROW_H + extraRows * 28 + 6);
+    ui.claimedPanel(ctx, brushesRect, "BRUSHES");
     y += 26;
     for (brushes, 0..) |label, i| {
         var kb: [24]u8 = undefined;
         const lbl = std.fmt.bufPrintZ(&kb, "{d}  {s}", .{ i + 1, label }) catch "";
         if (ui.buttonTip(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 26), lbl, 16, ed.brush() == i, tips[i])) ed.setBrush(i);
-        y += 30;
+        y += LAYER_ROW_H;
     }
     if (ed.layer == .decor) {
         if (ui.buttonTip(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 24), "Scatter (X)", 15, false, "Re-roll ALL decor over open floor (undoable)")) scatterDecor(g);
@@ -1744,7 +1829,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
     const px = W - PANEL_W - 8;
     var y: i32 = TOPBAR_H + 8;
 
-    ui.panel(ui.rect(px, y, PANEL_W, 196), "MAP");
+    ui.claimedPanel(ctx, ui.rect(px, y, PANEL_W, 196), "MAP");
     y += 26;
     if (ui.buttonTip(ctx, ui.rect(px + 8, y, PANEL_W - 16, 24), "Rename...", 15, false, "The name shown on the area banner")) openModal(ed, .rename);
     y += 30;
@@ -1795,17 +1880,17 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
     switch (ed.layer) {
         .entities => {
             if (ed.entityBrush() == .pack) {
-                ui.panel(ui.rect(px, y, PANEL_W, 62), "PACK");
+                ui.claimedPanel(ctx, ui.rect(px, y, PANEL_W, 62), "PACK");
                 ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Members stamped per new pack");
                 _ = ui.stepperI(ctx, px + 10, y + 28, "members", &ed.packCount, PACK_MIN, PACK_MAX);
             } else if (ed.entityBrush() == .erase) {
-                ui.panel(ui.rect(px, y, PANEL_W, 62), "ERASE");
+                ui.claimedPanel(ctx, ui.rect(px, y, PANEL_W, 62), "ERASE");
                 ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Erase sweep radius ([ ] adjusts)");
                 _ = ui.stepperF(ctx, px + 10, y + 28, "radius", &ed.brushR, BRUSH_R_STEP, BRUSH_R_MIN, BRUSH_R_MAX);
             }
         },
         .floor => {
-            ui.panel(ui.rect(px, y, PANEL_W, 94), "TERRAIN");
+            ui.claimedPanel(ctx, ui.rect(px, y, PANEL_W, 94), "TERRAIN");
             ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Height of NEW ledges/ramps; RMB a feature to apply");
             _ = ui.stepperF(ctx, px + 10, y + 28, "height", &ed.featureH, FEATURE_H_STEP, FEATURE_H_MIN, FEATURE_H_MAX);
             if (ed.floorBrush() == .ramp) {
@@ -1819,7 +1904,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
             }
         },
         .decor, .props => {
-            ui.panel(ui.rect(px, y, PANEL_W, 62), "BRUSH");
+            ui.claimedPanel(ctx, ui.rect(px, y, PANEL_W, 62), "BRUSH");
             ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Brush radius: decor spread + erase sweep ([ ])");
             _ = ui.stepperF(ctx, px + 10, y + 28, "radius", &ed.brushR, BRUSH_R_STEP, BRUSH_R_MIN, BRUSH_R_MAX);
         },
@@ -1935,7 +2020,7 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     const vx: i32 = @intFromFloat(ox + (ed.camTarget.x - viewHalf + halfW) * scale);
     const vy: i32 = @intFromFloat(oy + (ed.camTarget.z - viewHalf + halfD) * scale);
     const vs: i32 = @intFromFloat(2 * viewHalf * scale);
-    rl.drawRectangleLines(@max(vx, mx), @max(vy, my), @min(vs, MM_S), @min(vs, MM_S), rgba(255, 235, 190, 220));
+    rl.drawRectangleLines(@max(vx, mx), @max(vy, my), @min(vs, MM_S), @min(vs, MM_S), withAlpha(theme.highlightColor, 220));
 
     if (rl.checkCollisionPointRec(ctx.mouse, frame)) {
         ctx.anyHot = true;
@@ -1946,9 +2031,9 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     }
 }
 
-fn drawStatusBar(g: *Game, W: i32, H: i32) void {
+fn drawStatusBar(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     const ed = &g.ed;
-    ui.panel(ui.rect(0, H - 30, W, 30), null);
+    ui.claimedPanel(ctx, ui.rect(0, H - 30, W, 30), null); // the whole bar is chrome
     const hints: [:0]const u8 = "Tab layer   1-9 brush   LMB paint   Shift+drag select   Ctrl+C/X/V   Del   RMB menu/pan   M mirror   [ ] size   Ctrl+Z undo   Ctrl+S save   F5 playtest";
     hudx.text(hints, 12, H - 25, 15, withAlpha(theme.labelColor, 220));
 
@@ -1960,12 +2045,12 @@ fn drawStatusBar(g: *Game, W: i32, H: i32) void {
         }
     }
     if (coord.len > 0) {
-        hudx.text(coord, W - hudx.textW(coord, 13) - 12, H - 25, 15, withAlpha(theme.labelColor, 220));
+        hudx.text(coord, W - hudx.textW(coord, 15) - 12, H - 25, 15, withAlpha(theme.labelColor, 220));
     }
 
     if (ed.status_t > 0 and ed.status_len > 0) {
         const s = ed.status_buf[0..ed.status_len :0];
-        const w = hudx.textW(s, 18);
+        const w = hudx.textW(s, 19);
         hudx.pill(@divTrunc(W, 2) - @divTrunc(w, 2) - 14, TOPBAR_H + 8, w + 28, 30, withAlpha(theme.ink, 185));
         hudx.text(s, @divTrunc(W, 2) - @divTrunc(w, 2), TOPBAR_H + 14, 19, rgba(255, 245, 210, 255));
     }

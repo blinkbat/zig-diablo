@@ -80,7 +80,6 @@ const sceneFS =
     \\uniform vec3 lightPos;
     \\uniform vec4 lightColor;
     \\uniform vec4 ambient;
-    \\uniform vec3 viewPos;
     \\uniform mat4 lightVP;
     \\uniform sampler2D shadowMap;
     \\uniform int shadowMapResolution;
@@ -276,7 +275,6 @@ pub const Torch = struct {
     depthShader: rl.Shader,
     scene: rl.Shader,
     loc_lightPos: i32,
-    loc_viewPos: i32,
     loc_lightVP: i32,
     loc_lightRadius: i32,
     loc_fogHalf: i32,
@@ -316,7 +314,6 @@ pub const Torch = struct {
             .depthShader = depthShader,
             .scene = scene,
             .loc_lightPos = rl.getShaderLocation(scene, "lightPos"),
-            .loc_viewPos = rl.getShaderLocation(scene, "viewPos"),
             .loc_lightVP = rl.getShaderLocation(scene, "lightVP"),
             .loc_lightRadius = rl.getShaderLocation(scene, "lightRadius"),
             .loc_fogHalf = rl.getShaderLocation(scene, "fogHalf"),
@@ -340,16 +337,11 @@ pub const Torch = struct {
     }
 
     // The shadow camera: at the torch, looking straight down at the ground under it,
-    // with a cone FOV sized to just cover the light radius (verbatim demo math).
-    // `up` must not be parallel to the view direction or MatrixLookAt goes NaN.
-    fn shadowCamera(lp: LightParams) rl.Camera3D {
-        return overheadCamera(lp.pos, lp.radius, lp.groundRef);
-    }
-
     // Shared by the torch and the fireball: an overhead light looking straight down,
     // its cone FOV sized to just cover `radius` on the LOCAL ground plane (groundY)
     // — sizing against absolute y=0 would shrink the covered disc whenever the
-    // light stands on raised terrain.
+    // light stands on raised terrain. `up` must not be parallel to the view
+    // direction or MatrixLookAt goes NaN.
     fn overheadCamera(pos: rl.Vector3, radius: f32, groundY: f32) rl.Camera3D {
         const coverTarget = radius * SHADOW_COVER_MARGIN;
         const height = @max(pos.y - groundY, 0.5);
@@ -363,54 +355,51 @@ pub const Torch = struct {
         };
     }
 
-    // Depth pass: call this, draw the casters, then endShadowPass().
-    pub fn beginShadowPass(self: *Torch, lp: LightParams) void {
-        const cam = shadowCamera(lp);
+    // Shared depth-pass scaffold: save the clip planes, render into `map` from `cam`,
+    // capture the light view-projection into `vpOut`, and enter the depth shader.
+    // Draw the casters, then endDepthPass. The torch and fireball passes are this
+    // with different target maps and VP fields.
+    fn beginDepthPass(self: *Torch, map: rl.RenderTexture2D, vpOut: *rl.Matrix, cam: rl.Camera3D) void {
         self.saved_near = rl.gl.rlGetCullDistanceNear();
         self.saved_far = rl.gl.rlGetCullDistanceFar();
         rl.gl.rlSetClipPlanes(SHADOW_CLIP_NEAR, SHADOW_CLIP_FAR);
-        rl.beginTextureMode(self.shadowMap);
+        rl.beginTextureMode(map);
         rl.clearBackground(rl.Color.white);
         rl.beginMode3D(cam);
-        self.lightVP = rl.math.matrixMultiply(rl.gl.rlGetMatrixModelview(), rl.gl.rlGetMatrixProjection());
+        vpOut.* = rl.math.matrixMultiply(rl.gl.rlGetMatrixModelview(), rl.gl.rlGetMatrixProjection());
         rl.beginShaderMode(self.depthShader);
+    }
+
+    fn endDepthPass(self: *Torch) void {
+        rl.endShaderMode();
+        rl.endMode3D();
+        rl.endTextureMode();
+        rl.gl.rlSetClipPlanes(self.saved_near, self.saved_far);
+    }
+
+    // Torch depth pass: call this, draw the casters, then endShadowPass().
+    pub fn beginShadowPass(self: *Torch, lp: LightParams) void {
+        self.beginDepthPass(self.shadowMap, &self.lightVP, overheadCamera(lp.pos, lp.radius, lp.groundRef));
     }
 
     pub fn endShadowPass(self: *Torch) void {
-        rl.endShaderMode();
-        rl.endMode3D();
-        rl.endTextureMode();
-        rl.gl.rlSetClipPlanes(self.saved_near, self.saved_far);
+        self.endDepthPass();
     }
 
-    // Fireball depth pass: only worth running when a fireball is live (fp.intensity>0).
-    // Same structure as the torch pass, into the smaller fireMap from the fireball's
-    // overhead camera. Draw the casters between this and endFireShadowPass().
+    // Fireball depth pass: only worth running when a fireball is live (fp.intensity>0),
+    // into the smaller fireMap from the fireball's overhead camera.
     pub fn beginFireShadowPass(self: *Torch, fp: FireParams) void {
-        const cam = overheadCamera(fp.pos, fp.radius, fp.groundRef);
-        self.saved_near = rl.gl.rlGetCullDistanceNear();
-        self.saved_far = rl.gl.rlGetCullDistanceFar();
-        rl.gl.rlSetClipPlanes(SHADOW_CLIP_NEAR, SHADOW_CLIP_FAR);
-        rl.beginTextureMode(self.fireMap);
-        rl.clearBackground(rl.Color.white);
-        rl.beginMode3D(cam);
-        self.fireVP = rl.math.matrixMultiply(rl.gl.rlGetMatrixModelview(), rl.gl.rlGetMatrixProjection());
-        rl.beginShaderMode(self.depthShader);
+        self.beginDepthPass(self.fireMap, &self.fireVP, overheadCamera(fp.pos, fp.radius, fp.groundRef));
     }
 
     pub fn endFireShadowPass(self: *Torch) void {
-        rl.endShaderMode();
-        rl.endMode3D();
-        rl.endTextureMode();
-        rl.gl.rlSetClipPlanes(self.saved_near, self.saved_far);
+        self.endDepthPass();
     }
 
     // Main pass: call after beginDrawing()+clear and BEFORE beginMode3D(cam).
-    pub fn applyUniforms(self: *Torch, cam: rl.Camera3D, lp: LightParams) void {
+    pub fn applyUniforms(self: *Torch, lp: LightParams) void {
         const p = [3]f32{ lp.pos.x, lp.pos.y, lp.pos.z };
         rl.setShaderValue(self.scene, self.loc_lightPos, &p, .vec3);
-        const v = [3]f32{ cam.position.x, cam.position.y, cam.position.z };
-        rl.setShaderValue(self.scene, self.loc_viewPos, &v, .vec3);
         const r = lp.radius;
         rl.setShaderValue(self.scene, self.loc_lightRadius, &r, .float);
         rl.setShaderValueMatrix(self.scene, self.loc_lightVP, self.lightVP);
@@ -419,14 +408,18 @@ pub const Torch = struct {
     // Fireball light uniforms. Pass intensity 0 (any pos/radius/color) when no
     // fireball is live; the scene shader then skips the whole fireball term.
     pub fn applyFireUniforms(self: *Torch, fp: FireParams) void {
+        // The shader skips the whole fireball term when intensity is 0, so on the
+        // common no-fireball frame only intensity matters — uploading pos/color/
+        // radius/VP would be four wasted setShaderValue calls the shader ignores.
+        const i = fp.intensity;
+        rl.setShaderValue(self.scene, self.loc_fireIntensity, &i, .float);
+        if (i <= 0) return;
         const p = [3]f32{ fp.pos.x, fp.pos.y, fp.pos.z };
         rl.setShaderValue(self.scene, self.loc_firePos, &p, .vec3);
         const c = [3]f32{ fp.color.x, fp.color.y, fp.color.z };
         rl.setShaderValue(self.scene, self.loc_fireColor, &c, .vec3);
         const r = fp.radius;
         rl.setShaderValue(self.scene, self.loc_fireRadius, &r, .float);
-        const i = fp.intensity;
-        rl.setShaderValue(self.scene, self.loc_fireIntensity, &i, .float);
         rl.setShaderValueMatrix(self.scene, self.loc_fireVP, self.fireVP);
     }
 

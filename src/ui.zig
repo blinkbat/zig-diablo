@@ -76,6 +76,15 @@ pub fn rect(x: i32, y: i32, w: i32, h: i32) rl.Rectangle {
     return .{ .x = @floatFromInt(x), .y = @floatFromInt(y), .width = @floatFromInt(w), .height = @floatFromInt(h) };
 }
 
+// A panel that also claims its rect as chrome (the common case): the body must
+// set anyHot or world clicks fall through the padding onto the map. Editing one
+// rect of a separate claim+panel pair silently reopens that click-through hole,
+// so they travel together here.
+pub fn claimedPanel(ctx: *Ctx, r: rl.Rectangle, title: ?[:0]const u8) void {
+    _ = ctx.hot(r);
+    panel(r, title);
+}
+
 // Iron panel with a brass liner; optional small-caps title tab.
 pub fn panel(r: rl.Rectangle, title: ?[:0]const u8) void {
     rl.drawRectangleRounded(r, 0.08, 6, rgba(10, 8, 7, 215));
@@ -96,7 +105,7 @@ pub fn button(ctx: *Ctx, r: rl.Rectangle, label: [:0]const u8, size: i32, active
     const tw = hudx.textW(label, size);
     const tx: i32 = @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2);
     const ty: i32 = @intFromFloat(r.y + (r.height - @as(f32, @floatFromInt(size))) / 2 - 2);
-    hudx.text(label, tx, ty, size, if (active) rgba(255, 235, 190, 255) else rgba(225, 212, 190, 240));
+    hudx.text(label, tx, ty, size, if (active) theme.highlightColor else rgba(225, 212, 190, 240));
     return h and ctx.pressed;
 }
 
@@ -125,7 +134,7 @@ pub fn stepperF(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *f32, step: f
     }
     var buf: [24]u8 = undefined;
     const s = std.fmt.bufPrintZ(&buf, "{d:.1}", .{v.*}) catch "";
-    hudx.text(s, bx + 30 + @divTrunc(34 - hudx.textW(s, 16), 2), y + 3, 16, rgba(255, 240, 205, 255));
+    hudx.text(s, bx + 30 + @divTrunc(34 - hudx.textW(s, 16), 2), y + 3, 16, theme.valueColor);
     if (button(ctx, rect(bx + 96, y, 22, 22), "+", 16, false)) {
         const nv = mathx.clampF(v.* + step, min, max);
         if (nv != v.*) {
@@ -151,7 +160,7 @@ pub fn stepperI(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *i32, min: i3
     }
     var buf: [16]u8 = undefined;
     const s = std.fmt.bufPrintZ(&buf, "{d}", .{v.*}) catch "";
-    hudx.text(s, bx + 30 + @divTrunc(34 - hudx.textW(s, 16), 2), y + 3, 16, rgba(255, 240, 205, 255));
+    hudx.text(s, bx + 30 + @divTrunc(34 - hudx.textW(s, 16), 2), y + 3, 16, theme.valueColor);
     if (button(ctx, rect(bx + 96, y, 22, 22), "+", 16, false)) {
         const nv = mathx.clampI(v.* + 1, min, max);
         if (nv != v.*) {
@@ -167,7 +176,7 @@ pub fn swatch(ctx: *Ctx, x: i32, y: i32, w: i32, h: i32, fill: rl.Color, edge: r
     const r = rect(x, y, w, h);
     const hov = ctx.hot(r);
     rl.drawRectangleRounded(r, 0.25, 4, fill);
-    rl.drawRectangleRoundedLinesEx(r, 0.25, 4, if (active) 2 else 1, if (active) rgba(255, 235, 190, 255) else if (hov) withAlpha(theme.trimColor, 220) else edge);
+    rl.drawRectangleRoundedLinesEx(r, 0.25, 4, if (active) 2 else 1, if (active) theme.highlightColor else if (hov) withAlpha(theme.trimColor, 220) else edge);
     return hov and ctx.pressed;
 }
 
@@ -189,10 +198,10 @@ pub fn textField(ctx: *Ctx, r: rl.Rectangle, buf: []u8, len: *usize, focused: bo
     }
     buf[len.*] = 0;
     const s: [:0]const u8 = buf[0..len.* :0];
-    hudx.text(s, @intFromFloat(r.x + 8), @intFromFloat(r.y + 4), 18, rgba(255, 240, 205, 255));
+    hudx.text(s, @intFromFloat(r.x + 8), @intFromFloat(r.y + 4), 18, theme.valueColor);
     if (focused and @mod(t, 1.0) < 0.55) {
         const cx: i32 = @as(i32, @intFromFloat(r.x)) + 10 + hudx.textW(s, 18);
-        rl.drawRectangle(cx, @intFromFloat(r.y + 5), 2, 18, rgba(255, 235, 190, 220));
+        rl.drawRectangle(cx, @intFromFloat(r.y + 5), 2, 18, withAlpha(theme.highlightColor, 220));
     }
 }
 
@@ -210,6 +219,6 @@ pub fn beginModal(ctx: *Ctx, w: i32, h: i32, title: [:0]const u8) ModalBox {
     const x = @divTrunc(sw - w, 2);
     const y = @divTrunc(sh - h, 2);
     panel(rect(x, y, w, h), null);
-    hudx.text(title, x + @divTrunc(w - hudx.textW(title, 20), 2), y + 12, 20, rgba(255, 230, 190, 255));
+    hudx.text(title, x + @divTrunc(w - hudx.textW(title, 20), 2), y + 12, 20, theme.titleColor);
     return .{ .x = x, .y = y };
 }

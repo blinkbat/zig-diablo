@@ -11,7 +11,6 @@ pub const Projectile = struct {
     Radius: f32 = 0,
     Life: f32 = 0,
     FromPlayer: bool = false,
-    Color: rl.Color = rgba(255, 255, 255, 255),
 };
 
 // Flight speeds, public so shooters can compute the vertical velocity that lands
@@ -29,6 +28,10 @@ pub const arrowMuzzleDY = 1.2;
 // read as one flame — change it here and the trail follows.
 pub const fireboltColor = rgba(255, 150, 40, 255);
 
+// The white-hot heart at the center of any flame in the game — the firebolt's core
+// and the torch's inner tongue read as the same fire.
+pub const flameHeartColor = rgba(255, 246, 205, 255);
+
 // newFirebolt is the player's right-click spell. `from` carries the caster's
 // ground height; `yVel` slopes the flight toward a raised or sunken target.
 pub fn newFirebolt(from: rl.Vector3, dir: rl.Vector3, dmg: f32, yVel: f32) Projectile {
@@ -39,7 +42,6 @@ pub fn newFirebolt(from: rl.Vector3, dir: rl.Vector3, dmg: f32, yVel: f32) Proje
         .Radius = 0.45,
         .Life = 2.0,
         .FromPlayer = true,
-        .Color = fireboltColor,
     };
 }
 
@@ -52,6 +54,5 @@ pub fn newArrow(from: rl.Vector3, dir: rl.Vector3, dmg: f32, yVel: f32) Projecti
         .Radius = 0.35,
         .Life = 2.5,
         .FromPlayer = false,
-        .Color = rgba(230, 230, 210, 255),
     };
 }

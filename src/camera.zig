@@ -4,6 +4,10 @@ const mathx = @import("mathx.zig");
 const v3 = mathx.v3;
 const clampF = mathx.clampF;
 
+// The default framing: pulled in so the lit detail reads. Shared by the rig's
+// initial state and every "reset to default" (editor Home, screenshot harness).
+pub const DEFAULT_ZOOM = 1.4;
+
 // camRig holds the follow-camera state: a fixed high three-quarter iso angle
 // behind the player, zoomable.
 pub const CamRig = struct {
@@ -49,6 +53,6 @@ pub fn newCamRig() CamRig {
             .fovy = 50,
             .projection = .perspective,
         },
-        .zoom = 1.4, // start pulled in so the lit detail reads
+        .zoom = DEFAULT_ZOOM,
     };
 }

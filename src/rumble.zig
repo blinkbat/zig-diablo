@@ -19,6 +19,11 @@ const rl = @import("raylib");
 // XInput exposes a low-frequency ("heavy") motor and a high-frequency ("sharp buzz")
 // motor. Actions the player performs lean on the buzz motor; impacts the player suffers
 // lean on the heavy motor; death swells both.
+
+// The controller we drive: input polling (game.zig) and this module's XInput calls
+// must target the SAME physical pad, so both read this one index.
+pub const PAD = 0;
+
 pub const Event = struct { low: f32 = 0, high: f32 = 0, dur: f32 = 0 };
 
 pub const attack_hit = Event{ .low = 0.25, .high = 0.45, .dur = 0.12 }; // your melee lands
@@ -27,6 +32,7 @@ pub const cast = Event{ .low = 0.12, .high = 0.30, .dur = 0.10 }; // firebolt ca
 pub const hurt = Event{ .low = 0.60, .high = 0.35, .dur = 0.25 }; // you take a hit
 pub const death = Event{ .low = 1.00, .high = 0.60, .dur = 0.70 }; // you die
 pub const kill = Event{ .low = 0.30, .high = 0.18, .dur = 0.12 }; // you slay a foe
+pub const gas_tick = Event{ .low = 0.35, .high = 0.10, .dur = 0.16 }; // choking in miasma
 pub const dodge = Event{ .low = 0.18, .high = 0.40, .dur = 0.10 }; // dodge roll
 pub const level_up = Event{ .low = 0.40, .high = 0.60, .dur = 0.40 }; // level up
 
@@ -89,7 +95,7 @@ fn setMotors(low: f32, high: f32) void {
         win.set(l, h);
     } else {
         // Best effort on non-Windows: works under raylib's SDL backend, no-op under GLFW.
-        rl.setGamepadVibration(0, l, h, 0.1);
+        rl.setGamepadVibration(PAD, l, h, 0.1);
     }
 }
 
@@ -122,6 +128,6 @@ const win = struct {
             .wLeftMotor = @intFromFloat(l * 65535.0),
             .wRightMotor = @intFromFloat(h * 65535.0),
         };
-        _ = f(0, &vib); // user index 0 — the first controller, matching PAD in game.zig
+        _ = f(PAD, &vib); // the first controller (rumble.PAD), matching game.zig's input polling
     }
 };

@@ -21,16 +21,16 @@ pub const hitflash = 0.25;
 
 pub const maxPots = 9;
 
-// The hero's collision radius — the single source of truth. Used for movement
-// collision and melee hit reach; the monster attack telegraph reads it too, so the
-// drawn ring matches the real hitbox.
+// The hero's collision radius — THE single source of truth (there is no per-player
+// field; nothing varies it at runtime). Used for movement collision and melee hit
+// reach; the monster attack telegraph reads it too, so the drawn ring matches the
+// real hitbox.
 pub const radius: f32 = 0.55;
 
 // Player is the hero — an Amazon-ish ranged/melee hybrid.
 pub const Player = struct {
     Pos: rl.Vector3 = mathx.zero3,
     Facing: rl.Vector3 = mathx.zero3,
-    Radius: f32 = 0,
     Speed: f32 = 0,
 
     Level: i32 = 0,
@@ -159,7 +159,6 @@ pub fn newPlayer(pos: rl.Vector3) Player {
     var p = Player{
         .Pos = pos,
         .Facing = v3(0, 0, -1),
-        .Radius = radius,
         .Speed = 4.6, // deliberate, weighty walk
         .Level = 1,
         .XP = 0,

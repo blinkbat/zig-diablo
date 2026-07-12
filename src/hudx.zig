@@ -85,7 +85,10 @@ fn unloadFonts() void {
 }
 
 fn uiFont(size: i32) rl.Font {
-    return if (size >= 40) fontDisplay else fontText;
+    // Select on the EFFECTIVE render size (after the 1.18 x-height factor), not
+    // the requested one: sizes 35-39 render above the 40 px text atlas and must
+    // take the display atlas or they upscale into blur.
+    return if (fsize(size) > 40) fontDisplay else fontText;
 }
 
 // IM Fell's x-height is far smaller than the old pixel font's, so at equal point
@@ -140,6 +143,21 @@ fn glowCentered(s: [:0]const u8, cy: i32, size: i32, col: rl.Color, halo: rl.Col
 // A soft rounded backing pill behind free-floating text.
 pub fn pill(x: i32, y: i32, w: i32, h: i32, col: rl.Color) void {
     rl.drawRectangleRounded(.{ .x = fi(x), .y = fi(y), .width = fi(w), .height = fi(h) }, 0.9, 8, col);
+}
+
+// The "measured bar" chrome shared by the enemy plate and the XP channel — the ink
+// backing behind the bar, and the tick dividers + brass frame over it. The caller
+// draws its own fill (and any sweep) between the two, so a retune of the PoE-style
+// bar look happens in one place instead of two hand-tuned copies.
+fn barBacking(x: i32, y: i32, w: i32, h: i32) void {
+    rl.drawRectangle(x - 2, y - 2, w + 4, h + 4, withAlpha(theme.ink, 235));
+}
+fn barTicksFrame(x: i32, y: i32, w: i32, h: i32, ticks: i32, frameAlpha: u8) void {
+    var q: i32 = 1;
+    while (q < ticks) : (q += 1) {
+        rl.drawRectangle(x + @divTrunc(w * q, ticks), y, 1, h, withAlpha(theme.ink, 170));
+    }
+    rl.drawRectangleLines(x - 2, y - 2, w + 4, h + 4, withAlpha(theme.trimColor, frameAlpha));
 }
 
 // Top-level dispatcher: called once per frame after the 3D pass.
@@ -199,9 +217,9 @@ fn drawEnemyPlate(g: *Game) void {
     // One soft backing behind name + bar so both read over any scene.
     pill(bx - 18, 8, bw + 36, by - 8 + bh + 10, withAlpha(theme.ink, 165));
     var nbuf: [64]u8 = undefined;
-    const name = std.fmt.bufPrintZ(&nbuf, "{s}", .{m.Name}) catch "";
+    const name = std.fmt.bufPrintZ(&nbuf, "{s}", .{m.name()}) catch "";
     centered(name, 14, size, if (boss) rgba(255, 185, 205, 255) else rgba(240, 225, 205, 255));
-    rl.drawRectangle(bx - 2, by - 2, bw + 4, bh + 4, withAlpha(theme.ink, 235));
+    barBacking(bx, by, bw, bh);
     const fillCol = if (boss) rgba(225, 45, 105, 255) else rgba(200, 48, 40, 255);
     const frac = clampF(m.HP / m.MaxHP, 0, 1);
     const fw: i32 = @intFromFloat(fi(bw) * frac);
@@ -210,11 +228,7 @@ fn drawEnemyPlate(g: *Game) void {
         rl.drawRectangle(bx, by, fw, 2, withAlpha(lerpColor(fillCol, rl.Color.white, 0.5), 210));
     }
     // Quarter ticks + a thin brass frame: the PoE signature of a "measured" bar.
-    var q: i32 = 1;
-    while (q < 4) : (q += 1) {
-        rl.drawRectangle(bx + @divTrunc(bw * q, 4), by, 1, bh, withAlpha(theme.ink, 170));
-    }
-    rl.drawRectangleLines(bx - 2, by - 2, bw + 4, bh + 4, withAlpha(theme.trimColor, 140));
+    barTicksFrame(bx, by, bw, bh, 4, 140);
 }
 
 // (Floating combat text is gone by owner decree: no damage numbers, no "Dodge!" —
@@ -451,13 +465,21 @@ fn drawHUD(g: *Game) void {
     const H = sh();
     const t = g.elapsed;
 
-    // Damage flash: red pain closing in from the screen edges, not a flat wash.
+    // Damage flash: red pain pressed into the screen RIM — a border vignette that
+    // leaves the scene's own lighting alone. The old near-screen-sized circle
+    // gradient tinted the ENTIRE frame; over the fog's black, every arrow hit
+    // from an unseen archer read as the torch radius blowing out red for a beat
+    // ("the light keeps glitching"), not as pain. The center must stay untouched.
     if (g.damageFlash > 0) {
         const k = clampF(g.damageFlash / gamemod.DAMAGE_FLASH_DUR, 0, 1);
-        const cx = @divTrunc(W, 2);
-        const cy = @divTrunc(H, 2);
-        const r = screenDiag() * (1.25 - 0.15 * k);
-        rl.drawCircleGradient(cx, cy, r, rgba(180, 0, 0, 0), rgba(190, 10, 10, mathx.u8f(200 * k)));
+        const a = mathx.u8f(150 * k);
+        const band: i32 = @intFromFloat(@as(f32, @floatFromInt(@min(W, H))) * 0.16);
+        const red = rgba(185, 12, 10, a);
+        const clear = rgba(185, 12, 10, 0);
+        rl.drawRectangleGradientV(0, 0, W, band, red, clear);
+        rl.drawRectangleGradientV(0, H - band, W, band, clear, red);
+        rl.drawRectangleGradientH(0, 0, band, H, red, clear);
+        rl.drawRectangleGradientH(W - band, 0, band, H, clear, red);
     }
 
     // One fixed-width command cluster, centered on the bottom edge: the two orbs
@@ -486,7 +508,7 @@ fn drawHUD(g: *Game) void {
     const xpW = manaCX - orbR - 18 - xpX;
     const xpY = H - 24;
     const frac = if (p.XPNext > 0) @as(f32, @floatFromInt(p.XP)) / @as(f32, @floatFromInt(p.XPNext)) else 0;
-    rl.drawRectangle(xpX - 2, xpY - 2, xpW + 4, 12, withAlpha(theme.ink, 235));
+    barBacking(xpX, xpY, xpW, 8);
     rl.drawRectangle(xpX, xpY, xpW, 8, rgba(28, 22, 14, 255));
     const fw: i32 = @intFromFloat(fi(xpW) * clampF(frac, 0, 1));
     if (fw > 0) {
@@ -499,11 +521,7 @@ fn drawHUD(g: *Game) void {
         rl.drawRectangleGradientH(sx + sweepW, xpY, sweepW, 8, withAlpha(rl.Color.white, 55), withAlpha(rl.Color.white, 0));
         rl.endScissorMode();
     }
-    var tick: i32 = 1;
-    while (tick < 10) : (tick += 1) {
-        rl.drawRectangle(xpX + @divTrunc(xpW * tick, 10), xpY, 1, 8, withAlpha(theme.ink, 170));
-    }
-    rl.drawRectangleLines(xpX - 2, xpY - 2, xpW + 4, 12, withAlpha(theme.trimColor, 110));
+    barTicksFrame(xpX, xpY, xpW, 8, 10, 110);
 
     var b3: [32]u8 = undefined;
     const lvl = std.fmt.bufPrintZ(&b3, "Level {d}", .{p.Level}) catch "";
@@ -530,7 +548,7 @@ fn drawHUD(g: *Game) void {
     if (g.toast.active()) {
         const a = mathx.u8f(clampF(g.toast.time / gamemod.TOAST_DUR * 255, 0, 255));
         const toastW = textW(g.toast.text(), 22);
-        pill(@divTrunc(W, 2) - @divTrunc(toastW, 2) - 16, 78, toastW + 32, 36, rgba(8, 6, 5, @intFromFloat(fi(a) * 0.55)));
+        pill(@divTrunc(W, 2) - @divTrunc(toastW, 2) - 16, 78, toastW + 32, 36, withAlpha(theme.ink, mathx.u8f(fi(a) * 0.55)));
         centered(g.toast.text(), 84, 22, withAlpha(rgba(255, 245, 210, 255), a));
     }
 
@@ -667,8 +685,15 @@ fn drawMenu(g: *Game) void {
         .fullscreen => "Fullscreen",
     }}) catch "Display";
 
-    const rootItems = gamemod.menuRootItems;
+    // The Debug Log row shows its live state, same pattern as the display cycler.
+    var dbgBuf: [32]u8 = undefined;
+    const dbgLabel: [:0]const u8 = std.fmt.bufPrintZ(&dbgBuf, "Debug Log: {s}", .{if (g.debugLog) @as([]const u8, "On") else "Off"}) catch "Debug Log";
+    var rootItems = gamemod.menuRootItems;
+    rootItems[@intFromEnum(gamemod.RootItem.debug)] = dbgLabel;
+    // 1:1 with gamemod.OptionsItem (display, back) — pinned so a new options row
+    // can't leave the labels and the dispatch out of step.
     const optItems = [_][:0]const u8{ dispLabel, "Back" };
+    comptime std.debug.assert(optItems.len == @typeInfo(gamemod.OptionsItem).@"enum".fields.len);
     const items: []const [:0]const u8 = if (g.menuMode == .root) &rootItems else &optItems;
 
     const mouse = rl.getMousePosition();

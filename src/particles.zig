@@ -1,6 +1,7 @@
 const std = @import("std");
 const rl = @import("raylib");
 const mathx = @import("mathx.zig");
+const world = @import("world.zig");
 
 const v3 = mathx.v3;
 const rgba = mathx.rgba;
@@ -70,7 +71,7 @@ pub const Particles = struct {
         }
     }
 
-    pub fn update(self: *Particles, dt: f32) void {
+    pub fn update(self: *Particles, dt: f32, w: *const world.World) void {
         var i: usize = 0;
         while (i < self.count) {
             const p = &self.buf[i];
@@ -86,10 +87,17 @@ pub const Particles = struct {
             p.Vel.x *= k;
             p.Vel.y *= k;
             p.Vel.z *= k;
+            const prevY = p.Pos.y;
             p.Pos.x += p.Vel.x * dt;
             p.Pos.y += p.Vel.y * dt;
             p.Pos.z += p.Vel.z * dt;
-            if (p.Pos.y < 0.02) p.Pos.y = 0.02; // rest on the floor, don't sink through
+            // Rest on the LOCAL floor (the world is a heightfield — sparks on a
+            // rampart must not fall through its top). Only catch a mote crossing
+            // the floor from above: one that drifted sideways under a ledge is
+            // already inside the cliff and invisible; snapping it up to the ledge
+            // top would read as a teleport.
+            const floorY = w.groundY(p.Pos.x, p.Pos.z) + 0.02;
+            if (p.Pos.y < floorY and prevY >= floorY) p.Pos.y = floorY;
             i += 1;
         }
     }

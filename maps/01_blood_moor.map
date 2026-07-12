@@ -246,3 +246,5 @@ pack: fallen 2 4.3 -25.1
 pack: zombie 2 -10.1 4.4
 pack: zombie 2 2.2 -16.1
 pack: zombie 4 25.7 1.7
+pack: skeleton 2 -16.0 -6.0
+pack: skeleton 2 18.0 -18.0

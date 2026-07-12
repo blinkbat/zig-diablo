@@ -79,18 +79,6 @@ pub fn orFacing(f: rl.Vector3, fx: f32, fz: f32) rl.Vector3 {
     return f;
 }
 
-/// Intersect a ray with the y=0 plane; null if it never hits.
-pub fn rayGround(r: rl.Ray) ?rl.Vector3 {
-    if (@abs(r.direction.y) < 1e-6) return null;
-    const t = -r.position.y / r.direction.y;
-    if (t < 0) return null;
-    return v3(
-        r.position.x + r.direction.x * t,
-        0,
-        r.position.z + r.direction.z * t,
-    );
-}
-
 /// A copy of col with the given alpha (0..255).
 pub fn withAlpha(col: rl.Color, a: u8) rl.Color {
     var out = col;
