@@ -1486,21 +1486,24 @@ pub fn draw(g: *Game) void {
 
 // Live monster silhouettes on every pack (in the deploy ring) plus the boss at its
 // post, so the ENCOUNTER reads at a glance. Statuesque: no bob, facing outward.
-// Drawn in both passes so they cast shadows. makeMonster ignores its rng, so
-// previews are deterministic and free to rebuild every frame.
+// Drawn in both passes so they cast shadows. makeMonster rolls per-kind cooldowns off
+// the rng it's handed, but the drawn (statuesque) body ignores them — so a throwaway
+// local rng keeps previews deterministic AND leaves g.rng (author-time scatter/paint
+// jitter) unperturbed by every frame's rebuild.
 fn drawEncounterPreviews(g: *Game) void {
+    var rng = mathx.Rng.init(0);
     for (g.map.packList()) |pk| {
         const c = g.w.snapY(pk.pos());
         const n: i32 = @max(pk.count, 1);
         var i: i32 = 0;
         while (i < n) : (i += 1) {
             const a = @as(f32, @floatFromInt(i)) * (std.math.tau / @as(f32, @floatFromInt(n)));
-            var mm = monster.makeMonster(pk.kind, 0, &g.rng, g.w.snapY(v3(c.x + mathx.cosf(a) * 1.1, 0, c.z + mathx.sinf(a) * 1.1)));
+            var mm = monster.makeMonster(pk.kind, 0, &rng, g.w.snapY(v3(c.x + mathx.cosf(a) * 1.1, 0, c.z + mathx.sinf(a) * 1.1)));
             mm.Facing = v3(mathx.cosf(a), 0, mathx.sinf(a));
             gamemod.drawMonsterBody(&mm, false); // editor preview: no target highlight
         }
     }
-    var boss = monster.makeBoss(0, g.map.boss.slice(), &g.rng, g.w.snapY(g.map.bossPos));
+    var boss = monster.makeBoss(0, g.map.boss.slice(), &rng, g.w.snapY(g.map.bossPos));
     boss.Facing = v3(0, 0, 1);
     gamemod.drawMonsterBody(&boss, false);
 }

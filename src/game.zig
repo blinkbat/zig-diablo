@@ -1636,6 +1636,13 @@ fn endPlaytest(g: *Game) void {
 
 // ---- Rendering (frozen torchlight + baked scene mesh) ----
 
+// The hero's walk bob, shared by the body and its FX (bow limbs vs. the emissive
+// string) so the two can't drift — a mismatched amplitude would detach the drawn
+// string from the bow tips. Mirrors monsterBob for the foes.
+fn heroBob(p: *const Player) f32 {
+    return 0.05 * sinf(p.walkBob);
+}
+
 // The hero: a cloaked, hooded ranger; plain tint (torchlight shades it). Drawn
 // HERO_SCALE bigger about the feet (depth pass too, so the shadow grows with him).
 fn drawHeroBody(p: *const Player) void {
@@ -1646,7 +1653,7 @@ fn drawHeroBody(p: *const Player) void {
     const base = p.Pos;
     beginHeroScale(base);
     defer rl.gl.rlPopMatrix();
-    const bob = 0.05 * sinf(p.walkBob);
+    const bob = heroBob(p);
     const f = mathx.orFacing(p.Facing, 0, -1);
     const right = mathx.perpXZ(f);
 
@@ -1725,7 +1732,7 @@ fn drawHeroFX(p: *const Player, t: f32) void {
     }
 
     // Same bob as the body's limbs (heroBowHand) so the string meets the tips.
-    const bob = 0.05 * sinf(p.walkBob);
+    const bob = heroBob(p);
     const bhand = heroBowHand(base, f, right, bob);
     rl.drawLine3D(v3(bhand.x - f.x * 0.18, bhand.y + 0.62, bhand.z - f.z * 0.18), v3(bhand.x - f.x * 0.18, bhand.y - 0.62, bhand.z - f.z * 0.18), rgba(200, 200, 190, 200));
 
