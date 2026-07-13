@@ -62,6 +62,7 @@ const HERO_SCALE = 1.22;
 const TORCH_GRIP_RIGHT = 0.45;
 const TORCH_GRIP_FWD = 0.05;
 const TORCH_FLAME_Y = 1.64; // flame-heart height in the hero's ground-local frame
+const TORCH_HAND_Y = 0.95; // stick-grip Y, shared by the drawn stick and the FX flame base
 
 // Bow-hand grip (hero ground-local frame). ONE anchor (heroBowHand) for the drawn
 // bow limbs AND the emissive string, so the string can't detach from the tips.
@@ -800,7 +801,7 @@ fn handleGamepad(g: *Game) void {
     // X: engage — commit to chase+melee the selected foe (the stick pick, the nearest
     // default, or a fresh nearest scan), driving movement like a mouse click on a foe.
     if (input.padAttackDown() and !p.rolling()) {
-        const id = if (scannedAim) aimTarget else if (p.targetMonster >= 0) p.targetMonster else padAcquireTarget(g, aimDir);
+        const id = (if (scannedAim) aimTarget else null) orelse (if (p.targetMonster >= 0) p.targetMonster else padAcquireTarget(g, aimDir));
         if (id) |tid| {
             p.targetMonster = tid;
             p.chaseMonster = tid;
@@ -1167,7 +1168,7 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
 
     // Melee: close the gap, then commit to a telegraphed swing — but never wind up at
     // someone a cliff above/below; keep pressing (funnels the pack to the ramp).
-    const inMelee = toPlayer <= m.atkRange + playermod.radius and @abs(m.Pos.y - g.p.Pos.y) < SAME_GROUND_DY;
+    const inMelee = toPlayer <= playerReach(m.atkRange, playermod.radius) and @abs(m.Pos.y - g.p.Pos.y) < SAME_GROUND_DY;
     if (inMelee and m.atkCD <= 0) {
         m.lungeTimer = 0; // a lunge that connects ends here — no phantom dash after the swing
         m.windup = m.windupTime;
@@ -1281,15 +1282,20 @@ fn separateMonsters(g: *Game) void {
 
 // Shared tail of every damage source: on a lethal blow, fire the death rumble and
 // switch to the death screen. One spot for a future death hook.
+// Leave gameplay for a terminal screen (death/victory). Presentation timers only decay
+// in .playing, so a lethal/last-frame hit's flash/shake would judder the target screen
+// forever unless cleared here; the run is over, so nothing is resumable.
+fn endRun(g: *Game, to: Scene) void {
+    g.damageFlash = 0;
+    g.shake = 0;
+    g.scene = to;
+    g.canResume = false;
+}
+
 fn onPlayerDeath(g: *Game) void {
     if (g.p.alive()) return;
     g.rumble.play(rumble.death);
-    // Presentation timers only decay in .playing; the lethal hit's flash/shake would
-    // otherwise judder the death screen forever. Clear them as we leave gameplay.
-    g.damageFlash = 0;
-    g.shake = 0;
-    g.scene = .dead;
-    g.canResume = false; // the run is over — the menu offers a fresh start
+    endRun(g, .dead);
 }
 
 fn hitPlayer(g: *Game, dmg: stats.Damage) void {
@@ -1437,7 +1443,7 @@ fn updateDeaths(g: *Game, dt: f32) void {
 
 fn spawnGasCloud(g: *Game, pos: rl.Vector3, dps: f32) void {
     if (g.gasCount >= g.gas.len) return;
-    g.gas[g.gasCount] = .{ .Pos = pos, .life = GAS_LIFE, .dps = dps, .seed = g.rng.float() * std.math.tau };
+    g.gas[g.gasCount] = .{ .Pos = pos, .life = GAS_LIFE, .dps = dps, .seed = g.rng.angle() };
     g.gasCount += 1;
     // The body's rot boiling OUT — buoyant, sickly.
     g.parts.burst(&g.rng, v3(pos.x, pos.y + 0.7, pos.z), 18, 2.4, 0.15, 1.2, rgba(188, 228, 112, 230), -2);
@@ -1450,7 +1456,7 @@ fn keepGas(c: SweepCtx, gc: *GasCloud) bool {
     gc.life -= c.dt;
     if (gc.life <= 0) return false;
     if (distXZ(gc.Pos, g.p.Pos) <= TORCH_RADIUS and g.rng.float() < c.dt * 14) {
-        const ang = g.rng.float() * std.math.tau;
+        const ang = g.rng.angle();
         const r = g.rng.float() * GAS_RADIUS * 0.85;
         g.parts.spawn(.{
             .Pos = v3(gc.Pos.x + cosf(ang) * r, gc.Pos.y + 0.15 + g.rng.float() * 0.5, gc.Pos.z + sinf(ang) * r),
@@ -1502,7 +1508,7 @@ fn updateAmbientFX(g: *Game, dt: f32) void {
         g.portalPuff = 0.05;
         // Torchlight dust: dim, slow motes drifting the lit disc make the AIR visible.
         if (g.rng.float() < 0.55) {
-            const dang = g.rng.float() * std.math.tau;
+            const dang = g.rng.angle();
             const dr = (0.25 + 0.75 * g.rng.float()) * TORCH_RADIUS * 0.85;
             g.parts.spawn(.{
                 .Pos = v3(g.p.Pos.x + cosf(dang) * dr, g.p.Pos.y + 0.3 + g.rng.float() * 2.4, g.p.Pos.z + sinf(dang) * dr),
@@ -1545,7 +1551,7 @@ fn updateAmbientFX(g: *Game, dt: f32) void {
             });
         }
         if (g.w.PortalOpen) {
-            const ang = g.rng.float() * std.math.tau;
+            const ang = g.rng.angle();
             const r = 1.0 + g.rng.float() * 0.9;
             const pp = g.w.PortalPos;
             g.parts.spawn(.{
@@ -1590,12 +1596,7 @@ fn updatePortal(g: *Game) void {
             endPlaytest(g);
             g.ed.status("portal reached - playtest complete", .{});
         } else if (g.w.IsLast) {
-            // Same as death: stop gameplay timers decaying, so a last-frame hit's
-            // flash/shake can't judder the victory screen.
-            g.damageFlash = 0;
-            g.shake = 0;
-            g.scene = .victory;
-            g.canResume = false; // the run is won — nothing to resume
+            endRun(g, .victory);
         } else {
             g.enterArea(g.areaIndex + 1);
         }
@@ -1662,7 +1663,7 @@ fn endPlaytest(g: *Game) void {
 // string) so the two can't drift — a mismatched amplitude would detach the drawn
 // string from the bow tips. Mirrors monsterBob for the foes.
 fn heroBob(p: *const Player) f32 {
-    return 0.05 * sinf(p.walkBob);
+    return BOB_AMP * sinf(p.walkBob);
 }
 
 // The hero: a cloaked, hooded ranger; plain tint (torchlight shades it). Drawn
@@ -1734,7 +1735,7 @@ fn drawHeroBody(p: *const Player) void {
     rl.drawCylinderEx(bhand, v3(bhand.x - f.x * 0.18, bhand.y + 0.62, bhand.z - f.z * 0.18), 0.07, 0.03, 5, bowCol);
     rl.drawCylinderEx(bhand, v3(bhand.x - f.x * 0.18, bhand.y - 0.62, bhand.z - f.z * 0.18), 0.07, 0.03, 5, bowCol);
 
-    const thand = heroTorchHand(base, f, right, 0.95);
+    const thand = heroTorchHand(base, f, right, TORCH_HAND_Y);
     rl.drawCylinderEx(thand, v3(thand.x, thand.y + 0.55, thand.z), 0.05, 0.04, 5, rgba(70, 48, 30, 255));
 }
 
@@ -1775,7 +1776,7 @@ fn drawHeroFX(p: *const Player, t: f32) void {
     // The torch burns like the firebolt: wide corona, orange body, a swaying flame
     // TONGUE, a white-hot heart, plus the ember drift above.
     const flick = 1 + 0.18 * sinf(t * 22) + 0.1 * sinf(t * 37);
-    const thand = heroTorchHand(base, f, right, 0.95);
+    const thand = heroTorchHand(base, f, right, TORCH_HAND_Y);
     const flame = v3(thand.x, TORCH_FLAME_Y, thand.z);
     sphere(flame, 0.5 * flick, rgba(230, 80, 20, 40)); // wide soft halo
     sphere(flame, 0.32 * flick, rgba(235, 95, 25, 120));
@@ -1838,12 +1839,12 @@ pub fn drawWalls(w: *const world.World) void {
     }
 }
 
-const MONSTER_BOB_AMP = 0.05;
+const BOB_AMP = 0.05; // walk-bob amplitude, shared by heroBob + monsterBob so they can't drift
 const MONSTER_TORSO_BASE = 0.4;
 const MONSTER_HEAD_GAP = 0.25;
 
 fn monsterBob(m: *const Monster) f32 {
-    return MONSTER_BOB_AMP * sinf(m.bob);
+    return BOB_AMP * sinf(m.bob);
 }
 
 // World Y of a point up the drawn torso (frac 0=feet base, ~1=shoulders). FX anchor —
@@ -2549,8 +2550,9 @@ fn drawFireflies(g: *const Game, t: f32) void {
         rgba(150, 235, 110, 255),
         rgba(165, 150, 255, 255),
     };
+    const DARK_WOOD_AREA = 3; // campaign-order index of the map whose swarm teems (keyed to maps/*.map order)
     const col = cols[g.areaIndex % cols.len];
-    const n: usize = if (g.areaIndex == 3) 26 else 16; // the Dark Wood teems
+    const n: usize = if (g.areaIndex == DARK_WOOD_AREA) 26 else 16;
     const halfW = g.w.HalfW - 4;
     const halfD = g.w.HalfD - 4;
     var i: usize = 0;
@@ -2968,31 +2970,32 @@ pub fn run(shot: bool) void {
                     // Family portrait: one of each kind around the hero, three-quarter and zoomed — verifies every silhouette.
                     const px = g.p.Pos.x;
                     const pz = g.p.Pos.z;
+                    const posedBase = g.monsterCount; // capture before the four spawns — index off this, never count-4 (usize underflow if a spawn were dropped)
                     g.spawn(monster.makeMonster(.fallen, 0, &g.rng, mathx.ground(px - 3, pz - 1)));
                     g.spawn(monster.makeMonster(.zombie, 0, &g.rng, mathx.ground(px + 3, pz - 1.5)));
                     g.spawn(monster.makeMonster(.skeleton, 0, &g.rng, mathx.ground(px - 1, pz - 4)));
                     g.spawn(monster.makeMonster(.brute, 0, &g.rng, mathx.ground(px + 2.5, pz + 3)));
-                    var mi = g.monsterCount - 4;
+                    var mi = posedBase;
                     while (mi < g.monsterCount) : (mi += 1) {
                         g.monsters[mi].Facing = v3(-0.66, 0, 0.75);
                     }
                     // Pib mid-SWING so the arc shows (blade crossing, flare + trail). Posed
                     // dummies get STRETCHED timers: settle frames still tick updateMonster,
                     // and a real-length swing would decay past its readable middle.
-                    g.monsters[g.monsterCount - 4].swingTime = 3.0;
-                    g.monsters[g.monsterCount - 4].swing = 1.5;
+                    g.monsters[posedBase].swingTime = 3.0;
+                    g.monsters[posedBase].swing = 1.5;
                     // Zombie near the top of its raise: both claws overhead, body reared — full slam telegraph.
-                    g.monsters[g.monsterCount - 3].windupTime = 6.0;
-                    g.monsters[g.monsterCount - 3].windup = 0.9;
+                    g.monsters[posedBase + 1].windupTime = 6.0;
+                    g.monsters[posedBase + 1].windup = 0.9;
                     // Skeleton mid-draw: string back, arrow nocked, head glinting — aimed at
                     // the hero (windup AI keeps facing through the settle frames).
-                    g.monsters[g.monsterCount - 2].windupTime = 6.0;
-                    g.monsters[g.monsterCount - 2].windup = 2.4;
+                    g.monsters[posedBase + 2].windupTime = 6.0;
+                    g.monsters[posedBase + 2].windup = 2.4;
                     // Engage the brute so the top-center enemy plate is in frame (hover re-derives,
                     // but the attack target sticks and the plate reads from it).
-                    g.p.targetMonster = g.monsters[g.monsterCount - 1].id;
+                    g.p.targetMonster = g.monsters[posedBase + 3].id;
                     // Brute part-way into its heavy-stun meter to verify the amber stun channel under the HP bar.
-                    g.monsters[g.monsterCount - 1].stunFill = 0.6;
+                    g.monsters[posedBase + 3].stunFill = 0.6;
                     // And one fresh corpse mid-fade, to verify the spreading blood pool.
                     g.spawn(monster.makeMonster(.zombie, 0, &g.rng, mathx.ground(px + 0.6, pz + 4.6)));
                     g.monsters[g.monsterCount - 1].dying = true;

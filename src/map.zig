@@ -3,6 +3,7 @@ const rl = @import("raylib");
 const mathx = @import("mathx.zig");
 const world = @import("world.zig");
 const monster = @import("monster.zig");
+const torchlight = @import("torchlight.zig");
 
 const v3 = mathx.v3;
 const rgba = mathx.rgba;
@@ -72,14 +73,16 @@ pub const Pack = struct {
     }
 };
 
+pub const MAP_NAME_CAP = 48; // display-name cap; independent of monster.NAME_CAP (boss name)
+
 pub const Map = struct {
-    name: StrBuf(48) = .{},
+    name: StrBuf(MAP_NAME_CAP) = .{},
     boss: StrBuf(monster.NAME_CAP) = .{}, // copied into Monster.name; caps must match
     halfW: f32 = 30,
     halfD: f32 = 30,
     ground: rl.Color = DEFAULT_GROUND,
     accent: rl.Color = DEFAULT_ACCENT,
-    light: [3]f32 = .{ 1.0, 0.95, 0.85 },
+    light: [3]f32 = torchlight.DEFAULT_LIGHT,
     spawn: rl.Vector3 = v3(0, 0, 24),
     portal: rl.Vector3 = v3(0, 0, -23),
     bossPos: rl.Vector3 = v3(0, 0, -18),

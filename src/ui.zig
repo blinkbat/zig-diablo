@@ -13,6 +13,9 @@ const withAlpha = mathx.withAlpha;
 // frame"; the editor gates world clicks on it NEXT frame (1-frame lag is
 // imperceptible and avoids a layout/interaction split).
 
+// Shared cap for short UI message buffers (tips, status toasts, confirm prompts).
+pub const MSG_CAP = 96;
+
 pub const Ctx = struct {
     mouse: rl.Vector2,
     pressed: bool, // LMB went down this frame
@@ -21,7 +24,7 @@ pub const Ctx = struct {
 
     // Deferred tooltip: last hover this frame wins, drawn on top by drawTip. Copied
     // into a buffer so formatted tips can use caller stack storage.
-    tipBuf: [96]u8 = undefined,
+    tipBuf: [MSG_CAP]u8 = undefined,
     tipLen: usize = 0,
 
     pub fn begin() Ctx {

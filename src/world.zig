@@ -3,7 +3,6 @@ const rl = @import("raylib");
 const mathx = @import("mathx.zig");
 
 const v3 = mathx.v3;
-const rgba = mathx.rgba;
 const ground = mathx.ground;
 const dist2XZ = mathx.dist2XZ;
 
@@ -15,7 +14,7 @@ pub const Obstacle = struct {
     Radius: f32 = 0,
     Height: f32 = 0,
     Kind: ObstacleKind = .rock,
-    Tint: rl.Color = rgba(255, 255, 255, 255),
+    Tint: rl.Color = rl.Color.white,
 };
 
 // Bounded scenery, so a fixed array (no allocator). Above any area's max.
@@ -29,7 +28,7 @@ pub const Decor = struct {
     Pos: rl.Vector3 = mathx.zero3,
     Size: f32 = 0,
     Kind: DecorKind = .pebble,
-    Tint: rl.Color = rgba(255, 255, 255, 255),
+    Tint: rl.Color = rl.Color.white,
 };
 
 pub const MAX_DECOR = 512;
@@ -103,8 +102,8 @@ pub const MAX_RAMPS = 4;
 pub const World = struct {
     HalfW: f32 = 0, // arena spans -HalfW..HalfW on X
     HalfD: f32 = 0, // ...and -HalfD..HalfD on Z (rectangular arenas welcome)
-    Ground: rl.Color = rgba(255, 255, 255, 255),
-    Accent: rl.Color = rgba(255, 255, 255, 255),
+    Ground: rl.Color = rl.Color.white,
+    Accent: rl.Color = rl.Color.white,
     obstacles: [MAX_OBSTACLES]Obstacle = undefined,
     obstacle_count: usize = 0,
     decor: [MAX_DECOR]Decor = undefined,

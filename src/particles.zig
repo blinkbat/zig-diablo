@@ -4,7 +4,6 @@ const mathx = @import("mathx.zig");
 const world = @import("world.zig");
 
 const v3 = mathx.v3;
-const rgba = mathx.rgba;
 const sinf = mathx.sinf;
 const cosf = mathx.cosf;
 
@@ -21,7 +20,7 @@ pub const Particle = struct {
     Life: f32 = 0,
     maxLife: f32 = 1,
     Size: f32 = 0.1,
-    Color: rl.Color = rgba(255, 255, 255, 255),
+    Color: rl.Color = rl.Color.white,
     grav: f32 = 0, // downward pull; negative floats the mote upward
     drag: f32 = 0, // fraction of velocity shed per second
 };

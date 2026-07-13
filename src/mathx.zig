@@ -159,6 +159,11 @@ pub const Rng = struct {
         return lo + self.float() * (hi - lo);
     }
 
+    /// Uniform azimuth in [0, tau) — FX scatter/seed idiom, one source.
+    pub fn angle(self: *Rng) f32 {
+        return self.float() * std.math.tau;
+    }
+
     /// [0,n) — Go's rng.Intn(n). Returns 0 for n<=0 (Go would panic).
     pub fn intn(self: *Rng, n: i32) i32 {
         if (n <= 0) return 0;

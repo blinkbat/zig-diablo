@@ -270,7 +270,7 @@ decor: tuft -13.63 13.24 0.58
 decor: tuft -14.87 12.83 0.44
 decor: tuft -15.23 10.93 0.54
 decor: tuft -15.20 12.75 0.55
-pack: fallen 4 4.3 -25.1
+pack: fallen 5 4.3 -25.1
 pack: zombie 2 -10.1 4.4
 pack: zombie 2 2.2 -16.1
 pack: zombie 4 25.7 1.7

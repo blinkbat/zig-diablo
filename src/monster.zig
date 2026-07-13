@@ -76,7 +76,7 @@ pub const Monster = struct {
     Speed: f32 = 0,
     Radius: f32 = 0,
     Height: f32 = 0,
-    Color: rl.Color = rgba(255, 255, 255, 255),
+    Color: rl.Color = rl.Color.white,
     // Armor (PoE2 hit-size phys DR) + four elemental resists.
     def: stats.Defense = .{},
     MinDmg: f32 = 0,

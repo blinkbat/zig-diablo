@@ -13,6 +13,10 @@ const rl = @import("raylib");
 pub const SHADOWMAP_RESOLUTION = 4096;
 pub const SHADOW_COVER_MARGIN = 1.3;
 
+// Default warm torch tint. The per-map `light:` falls back to this, and the scene
+// shader seeds its lightColor uniform with it — one source so the two can't drift.
+pub const DEFAULT_LIGHT = [3]f32{ 1.0, 0.95, 0.85 };
+
 // Depth-pass clip planes for the overhead shadow cameras (torch + fireball), shared
 // so both frame the same near/far slab. NEAR clips anything above (light height -
 // NEAR) out of the depth pass, so it must stay small enough that monster heads clear
@@ -287,7 +291,7 @@ pub const Torch = struct {
         const scene = try rl.loadShaderFromMemory(sceneVS, sceneFS);
 
         // Constant uniforms.
-        const lc = [4]f32{ 1.0, 0.95, 0.85, 1.0 };
+        const lc = [4]f32{ DEFAULT_LIGHT[0], DEFAULT_LIGHT[1], DEFAULT_LIGHT[2], 1.0 };
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "lightColor"), &lc, .vec4);
         const amb = [4]f32{ 0.6, 0.6, 0.7, 1.0 };
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "ambient"), &amb, .vec4);

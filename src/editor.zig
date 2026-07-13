@@ -335,14 +335,14 @@ pub const Editor = struct {
     newHalfW: f32 = 30,
     newHalfD: f32 = 30,
 
-    status_buf: [96]u8 = [_]u8{0} ** 96,
+    status_buf: [ui.MSG_CAP]u8 = [_]u8{0} ** ui.MSG_CAP,
     status_len: usize = 0,
     status_t: f32 = 0,
 
     pub fn status(ed: *Editor, comptime fmt: []const u8, args: anytype) void {
         const s = std.fmt.bufPrintZ(&ed.status_buf, fmt, args) catch return;
         ed.status_len = s.len;
-        ed.status_t = 2.5;
+        ed.status_t = STATUS_SECS;
     }
 
     fn path(ed: *const Editor) []const u8 {
@@ -409,6 +409,7 @@ fn lastVariant(comptime T: type) usize {
 
 const REC_PATH = mapmod.dir ++ "/recovery.autosave";
 const REC_INTERVAL = 20.0;
+const STATUS_SECS = 2.5; // how long a status toast lingers before fading
 
 fn clearRecovery() void {
     std.fs.cwd().deleteFile(REC_PATH) catch {};
@@ -497,16 +498,18 @@ fn freePlace() bool {
 // void. Clamp at placement: out-of-wall content spawns unreachable monsters (playtest
 // softlock) and map.sanitize silently relocates it on next load (saved != authored).
 // Same insets as clampContents/pasteAt: content sits closer to the wall than anchors.
-fn clampContent(m: *const mapmod.Map, p: rl.Vector3) rl.Vector3 {
-    const limW = m.halfW - CONTENT_INSET;
-    const limD = m.halfD - CONTENT_INSET;
+fn clampInto(m: *const mapmod.Map, p: rl.Vector3, inset: f32) rl.Vector3 {
+    const limW = m.halfW - inset;
+    const limD = m.halfD - inset;
     return v3(clampF(p.x, -limW, limW), p.y, clampF(p.z, -limD, limD));
 }
 
+fn clampContent(m: *const mapmod.Map, p: rl.Vector3) rl.Vector3 {
+    return clampInto(m, p, CONTENT_INSET);
+}
+
 fn clampAnchor(m: *const mapmod.Map, p: rl.Vector3) rl.Vector3 {
-    const limW = m.halfW - ANCHOR_INSET;
-    const limD = m.halfD - ANCHOR_INSET;
-    return v3(clampF(p.x, -limW, limW), p.y, clampF(p.z, -limD, limD));
+    return clampInto(m, p, ANCHOR_INSET); // content sits closer to the wall than anchors
 }
 
 fn snapCenter(p: rl.Vector3) rl.Vector3 {
@@ -1112,9 +1115,7 @@ pub fn update(g: *Game, dt: f32) void {
         if (rl.isKeyDown(.d) or rl.isKeyDown(.right)) pan.x += 1;
     }
     const speed = 26.0 / g.rig.zoom;
-    ed.camTarget.x = clampF(ed.camTarget.x + pan.x * speed * dt, -g.map.halfW, g.map.halfW);
-    ed.camTarget.z = clampF(ed.camTarget.z + pan.z * speed * dt, -g.map.halfD, g.map.halfD);
-    ed.camTarget.y = g.w.groundY(ed.camTarget.x, ed.camTarget.z);
+    setCamTarget(g, ed.camTarget.x + pan.x * speed * dt, ed.camTarget.z + pan.z * speed * dt);
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0 and !ed.uiHot) g.rig.addZoom(wheel);
 
@@ -1130,9 +1131,7 @@ pub fn update(g: *Game, dt: f32) void {
         if (ed.rightMoved) {
             if (ed.panAnchor) |anchor| {
                 if (mousePoint(g)) |cur| {
-                    ed.camTarget.x = clampF(ed.camTarget.x - (cur.x - anchor.x), -g.map.halfW, g.map.halfW);
-                    ed.camTarget.z = clampF(ed.camTarget.z - (cur.z - anchor.z), -g.map.halfD, g.map.halfD);
-                    ed.camTarget.y = g.w.groundY(ed.camTarget.x, ed.camTarget.z);
+                    setCamTarget(g, ed.camTarget.x - (cur.x - anchor.x), ed.camTarget.z - (cur.z - anchor.z));
                     panning = true;
                 }
             }
@@ -1690,6 +1689,7 @@ const PALETTE_W = 148;
 const PANEL_W = 224;
 const MM_S = 150; // minimap side
 const LAYER_ROW_H = 30; // stride of a layer/brush button row
+const STEP_ROW_H = 28; // vertical stride of a property/stepper row in the panels
 
 pub fn drawOverlay(g: *Game) void {
     const ed = &g.ed;
@@ -1734,7 +1734,7 @@ fn hoverWorldTip(g: *Game, ctx: *ui.Ctx) void {
     // Tips only at rest: mid-paint/drag they'd flicker under the brush.
     if (rl.isMouseButtonDown(.left) or rl.isMouseButtonDown(.right)) return;
     const p = mousePoint(g) orelse return;
-    var buf: [96]u8 = undefined;
+    var buf: [ui.MSG_CAP]u8 = undefined;
     const m = &g.map;
     for (m.packList()) |pk| {
         if (distXZ(pk.pos(), p) < PACK_GRAB_R) {
@@ -1833,7 +1833,7 @@ fn drawPalette(g: *Game, ctx: *ui.Ctx) void {
     const brushes = brushesFor(ed.layer);
     const tips = brushTipsFor(ed.layer);
     const extraRows: i32 = if (ed.layer == .decor) 2 else 0;
-    const brushesRect = ui.rect(px, y, PALETTE_W, 26 + @as(i32, @intCast(brushes.len)) * LAYER_ROW_H + extraRows * 28 + 6);
+    const brushesRect = ui.rect(px, y, PALETTE_W, 26 + @as(i32, @intCast(brushes.len)) * LAYER_ROW_H + extraRows * STEP_ROW_H + 6);
     ui.claimedPanel(ctx, brushesRect, "BRUSHES");
     y += 26;
     for (brushes, 0..) |label, i| {
@@ -1844,13 +1844,13 @@ fn drawPalette(g: *Game, ctx: *ui.Ctx) void {
     }
     if (ed.layer == .decor) {
         if (ui.buttonTip(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 24), "Scatter (X)", 15, false, "Re-roll ALL decor over open floor (undoable)")) scatterDecor(g);
-        y += 28;
+        y += STEP_ROW_H;
         if (ui.buttonTip(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 24), "Clear all", 15, false, "Delete every decor on the map (undoable)")) {
             bankUndo(g);
             g.map.decor_count = 0;
             markDirty(g);
         }
-        y += 28;
+        y += STEP_ROW_H;
     }
 }
 
@@ -1871,7 +1871,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
         clampContents(&g.map);
         markDirty(g);
     }
-    y += 28;
+    y += STEP_ROW_H;
     ui.tipFor(ctx, ui.rect(px + 8, y - 2, PANEL_W - 16, 26), "North-south half-extent; shrinking clamps contents");
     var halfD = g.map.halfD;
     if (ui.stepperF(ctx, px + 10, y, "depth", &halfD, HALF_STEP, HALF_MIN, HALF_MAX)) {
@@ -1880,7 +1880,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
         clampContents(&g.map);
         markDirty(g);
     }
-    y += 28;
+    y += STEP_ROW_H;
     hudx.text("palette", px + 10, y + 3, 15, withAlpha(theme.labelColor, 230));
     var sx = px + 76;
     for (presets) |p| {
@@ -1944,11 +1944,9 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
 // Keep authored anchors AND terrain rects inside a shrunken arena; features that
 // collapse below a usable span are dropped, not left as slivers.
 fn clampContents(m: *mapmod.Map) void {
-    const limW = m.halfW - ANCHOR_INSET;
-    const limD = m.halfD - ANCHOR_INSET;
-    m.spawn = v3(clampF(m.spawn.x, -limW, limW), 0, clampF(m.spawn.z, -limD, limD));
-    m.portal = v3(clampF(m.portal.x, -limW, limW), 0, clampF(m.portal.z, -limD, limD));
-    m.bossPos = v3(clampF(m.bossPos.x, -limW, limW), 0, clampF(m.bossPos.z, -limD, limD));
+    m.spawn = clampAnchor(m, m.spawn);
+    m.portal = clampAnchor(m, m.portal);
+    m.bossPos = clampAnchor(m, m.bossPos);
     const flimW = m.halfW - CONTENT_INSET;
     const flimD = m.halfD - CONTENT_INSET;
     var i: usize = m.ledge_count;
@@ -1979,16 +1977,32 @@ fn clampContents(m: *mapmod.Map) void {
     // shrunken wall too (pasteAt's CONTENT_INSET limits), or they strand outside —
     // void-spawned monsters, floating scenery. No min-span collapse, so just clamp.
     for (m.obstacles[0..m.obstacle_count]) |*o| {
-        o.Pos.x = clampF(o.Pos.x, -flimW, flimW);
-        o.Pos.z = clampF(o.Pos.z, -flimD, flimD);
+        o.Pos = clampContent(m, o.Pos);
     }
     for (m.decor[0..m.decor_count]) |*d| {
-        d.Pos.x = clampF(d.Pos.x, -flimW, flimW);
-        d.Pos.z = clampF(d.Pos.z, -flimD, flimD);
+        d.Pos = clampContent(m, d.Pos);
     }
     for (m.packs[0..m.pack_count]) |*p| {
         p.x = clampF(p.x, -flimW, flimW);
         p.z = clampF(p.z, -flimD, flimD);
+    }
+}
+
+// Move the editor camera focus, clamped to the arena and re-seated on the ground. One
+// source for WASD pan, right-drag, and minimap travel so their clamp/ground rules match.
+fn setCamTarget(g: *Game, x: f32, z: f32) void {
+    g.ed.camTarget.x = clampF(x, -g.map.halfW, g.map.halfW);
+    g.ed.camTarget.z = clampF(z, -g.map.halfD, g.map.halfD);
+    g.ed.camTarget.y = g.w.groundY(g.ed.camTarget.x, g.ed.camTarget.z);
+}
+
+// Move a map anchor (spawn/portal/boss) to a pre-clamped point, banking undo only if it
+// actually moves. One guard for the three context-menu rows so they can't drift.
+fn setAnchorIfMoved(g: *Game, anchor: *rl.Vector3, ap: rl.Vector3) void {
+    if (anchor.x != ap.x or anchor.z != ap.z) {
+        bankUndo(g);
+        anchor.* = v3(ap.x, 0, ap.z);
+        markDirty(g);
     }
 }
 
@@ -2054,8 +2068,7 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     if (rl.checkCollisionPointRec(ctx.mouse, frame)) {
         ctx.anyHot = true;
         if (ctx.down) {
-            ed.camTarget.x = clampF((ctx.mouse.x - ox) / scale - halfW, -halfW, halfW);
-            ed.camTarget.z = clampF((ctx.mouse.y - oy) / scale - halfD, -halfD, halfD);
+            setCamTarget(g, (ctx.mouse.x - ox) / scale - halfW, (ctx.mouse.y - oy) / scale - halfD);
         }
     }
 }
@@ -2066,7 +2079,7 @@ fn drawStatusBar(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     const hints: [:0]const u8 = "Tab layer   1-9 brush   LMB paint   Shift+drag select   Ctrl+C/X/V   Del   RMB menu/pan   M mirror   [ ] size   Ctrl+Z undo   Ctrl+S save   F5 playtest";
     hudx.text(hints, 12, H - 25, 15, withAlpha(theme.labelColor, 220));
 
-    var right: [96]u8 = undefined;
+    var right: [ui.MSG_CAP]u8 = undefined;
     var coord: [:0]const u8 = "";
     if (!ed.uiHot) {
         if (mousePoint(g)) |p| {
@@ -2217,30 +2230,21 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
         }
         y += rowH;
     }
+    // Clamp to the arena inset like the LMB placement path (#L1409); a raw ctxWorld
+    // point can land in the void past the wall → unreachable hero/exit + save != authored.
+    const ap = clampAnchor(m, p);
     if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Move spawn here", 16, false)) {
-        if (m.spawn.x != p.x or m.spawn.z != p.z) {
-            bankUndo(g);
-            m.spawn = v3(p.x, 0, p.z);
-            markDirty(g);
-        }
+        setAnchorIfMoved(g, &m.spawn, ap);
         ed.ctxOpen = false;
     }
     y += rowH;
     if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Move portal here", 16, false)) {
-        if (m.portal.x != p.x or m.portal.z != p.z) {
-            bankUndo(g);
-            m.portal = v3(p.x, 0, p.z);
-            markDirty(g);
-        }
+        setAnchorIfMoved(g, &m.portal, ap);
         ed.ctxOpen = false;
     }
     y += rowH;
     if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Move boss here", 16, false)) {
-        if (m.bossPos.x != p.x or m.bossPos.z != p.z) {
-            bankUndo(g);
-            m.bossPos = v3(p.x, 0, p.z);
-            markDirty(g);
-        }
+        setAnchorIfMoved(g, &m.bossPos, ap);
         ed.ctxOpen = false;
     }
     y += rowH;
@@ -2266,7 +2270,7 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
             // Live path preview: exactly what doSaveAs will write, so sanitizing
             // never surprises.
             var slug: [40]u8 = undefined;
-            var pv: [96]u8 = undefined;
+            var pv: [ui.MSG_CAP]u8 = undefined;
             const s = slugTo(&slug, ed.field_buf[0..ed.field_len]);
             const preview = if (s.len > 0)
                 (std.fmt.bufPrintZ(&pv, "Will save to: {s}/{s}{s}", .{ mapmod.dir, s, mapmod.ext }) catch "")
@@ -2325,7 +2329,7 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
         },
         .confirm => {
             const mb = ui.beginModal(ctx, 460, 150, "Unsaved Changes");
-            var msg: [96]u8 = undefined;
+            var msg: [ui.MSG_CAP]u8 = undefined;
             const s = std.fmt.bufPrintZ(&msg, "\"{s}\" has unsaved changes.", .{g.map.name.slice()}) catch "";
             hudx.text(s, mb.x + 24, mb.y + 52, 17, rgba(225, 210, 190, 240));
             const bx = mb.x;
