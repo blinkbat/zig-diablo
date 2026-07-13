@@ -14,7 +14,7 @@ const mathx = @import("mathx.zig");
 // unseen/seen/active. Per-area: reset() clears the grid on area entry.
 
 // Grid resolution over the arena square. 128 => ~0.94 world-units/texel at the
-// largest area (half-extent clamps to 60 in map.sanitize); bilinear softens the edge.
+// largest area (half-extent clamps to map.HALF_MAX in map.sanitize); bilinear softens the edge.
 pub const RES = 128;
 
 pub const Fog = struct {
@@ -25,6 +25,12 @@ pub const Fog = struct {
     halfW: f32 = 1, // arena half-extents the grid spans; drive world->UV (kept > 0)
     halfD: f32 = 1,
     dirty: bool = true, // a cell changed (or area is fresh): re-upload pending
+    // Last reveal center+radius. The grid is monotonic-max, so re-revealing an unchanged
+    // disc writes nothing — skip the whole bbox scan (~hundreds of sqrts) while the hero
+    // holds still. Invalidated (lastR = -1) whenever the grid itself changes.
+    lastX: f32 = 0,
+    lastZ: f32 = 0,
+    lastR: f32 = -1,
 
     pub fn init() Fog {
         // Build the R8 texture once; contents come from `cells` via updateTexture.
@@ -50,12 +56,17 @@ pub const Fog = struct {
         self.halfW = if (halfW > 0) halfW else 1;
         self.halfD = if (halfD > 0) halfD else 1;
         self.dirty = true;
+        self.lastR = -1; // grid cleared — force the next reveal to re-scan
     }
 
     // Paint the disc of `radius` around ground `pos` into the grid. Cells fade from
     // seen inside `inner` to unseen at the edge, kept as a running max so the frontier
     // keeps a soft edge while cells behind it saturate. Iterates the disc's bbox only.
     pub fn reveal(self: *Fog, pos: rl.Vector3, radius: f32) void {
+        if (radius == self.lastR and pos.x == self.lastX and pos.z == self.lastZ) return;
+        self.lastX = pos.x;
+        self.lastZ = pos.z;
+        self.lastR = radius;
         const spanW = self.halfW * 2;
         const spanD = self.halfD * 2;
         const inner = radius * 0.82; // fully seen within this; linear ramp out to `radius`
@@ -90,6 +101,7 @@ pub const Fog = struct {
         self.halfW = if (halfW > 0) halfW else 1;
         self.halfD = if (halfD > 0) halfD else 1;
         self.dirty = true;
+        self.lastR = -1; // grid changed — force the next reveal to re-scan
     }
 
     // Upload the grid to the GPU if it changed since the last sync.

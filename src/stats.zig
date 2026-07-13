@@ -20,9 +20,14 @@ pub const DamageType = enum(u3) {
     // Self-maintaining (mirrors player.Skill.count): a new variant grows the damage
     // packet / resist arrays automatically instead of silently staying length-5.
     pub const count = @typeInfo(DamageType).@"enum".fields.len;
-    // The four non-physical types, in canonical order. The single source for
-    // "iterate the elements" (resist rows, setAllElemental) — no hand-synced list.
+    // The non-physical types, in canonical order — the single source for "iterate the
+    // elements" (resist rows, setAllElemental). It IS hand-listed, so the assert below
+    // pins it: adding a DamageType variant without extending this list is a compile error.
     pub const elementals = [_]DamageType{ .fire, .cold, .lightning, .chaos };
+    comptime {
+        std.debug.assert(elementals.len == count - 1); // every type but .physical
+        for (elementals) |t| std.debug.assert(t != .physical);
+    }
 
     pub fn idx(t: DamageType) usize {
         return @intFromEnum(t);
@@ -145,7 +150,10 @@ pub const RES_MIN: f32 = -1.0; // -100% (double damage) is the floor
 // monster.zig.
 pub const LIGHT_STUN_HP_FRAC: f32 = 0.25;
 pub const LIGHT_STUN_DUR: f32 = 0.35; // seconds of interrupt
-pub const HEAVY_STUN_DECAY_PER_SEC: f32 = 0.11; // fraction of the meter drained/sec (slow: the meter lingers)
+pub const HEAVY_STUN_DECAY_PER_SEC: f32 = 0.04; // fraction of the meter drained/sec (very slow: the meter really lingers)
+// Multiplier on how fast landed damage fills the heavy-stun meter. >1 means your hits
+// build stun far faster than raw damage would — a couple of solid blows stagger.
+pub const HEAVY_STUN_BUILD: f32 = 2.6;
 
 // ── Attributes ───────────────────────────────────────────────────────────────
 pub const Attribs = struct {
@@ -160,6 +168,11 @@ pub const Attribs = struct {
     /// the sheet UI and allocation code iterate ONE list, not six hardcoded rows.
     pub const Kind = enum { vitality, strength, dexterity, intelligence, focus, luck };
     pub const order = [_]Kind{ .vitality, .strength, .dexterity, .intelligence, .focus, .luck };
+    comptime {
+        // A new Kind forces compile errors in the exhaustive switches below, but `order`
+        // would silently omit it (invisible in the sheet, unallocatable) — pin its length.
+        std.debug.assert(order.len == @typeInfo(Kind).@"enum".fields.len);
+    }
 
     pub fn label(k: Kind) [:0]const u8 {
         return switch (k) {

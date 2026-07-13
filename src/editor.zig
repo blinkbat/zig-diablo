@@ -127,6 +127,16 @@ comptime {
     std.debug.assert(propBrushes.len == @typeInfo(world.ObstacleKind).@"enum".fields.len + 1);
     // packs (one per MonsterKind) + non-pack EntityBrush variants (all but .pack).
     std.debug.assert(entityBrushes.len == @typeInfo(monster.MonsterKind).@"enum".fields.len + @typeInfo(EntityBrush).@"enum".fields.len - 1);
+    // decor/props labels ARE the enum tag names — pin the ORDER, not just the length,
+    // so reordering DecorKind/ObstacleKind without reordering the brush table is a
+    // compile error (the decoders index enum-by-ordinal). Floor/entity labels are
+    // stylized ("Ledge", "pib pack") so their order stays a hand-kept convention.
+    for (0..@typeInfo(world.DecorKind).@"enum".fields.len) |i| {
+        std.debug.assert(std.mem.eql(u8, decorBrushes[i], @tagName(@as(world.DecorKind, @enumFromInt(i)))));
+    }
+    for (0..@typeInfo(world.ObstacleKind).@"enum".fields.len) |i| {
+        std.debug.assert(std.mem.eql(u8, propBrushes[i], @tagName(@as(world.ObstacleKind, @enumFromInt(i)))));
+    }
 }
 
 // Floor-layer brush index (positional, matching floorBrushes).
@@ -372,8 +382,9 @@ pub const Editor = struct {
     fn entityBrush(ed: *const Editor) EntityBrush {
         // First N brushes are the N monster-kind packs (decode to .pack); the tail
         // maps 1:1 onto EntityBrush's non-pack variants IN ORDER, so a new brush
-        // decodes correctly rather than collapsing to .erase. EntityBrush's order
-        // must match entityBrushes' tail; the comptime assert pins that contract.
+        // decodes correctly rather than collapsing to .erase. EntityBrush's order must
+        // match entityBrushes' tail — the comptime assert pins only the LENGTH (labels
+        // are stylized, not tag names), so this ordering is a hand-kept convention.
         const nPacks = @typeInfo(monster.MonsterKind).@"enum".fields.len;
         const b = ed.brush();
         if (b < nPacks) return .pack;
@@ -646,33 +657,38 @@ fn copySelection(g: *Game, cut: bool) void {
     const cx = (s.minX + s.maxX) / 2;
     const cz = (s.minZ + s.maxZ) / 2;
     const m = &g.map;
-    clipPropN = 0;
-    clipDecorN = 0;
-    clipPackN = 0;
+    // Capture into local counts first: an empty selection must NOT wipe the existing
+    // clipboard (the counts/clipHas are committed only once we know the grab is non-empty).
+    var np: usize = 0;
+    var nd: usize = 0;
+    var npk: usize = 0;
     for (m.obstacles[0..m.obstacle_count]) |o| {
         if (s.contains(o.Pos.x, o.Pos.z)) {
-            clipProps[clipPropN] = o;
-            clipProps[clipPropN].Pos = v3(o.Pos.x - cx, 0, o.Pos.z - cz);
-            clipPropN += 1;
+            clipProps[np] = o;
+            clipProps[np].Pos = v3(o.Pos.x - cx, 0, o.Pos.z - cz);
+            np += 1;
         }
     }
     for (m.decor[0..m.decor_count]) |d| {
         if (s.contains(d.Pos.x, d.Pos.z)) {
-            clipDecor[clipDecorN] = d;
-            clipDecor[clipDecorN].Pos = v3(d.Pos.x - cx, 0, d.Pos.z - cz);
-            clipDecorN += 1;
+            clipDecor[nd] = d;
+            clipDecor[nd].Pos = v3(d.Pos.x - cx, 0, d.Pos.z - cz);
+            nd += 1;
         }
     }
     for (m.packList()) |pk| {
         if (s.contains(pk.x, pk.z)) {
-            clipPacks[clipPackN] = pk;
-            clipPacks[clipPackN].x = pk.x - cx;
-            clipPacks[clipPackN].z = pk.z - cz;
-            clipPackN += 1;
+            clipPacks[npk] = pk;
+            clipPacks[npk].x = pk.x - cx;
+            clipPacks[npk].z = pk.z - cz;
+            npk += 1;
         }
     }
-    clipHas = clipPropN + clipDecorN + clipPackN > 0;
-    if (!clipHas) return ed.status("selection is empty", .{});
+    if (np + nd + npk == 0) return ed.status("selection is empty", .{});
+    clipPropN = np;
+    clipDecorN = nd;
+    clipPackN = npk;
+    clipHas = true;
     if (cut) deleteSelection(g);
     ed.status("{s} {d} props, {d} decor, {d} packs", .{ if (cut) @as([]const u8, "cut") else "copied", clipPropN, clipDecorN, clipPackN });
 }
@@ -680,23 +696,37 @@ fn copySelection(g: *Game, cut: bool) void {
 fn deleteSelection(g: *Game) void {
     const ed = &g.ed;
     const s = ed.sel orelse return ed.status("nothing selected (Shift+drag)", .{});
-    bankUndo(g);
+    // Snapshot first, bank only if something is actually removed — an empty rect must
+    // not push a no-op undo frame (evicting real history) or raise a spurious dirty flag.
+    const before = g.map;
     const m = &g.map;
+    var changed = false;
     var i: usize = m.obstacle_count;
     while (i > 0) {
         i -= 1;
-        if (s.contains(m.obstacles[i].Pos.x, m.obstacles[i].Pos.z)) m.removeObstacle(i);
+        if (s.contains(m.obstacles[i].Pos.x, m.obstacles[i].Pos.z)) {
+            m.removeObstacle(i);
+            changed = true;
+        }
     }
     i = m.decor_count;
     while (i > 0) {
         i -= 1;
-        if (s.contains(m.decor[i].Pos.x, m.decor[i].Pos.z)) m.removeDecor(i);
+        if (s.contains(m.decor[i].Pos.x, m.decor[i].Pos.z)) {
+            m.removeDecor(i);
+            changed = true;
+        }
     }
     i = m.pack_count;
     while (i > 0) {
         i -= 1;
-        if (s.contains(m.packs[i].x, m.packs[i].z)) m.removePack(i);
+        if (s.contains(m.packs[i].x, m.packs[i].z)) {
+            m.removePack(i);
+            changed = true;
+        }
     }
+    if (!changed) return;
+    pushUndoFrom(&before);
     markDirty(g);
 }
 
@@ -707,8 +737,6 @@ fn pasteAt(g: *Game, at: rl.Vector3) void {
     if (!clipHas) return ed.status("clipboard is empty (Ctrl+C first)", .{});
     bankUndo(g);
     const m = &g.map;
-    const limW = m.halfW - CONTENT_INSET;
-    const limD = m.halfD - CONTENT_INSET;
     var dropped: usize = 0;
     for (clipProps[0..clipPropN]) |o| {
         if (m.obstacle_count >= world.MAX_OBSTACLES) {
@@ -716,7 +744,7 @@ fn pasteAt(g: *Game, at: rl.Vector3) void {
             continue;
         }
         m.obstacles[m.obstacle_count] = o;
-        m.obstacles[m.obstacle_count].Pos = v3(clampF(at.x + o.Pos.x, -limW, limW), 0, clampF(at.z + o.Pos.z, -limD, limD));
+        m.obstacles[m.obstacle_count].Pos = clampContent(m, v3(at.x + o.Pos.x, 0, at.z + o.Pos.z));
         m.obstacle_count += 1;
     }
     for (clipDecor[0..clipDecorN]) |d| {
@@ -725,7 +753,7 @@ fn pasteAt(g: *Game, at: rl.Vector3) void {
             continue;
         }
         m.decor[m.decor_count] = d;
-        m.decor[m.decor_count].Pos = v3(clampF(at.x + d.Pos.x, -limW, limW), 0, clampF(at.z + d.Pos.z, -limD, limD));
+        m.decor[m.decor_count].Pos = clampContent(m, v3(at.x + d.Pos.x, 0, at.z + d.Pos.z));
         m.decor_count += 1;
     }
     for (clipPacks[0..clipPackN]) |pk| {
@@ -733,9 +761,10 @@ fn pasteAt(g: *Game, at: rl.Vector3) void {
             dropped += 1;
             continue;
         }
+        const pp = clampContent(m, v3(at.x + pk.x, 0, at.z + pk.z));
         m.packs[m.pack_count] = pk;
-        m.packs[m.pack_count].x = clampF(at.x + pk.x, -limW, limW);
-        m.packs[m.pack_count].z = clampF(at.z + pk.z, -limD, limD);
+        m.packs[m.pack_count].x = pp.x;
+        m.packs[m.pack_count].z = pp.z;
         m.pack_count += 1;
     }
     markDirty(g);
@@ -753,24 +782,17 @@ fn moveSelection(g: *Game, delta: rl.Vector3) void {
     const ed = &g.ed;
     const s = ed.sel orelse return;
     const m = &g.map;
-    const limW = m.halfW - CONTENT_INSET;
-    const limD = m.halfD - CONTENT_INSET;
     for (m.obstacles[0..m.obstacle_count]) |*o| {
-        if (s.contains(o.Pos.x, o.Pos.z)) {
-            o.Pos.x = clampF(o.Pos.x + delta.x, -limW, limW);
-            o.Pos.z = clampF(o.Pos.z + delta.z, -limD, limD);
-        }
+        if (s.contains(o.Pos.x, o.Pos.z)) o.Pos = clampContent(m, v3(o.Pos.x + delta.x, o.Pos.y, o.Pos.z + delta.z));
     }
     for (m.decor[0..m.decor_count]) |*d| {
-        if (s.contains(d.Pos.x, d.Pos.z)) {
-            d.Pos.x = clampF(d.Pos.x + delta.x, -limW, limW);
-            d.Pos.z = clampF(d.Pos.z + delta.z, -limD, limD);
-        }
+        if (s.contains(d.Pos.x, d.Pos.z)) d.Pos = clampContent(m, v3(d.Pos.x + delta.x, d.Pos.y, d.Pos.z + delta.z));
     }
     for (m.packs[0..m.pack_count]) |*pk| {
         if (s.contains(pk.x, pk.z)) {
-            pk.x = clampF(pk.x + delta.x, -limW, limW);
-            pk.z = clampF(pk.z + delta.z, -limD, limD);
+            const pp = clampContent(m, v3(pk.x + delta.x, 0, pk.z + delta.z));
+            pk.x = pp.x;
+            pk.z = pp.z;
         }
     }
     ed.sel = .{
@@ -892,7 +914,7 @@ fn scatterDecor(g: *Game) void {
     bankUndo(g);
     const m = &g.map;
     m.decor_count = 0;
-    const target: usize = @intFromFloat((m.halfW + m.halfD) * 2.25);
+    const target: usize = @min(@as(usize, @intFromFloat((m.halfW + m.halfD) * 2.25)), world.MAX_DECOR);
     var placed: usize = 0;
     var attempt: usize = 0;
     while (placed < target and attempt < target * 8) : (attempt += 1) {
@@ -901,6 +923,9 @@ fn scatterDecor(g: *Game) void {
         if (g.w.blocked(v3(x, 0, z), 0.3)) continue;
         if (g.w.onFeature(x, z)) continue;
         const roll = g.rng.float();
+        // Tripwire: this weight chain names every DecorKind. A new variant would fold
+        // silently into the `.bone` tail and never scatter, so force a revisit here.
+        comptime std.debug.assert(@typeInfo(world.DecorKind).@"enum".fields.len == 4);
         const kind: world.DecorKind = if (roll < 0.36) .pebble else if (roll < 0.8) .tuft else if (roll < 0.92) .shroom else .bone;
         m.decor[placed] = .{ .Kind = kind, .Pos = v3(x, 0, z), .Size = decorSize(kind, g.rng.float()) };
         placed += 1;
@@ -1200,6 +1225,7 @@ pub fn update(g: *Game, dt: f32) void {
     if (rl.isKeyPressed(.delete)) deleteSelection(g);
     if (ctrl and rl.isKeyPressed(.r) and recoveryExists()) {
         if (mapmod.load(REC_PATH)) |m| {
+            resetTransient(g); // no gesture straddles the map swap (mirrors doOpen)
             g.map = m;
             apply(g);
             ed.dirty = true;
@@ -1296,7 +1322,7 @@ pub fn update(g: *Game, dt: f32) void {
         // A layer/brush switch mid-drag (Tab, Alt+N, toolbar) leaves the current
         // case unable to own an in-flight stroke, so its release would never bank
         // undo AND strokeActive would stay set — silently blocking all undo/redo
-        // (L240/L254 guards) until the next stroke overwrites strokeBefore. Close
+        // (the doUndo/doRedo gesture guards) until the next stroke overwrites strokeBefore. Close
         // the stroke here the moment the active tool can no longer own it.
         const ownsStroke = switch (ed.layer) {
             .decor, .props => true,
@@ -1304,6 +1330,11 @@ pub fn update(g: *Game, dt: f32) void {
             else => false,
         };
         if (ed.strokeActive and !ownsStroke) endStroke(ed);
+        // Symmetric teardown for the floor rect-drag, which only the .floor case owns:
+        // a layer switch mid-drag must drop the anchor too, or its ghost preview lingers
+        // on the new layer and a later floor release (after tabbing back, LMB still held)
+        // commits a feature from the stale anchor.
+        if (ed.dragStart != null and ed.layer != .floor) ed.dragStart = null;
         switch (ed.layer) {
             .floor => {
                 if (rl.isMouseButtonPressed(.left)) {
@@ -1539,8 +1570,8 @@ fn drawMarkers(g: *Game) void {
         const col = packColor(pk.kind);
         const c = g.w.snapY(pk.pos());
         rl.drawCylinderEx(v3(c.x, c.y + 0.01, c.z), v3(c.x, c.y + 0.03, c.z), PACK_GRAB_R + 0.3, PACK_GRAB_R + 0.3, 20, withAlpha(theme.ink, 120));
-        rl.drawCircle3D(v3(c.x, c.y + 0.06, c.z), PACK_GRAB_R, v3(1, 0, 0), 90, col);
-        rl.drawCircle3D(v3(c.x, c.y + 0.06, c.z), PACK_GRAB_R - 0.15, v3(1, 0, 0), 90, withAlpha(col, 150));
+        gamemod.groundRing(v3(c.x, c.y + 0.06, c.z), PACK_GRAB_R, col);
+        gamemod.groundRing(v3(c.x, c.y + 0.06, c.z), PACK_GRAB_R - 0.15, withAlpha(col, 150));
     }
 
     // Marquee: the live drag rect, then the committed one.
@@ -1557,7 +1588,7 @@ fn drawMarkers(g: *Game) void {
 
     // Prop collision circles so spacing reads at a glance.
     for (m.obstacles[0..m.obstacle_count]) |o| {
-        rl.drawCircle3D(v3(o.Pos.x, g.w.groundY(o.Pos.x, o.Pos.z) + 0.04, o.Pos.z), o.Radius, v3(1, 0, 0), 90, rgba(255, 255, 255, 50));
+        gamemod.groundRing(v3(o.Pos.x, g.w.groundY(o.Pos.x, o.Pos.z) + 0.04, o.Pos.z), o.Radius, rgba(255, 255, 255, 50));
     }
 
     // Live drag rect preview for ledge/ramp (corners snapped like the commit).
@@ -1595,23 +1626,23 @@ fn drawCursorAids(g: *Game) void {
             }
         } else {
             // Sweep circle, plus a ring on everything it would take.
-            rl.drawCircle3D(v3(raw.x, raw.y + 0.06, raw.z), ed.brushR, v3(1, 0, 0), 90, rgba(255, 90, 70, 200));
+            gamemod.groundRing(v3(raw.x, raw.y + 0.06, raw.z), ed.brushR, rgba(255, 90, 70, 200));
             const m = &g.map;
             switch (ed.layer) {
                 .props => for (m.obstacles[0..m.obstacle_count]) |o| {
                     if (distXZ(o.Pos, raw) < ed.brushR) {
-                        rl.drawCircle3D(v3(o.Pos.x, g.w.groundY(o.Pos.x, o.Pos.z) + 0.08, o.Pos.z), o.Radius + 0.15, v3(1, 0, 0), 90, rgba(255, 60, 40, 255));
+                        gamemod.groundRing(v3(o.Pos.x, g.w.groundY(o.Pos.x, o.Pos.z) + 0.08, o.Pos.z), o.Radius + 0.15, rgba(255, 60, 40, 255));
                     }
                 },
                 .decor => for (m.decor[0..m.decor_count]) |d| {
                     if (distXZ(d.Pos, raw) < ed.brushR) {
-                        rl.drawCircle3D(v3(d.Pos.x, g.w.groundY(d.Pos.x, d.Pos.z) + 0.08, d.Pos.z), d.Size + 0.2, v3(1, 0, 0), 90, rgba(255, 60, 40, 255));
+                        gamemod.groundRing(v3(d.Pos.x, g.w.groundY(d.Pos.x, d.Pos.z) + 0.08, d.Pos.z), d.Size + 0.2, rgba(255, 60, 40, 255));
                     }
                 },
                 .entities => for (m.packList()) |pk| {
                     if (distXZ(pk.pos(), raw) < ed.brushR) {
                         const c = g.w.snapY(pk.pos());
-                        rl.drawCircle3D(v3(c.x, c.y + 0.1, c.z), PACK_GRAB_R + 0.2, v3(1, 0, 0), 90, rgba(255, 60, 40, 255));
+                        gamemod.groundRing(v3(c.x, c.y + 0.1, c.z), PACK_GRAB_R + 0.2, rgba(255, 60, 40, 255));
                     }
                 },
                 .floor => {},
@@ -1620,14 +1651,14 @@ fn drawCursorAids(g: *Game) void {
         return;
     }
 
-    rl.drawCircle3D(v3(p.x, p.y + 0.05, p.z), 0.5, v3(1, 0, 0), 90, rgba(255, 245, 200, 200));
+    gamemod.groundRing(v3(p.x, p.y + 0.05, p.z), 0.5, rgba(255, 245, 200, 200));
     if (p.x != raw.x or p.z != raw.z) {
         const c = snapCenter(raw);
         rl.drawCubeWiresV(v3(c.x, p.y + 0.03, c.z), v3(GRID, 0.0, GRID), rgba(255, 245, 200, 120));
     }
     if (wantMirror(ed, p)) {
         const mp = mirrorOf(p);
-        rl.drawCircle3D(v3(mp.x, g.w.groundY(mp.x, mp.z) + 0.05, mp.z), 0.5, v3(1, 0, 0), 90, rgba(160, 220, 255, 160));
+        gamemod.groundRing(v3(mp.x, g.w.groundY(mp.x, mp.z) + 0.05, mp.z), 0.5, rgba(160, 220, 255, 160));
     }
 }
 
@@ -1636,8 +1667,8 @@ fn marker(g: *Game, at: rl.Vector3, col: rl.Color, r: f32) void {
     // Dark puck + doubled ring + a tall haloed banner post: the map's fixed anchors,
     // never to be lost against the terrain.
     rl.drawCylinderEx(v3(p.x, p.y + 0.01, p.z), v3(p.x, p.y + 0.03, p.z), r + 0.35, r + 0.35, 20, withAlpha(theme.ink, 150));
-    rl.drawCircle3D(v3(p.x, p.y + 0.06, p.z), r, v3(1, 0, 0), 90, col);
-    rl.drawCircle3D(v3(p.x, p.y + 0.06, p.z), r - 0.14, v3(1, 0, 0), 90, withAlpha(col, 150));
+    gamemod.groundRing(v3(p.x, p.y + 0.06, p.z), r, col);
+    gamemod.groundRing(v3(p.x, p.y + 0.06, p.z), r - 0.14, withAlpha(col, 150));
     rl.drawCylinderEx(v3(p.x, p.y, p.z), v3(p.x, p.y + 2.6, p.z), 0.1, 0.03, 6, col);
     rl.drawSphereEx(v3(p.x, p.y + 2.75, p.z), 0.26, 8, 8, col);
     rl.drawSphereEx(v3(p.x, p.y + 2.75, p.z), 0.42, 8, 8, withAlpha(col, 70));
@@ -1775,6 +1806,7 @@ fn drawTopbar(g: *Game, ctx: *ui.Ctx, W: i32) void {
     if (ui.buttonTip(ctx, ui.rect(rx, 7, 66, 26), "Menu", 17, false, "Back to the title (Esc)")) requestAction(g, .exit, 0);
     rx -= 116;
     if (ui.buttonTip(ctx, ui.rect(rx, 7, 110, 26), "Playtest F5", 17, false, "Play this map now - Ctrl+F5 starts at the cursor")) {
+        resetTransient(g); // as the F5 key: no armed grab/stroke/marquee survives the round-trip
         gamemod.startPlaytest(g);
     }
 }
@@ -2167,35 +2199,48 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
         var fb: [40]u8 = undefined;
         const flbl = std.fmt.bufPrintZ(&fb, "{s} height -> {d:.1}", .{ if (featKind == .ledge) @as([]const u8, "Ledge") else "Ramp", ed.featureH }) catch "Set height";
         if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), flbl, 16, false)) {
-            bankUndo(g);
-            switch (featKind) {
-                .ledge => m.ledges[featIdx].h = ed.featureH,
-                .ramp => m.ramps[featIdx].h = ed.featureH,
-                .none => {},
+            const cur = switch (featKind) {
+                .ledge => m.ledges[featIdx].h,
+                .ramp => m.ramps[featIdx].h,
+                .none => ed.featureH,
+            };
+            if (cur != ed.featureH) {
+                bankUndo(g);
+                switch (featKind) {
+                    .ledge => m.ledges[featIdx].h = ed.featureH,
+                    .ramp => m.ramps[featIdx].h = ed.featureH,
+                    .none => {},
+                }
+                markDirty(g);
             }
-            markDirty(g);
             ed.ctxOpen = false;
         }
         y += rowH;
     }
     if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Move spawn here", 16, false)) {
-        bankUndo(g);
-        m.spawn = v3(p.x, 0, p.z);
-        markDirty(g);
+        if (m.spawn.x != p.x or m.spawn.z != p.z) {
+            bankUndo(g);
+            m.spawn = v3(p.x, 0, p.z);
+            markDirty(g);
+        }
         ed.ctxOpen = false;
     }
     y += rowH;
     if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Move portal here", 16, false)) {
-        bankUndo(g);
-        m.portal = v3(p.x, 0, p.z);
-        markDirty(g);
+        if (m.portal.x != p.x or m.portal.z != p.z) {
+            bankUndo(g);
+            m.portal = v3(p.x, 0, p.z);
+            markDirty(g);
+        }
         ed.ctxOpen = false;
     }
     y += rowH;
     if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Move boss here", 16, false)) {
-        bankUndo(g);
-        m.bossPos = v3(p.x, 0, p.z);
-        markDirty(g);
+        if (m.bossPos.x != p.x or m.bossPos.z != p.z) {
+            bankUndo(g);
+            m.bossPos = v3(p.x, 0, p.z);
+            markDirty(g);
+        }
         ed.ctxOpen = false;
     }
     y += rowH;

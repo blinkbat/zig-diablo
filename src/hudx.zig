@@ -42,6 +42,12 @@ fn screenDiag() f32 {
     return @sqrt(fi(cx * cx + cy * cy));
 }
 
+// Full-screen radial wash: transparent at center, `edge` at the corners. `scale`
+// nudges the falloff past the corner so the tint doesn't band. Vignette + scene screens.
+fn radialWash(edge: rl.Color, scale: f32) void {
+    rl.drawCircleGradient(@divTrunc(sw(), 2), @divTrunc(sh(), 2), screenDiag() * scale, rgba(0, 0, 0, 0), edge);
+}
+
 // ---- UI font ----
 // IM Fell English (assets/, OFL license alongside) — antique book type for all UI
 // text. TWO rasterizations so neither size extreme goes mushy: a display cut for
@@ -113,7 +119,8 @@ fn drawStr(s: [:0]const u8, x: i32, y: i32, size: i32, col: rl.Color) void {
 // Text with a drop shadow for legibility over the 3D scene (1 px under 22, else 2).
 pub fn text(s: [:0]const u8, x: i32, y: i32, size: i32, col: rl.Color) void {
     const off: i32 = if (size < 22) 1 else 2;
-    drawStr(s, x + off, y + off, size, rgba(0, 0, 0, 200));
+    // Shadow tracks the face alpha so a fading toast doesn't leave a black ghost.
+    drawStr(s, x + off, y + off, size, rgba(0, 0, 0, @intCast(@as(u16, 200) * col.a / 255)));
     drawStr(s, x, y, size, col);
 }
 fn centered(s: [:0]const u8, cy: i32, size: i32, col: rl.Color) void {
@@ -211,7 +218,7 @@ fn drawEnemyPlate(g: *Game) void {
     // Soft backing behind name + bar(s) so they read over any scene.
     pill(bx - 18, 8, bw + 36, by - 8 + bh + 10 + stunPad, withAlpha(theme.ink, 165));
     var nbuf: [64]u8 = undefined;
-    const name = std.fmt.bufPrintZ(&nbuf, "{s}", .{m.name()}) catch "";
+    const name = std.fmt.bufPrintZ(&nbuf, "{s}", .{m.name.slice()}) catch "";
     centered(name, 14, size, if (boss) rgba(255, 185, 205, 255) else rgba(240, 225, 205, 255));
     barBacking(bx, by, bw, bh);
     const fillCol = if (boss) rgba(225, 45, 105, 255) else rgba(200, 48, 40, 255);
@@ -761,10 +768,7 @@ fn drawTopRight(g: *Game) void {
 
 // Edge vignette so the eye stays on the lit center.
 fn vignette() void {
-    const cx = @divTrunc(sw(), 2);
-    const cy = @divTrunc(sh(), 2);
-    const r = screenDiag() * 1.02;
-    rl.drawCircleGradient(cx, cy, r, rgba(0, 0, 0, 0), rgba(0, 0, 0, 150));
+    radialWash(rgba(0, 0, 0, 150), 1.02);
 }
 
 // Stateless drifting screen embers: each mote's path is a pure function of time and
@@ -860,11 +864,9 @@ fn drawMenu(g: *Game) void {
 }
 
 fn drawDeath(g: *Game) void {
-    const cx = @divTrunc(sw(), 2);
     const cy = @divTrunc(sh(), 2);
     rl.drawRectangle(0, 0, sw(), sh(), rgba(20, 0, 0, 140));
-    const r = screenDiag() * 1.05;
-    rl.drawCircleGradient(cx, cy, r, rgba(0, 0, 0, 0), rgba(130, 0, 0, 210));
+    radialWash(rgba(130, 0, 0, 210), 1.05);
     emberField(g.elapsed, 14, rgba(200, 40, 30, 160), true);
     glowCentered("YOU HAVE DIED", cy - 80, 70, rgba(225, 45, 40, 255), rgba(70, 5, 5, 130));
     var buf: [128]u8 = undefined;
@@ -875,11 +877,9 @@ fn drawDeath(g: *Game) void {
 }
 
 fn drawVictory(g: *Game) void {
-    const cx = @divTrunc(sw(), 2);
     const cy = @divTrunc(sh(), 2);
     rl.drawRectangle(0, 0, sw(), sh(), rgba(0, 0, 0, 170));
-    const r = screenDiag() * 1.05;
-    rl.drawCircleGradient(cx, cy, r, rgba(0, 0, 0, 0), rgba(90, 60, 0, 160));
+    radialWash(rgba(90, 60, 0, 160), 1.05);
     emberField(g.elapsed, 26, rgba(255, 215, 90, 200), false);
     glowCentered("VICTORY!", cy - 90, 80, theme.goldColor, rgba(120, 80, 10, 130));
     centered("You have cleared the catacombs and triumphed over the darkness.", cy + 10, 22, rgba(230, 220, 200, 255));

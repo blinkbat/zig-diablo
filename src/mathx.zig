@@ -10,6 +10,24 @@ pub const rgba = rl.Color.init;
 /// The zero vector — used as a struct-field default (Go's zero value).
 pub const zero3 = rl.Vector3{ .x = 0, .y = 0, .z = 0 };
 
+/// Fixed-capacity inline string: stored in-struct (no alloc, no dangle when the owner
+/// moves). set() truncates to cap; slice() is the live view. Shared by Map + Monster.
+pub fn StrBuf(comptime cap: usize) type {
+    return struct {
+        buf: [cap]u8 = [_]u8{0} ** cap,
+        len: usize = 0,
+        const Self = @This();
+        pub fn set(self: *Self, s: []const u8) void {
+            const n = @min(s.len, cap);
+            @memcpy(self.buf[0..n], s[0..n]);
+            self.len = n;
+        }
+        pub fn slice(self: *const Self) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+}
+
 pub fn clampF(v: f32, lo: f32, hi: f32) f32 {
     // NaN passes both `<` and `>`, so it'd escape unclamped and blow up a downstream
     // @intFromFloat; pin it to lo (safe, no meaningful clamp position for NaN).

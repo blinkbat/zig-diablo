@@ -10,8 +10,8 @@ const clampF = mathx.clampF;
 
 // Dodge-roll tuning: a short fast burst with a generous i-frame window — the core
 // way to survive telegraphed attacks.
-pub const rollDur = 0.42;
-pub const rollSpeed = 17.0;
+pub const rollDur = 0.38;
+pub const rollSpeed = 15.0;
 pub const rollCDMax = 1.05;
 pub const rollIframe = 0.34;
 
@@ -22,6 +22,13 @@ pub const swingDur = 0.22;
 pub const hitflash = 0.25;
 
 pub const maxPots = 9;
+
+// Belt-potion potency: a percentage of the max pool plus a flat floor, so early
+// potions still meaningfully heal before pools grow.
+pub const POTION_HEAL_FRAC = 0.55;
+pub const POTION_HEAL_FLAT = 30;
+pub const POTION_MANA_FRAC = 0.6;
+pub const POTION_MANA_FLAT = 20;
 
 // Hero collision radius — the single source of truth (no per-player field; never
 // varies at runtime). Used for movement collision and melee reach, and read by the
@@ -295,21 +302,22 @@ pub const Player = struct {
     }
 
     pub fn regen(p: *Player, dt: f32) void {
-        if (p.HP > 0 and p.HP < p.MaxHP) p.HP = minF(p.MaxHP, p.HP + p.hpRegen * dt);
+        if (p.HP <= 0) return; // the dead don't regen HP or mana
+        if (p.HP < p.MaxHP) p.HP = minF(p.MaxHP, p.HP + p.hpRegen * dt);
         if (p.Mana < p.MaxMana) p.Mana = minF(p.MaxMana, p.Mana + p.manaRegen * dt);
     }
 
     pub fn drinkHealth(p: *Player) bool {
         if (p.HealthPots <= 0 or p.HP >= p.MaxHP) return false;
         p.HealthPots -= 1;
-        p.HP = minF(p.MaxHP, p.HP + p.MaxHP * 0.55 + 30);
+        p.HP = minF(p.MaxHP, p.HP + p.MaxHP * POTION_HEAL_FRAC + POTION_HEAL_FLAT);
         return true;
     }
 
     pub fn drinkMana(p: *Player) bool {
         if (p.ManaPots <= 0 or p.Mana >= p.MaxMana) return false;
         p.ManaPots -= 1;
-        p.Mana = minF(p.MaxMana, p.Mana + p.MaxMana * 0.6 + 20);
+        p.Mana = minF(p.MaxMana, p.Mana + p.MaxMana * POTION_MANA_FRAC + POTION_MANA_FLAT);
         return true;
     }
 };

@@ -65,8 +65,7 @@ pub const Monster = struct {
     Kind: MonsterKind = .fallen,
     // Name stored INLINE, not sliced: a boss name aliased into the map would dangle
     // when the owning struct moves (see map.zig). Cap shared with Map.boss.
-    nameBuf: [NAME_CAP]u8 = [_]u8{0} ** NAME_CAP,
-    nameLen: u8 = 0,
+    name: mathx.StrBuf(NAME_CAP) = .{},
     Pos: rl.Vector3 = mathx.zero3,
     Facing: rl.Vector3 = mathx.zero3,
     HP: f32 = 0,
@@ -140,7 +139,7 @@ pub const Monster = struct {
         }
         // Heavy stun: accumulate toward the meter; topping out locks it down hard.
         if (m.HP > 0 and m.heavyStunMax > 0) {
-            m.stunFill += landed / m.heavyStunMax;
+            m.stunFill += stats.HEAVY_STUN_BUILD * landed / m.heavyStunMax;
             if (m.stunFill >= 1) {
                 m.stunFill = 0;
                 m.applyStun(m.heavyStunDur);
@@ -165,16 +164,6 @@ pub const Monster = struct {
             if (m.stunFill < 0) m.stunFill = 0;
         }
         return m.stunTimer > 0;
-    }
-
-    pub fn name(m: *const Monster) []const u8 {
-        return m.nameBuf[0..m.nameLen];
-    }
-
-    pub fn setName(m: *Monster, s: []const u8) void {
-        const n = @min(s.len, m.nameBuf.len);
-        @memcpy(m.nameBuf[0..n], s[0..n]);
-        m.nameLen = @intCast(n);
     }
 
     /// Telegraph progress 0→1 as a committed strike winds up (0 when idle). Shared
@@ -208,7 +197,7 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
     var stunFactor: f32 = 1.4;
     switch (kind) {
         .fallen => {
-            m.setName("Pib"); // the knife pigs (gf-certified)
+            m.name.set("Pib"); // the knife pigs (gf-certified)
             m.MaxHP = 30 + t * 11;
             m.Radius = 0.45;
             m.Height = 1.4;
@@ -233,7 +222,7 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
             m.lungeCD = rng.float() * pib_lunge_cd_min; // stagger first lunge across the pack
         },
         .zombie => {
-            m.setName("Zombie");
+            m.name.set("Zombie");
             // A lumbering wall: too slow to catch the alert, too tanky to ignore,
             // and its overhead slam ruins whoever stands in it.
             m.MaxHP = 115 + t * 34;
@@ -258,7 +247,7 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
             stunFactor = 1.7;
         },
         .skeleton => {
-            m.setName("Skeleton Archer");
+            m.name.set("Skeleton Archer");
             m.MaxHP = 42 + t * 15;
             m.Speed = 3.0 + t * 0.2;
             m.Radius = 0.5;
@@ -281,7 +270,7 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
             m.dodgeCD = rng.float() * skel_dodge_cd_min; // stagger first juke across the line
         },
         .brute => {
-            m.setName("Brute");
+            m.name.set("Brute");
             m.MaxHP = 170 + t * 60;
             m.Speed = 2.4 + t * 0.2;
             m.Radius = 1.0;
@@ -315,7 +304,7 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
 pub fn makeBoss(tier: i32, bossName: []const u8, rng: *Rng, pos: rl.Vector3) Monster {
     var m = makeMonster(.brute, tier, rng, pos);
     m.boss = true;
-    m.setName(bossName); // copied, not aliased: the caller's map may move
+    m.name.set(bossName); // copied, not aliased: the caller's map may move
     m.MaxHP = m.MaxHP * 2.4 + 120;
     m.HP = m.MaxHP;
     m.MinDmg *= 1.4;

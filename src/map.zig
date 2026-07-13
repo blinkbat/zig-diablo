@@ -12,7 +12,8 @@ const lerpColor = mathx.lerpColor;
 // lexicographic order, e.g. `01_blood_moor.map`). Line-based text, one object per
 // line, diff-friendly and hand-editable, with a required `version:` header. Every
 // line is `key: payload`; unknown keys are an ERROR (typos must not silently drop
-// half a map). `#` starts a comment.
+// half a map). A line beginning with `#` is a comment (whole-line only — a `#` after
+// a payload is NOT stripped and will fail the trailing-data check).
 //
 //   version: 2
 //   name: The Blood Moor
@@ -37,6 +38,12 @@ const lerpColor = mathx.lerpColor;
 pub const FORMAT_VERSION = 2; // v2: rectangular arenas (size: W D); v1 'half:' still loads
 pub const MAX_PACKS = 24;
 pub const MAX_MAPS = 16;
+// Load-time clamps (see sanitize). Deliberately WIDER than the editor's steppers so
+// hand-edited/legacy maps stay welcome; the editor curates a tighter authoring range.
+pub const HALF_MIN = 12;
+pub const HALF_MAX = 60;
+pub const PACK_MEMBERS_MIN = 1;
+pub const PACK_MEMBERS_MAX = 16;
 pub const ext = ".map";
 pub const dir = "maps";
 // Stored map-file path capacity, shared by the campaign list, cached paths, and the
@@ -50,21 +57,7 @@ pub const DEFAULT_ACCENT = rgba(72, 62, 50, 255);
 
 const alloc = std.heap.c_allocator;
 
-fn StrBuf(comptime cap: usize) type {
-    return struct {
-        buf: [cap]u8 = [_]u8{0} ** cap,
-        len: usize = 0,
-        const Self = @This();
-        pub fn set(self: *Self, s: []const u8) void {
-            const n = @min(s.len, cap);
-            @memcpy(self.buf[0..n], s[0..n]);
-            self.len = n;
-        }
-        pub fn slice(self: *const Self) []const u8 {
-            return self.buf[0..self.len];
-        }
-    };
-}
+const StrBuf = mathx.StrBuf; // fixed-capacity inline string, shared with Monster
 
 pub const Pack = struct {
     kind: monster.MonsterKind = .fallen,
@@ -81,7 +74,7 @@ pub const Pack = struct {
 
 pub const Map = struct {
     name: StrBuf(48) = .{},
-    boss: StrBuf(monster.NAME_CAP) = .{}, // copied into Monster.nameBuf; caps must match
+    boss: StrBuf(monster.NAME_CAP) = .{}, // copied into Monster.name; caps must match
     halfW: f32 = 30,
     halfD: f32 = 30,
     ground: rl.Color = DEFAULT_GROUND,
@@ -219,6 +212,27 @@ pub fn toWorld(m: *const Map, isLast: bool) world.World {
 
 // ---- Saving ----
 
+// Line keys — one spelling per field, shared by save() and load() so a rename can
+// never desync the writer from the parser.
+const K = struct {
+    const version = "version";
+    const name = "name";
+    const boss = "boss";
+    const size = "size";
+    const half = "half"; // legacy v1 square arena, read-only
+    const ground = "ground";
+    const accent = "accent";
+    const light = "light";
+    const spawn = "spawn";
+    const portal = "portal";
+    const bossat = "bossat";
+    const ledge = "ledge";
+    const ramp = "ramp";
+    const ob = "ob";
+    const decor = "decor";
+    const pack = "pack";
+};
+
 pub fn save(m: *const Map, path: []const u8) !void {
     std.fs.cwd().makePath(dir) catch {};
     // Keep a .bak of whatever was there before, so we never clobber the only copy.
@@ -230,30 +244,30 @@ pub fn save(m: *const Map, path: []const u8) !void {
     const f = try std.fs.cwd().createFile(path, .{});
     defer f.close();
     const w = f.writer();
-    try w.print("version: {d}\n", .{FORMAT_VERSION});
-    try w.print("name: {s}\n", .{m.name.slice()});
-    try w.print("boss: {s}\n", .{m.boss.slice()});
-    try w.print("size: {d:.1} {d:.1}\n", .{ m.halfW, m.halfD });
-    try w.print("ground: {d} {d} {d}\n", .{ m.ground.r, m.ground.g, m.ground.b });
-    try w.print("accent: {d} {d} {d}\n", .{ m.accent.r, m.accent.g, m.accent.b });
-    try w.print("light: {d:.2} {d:.2} {d:.2}\n", .{ m.light[0], m.light[1], m.light[2] });
-    try w.print("spawn: {d:.1} {d:.1}\n", .{ m.spawn.x, m.spawn.z });
-    try w.print("portal: {d:.1} {d:.1}\n", .{ m.portal.x, m.portal.z });
-    try w.print("bossat: {d:.1} {d:.1}\n", .{ m.bossPos.x, m.bossPos.z });
+    try w.print(K.version ++ ": {d}\n", .{FORMAT_VERSION});
+    try w.print(K.name ++ ": {s}\n", .{m.name.slice()});
+    try w.print(K.boss ++ ": {s}\n", .{m.boss.slice()});
+    try w.print(K.size ++ ": {d:.1} {d:.1}\n", .{ m.halfW, m.halfD });
+    try w.print(K.ground ++ ": {d} {d} {d}\n", .{ m.ground.r, m.ground.g, m.ground.b });
+    try w.print(K.accent ++ ": {d} {d} {d}\n", .{ m.accent.r, m.accent.g, m.accent.b });
+    try w.print(K.light ++ ": {d:.2} {d:.2} {d:.2}\n", .{ m.light[0], m.light[1], m.light[2] });
+    try w.print(K.spawn ++ ": {d:.1} {d:.1}\n", .{ m.spawn.x, m.spawn.z });
+    try w.print(K.portal ++ ": {d:.1} {d:.1}\n", .{ m.portal.x, m.portal.z });
+    try w.print(K.bossat ++ ": {d:.1} {d:.1}\n", .{ m.bossPos.x, m.bossPos.z });
     for (m.ledges[0..m.ledge_count]) |l| {
-        try w.print("ledge: {d:.1} {d:.1} {d:.1} {d:.1} {d:.1}\n", .{ l.minX, l.minZ, l.maxX, l.maxZ, l.h });
+        try w.print(K.ledge ++ ": {d:.1} {d:.1} {d:.1} {d:.1} {d:.1}\n", .{ l.minX, l.minZ, l.maxX, l.maxZ, l.h });
     }
     for (m.ramps[0..m.ramp_count]) |r| {
-        try w.print("ramp: {d:.1} {d:.1} {d:.1} {d:.1} {d:.1} {s}\n", .{ r.minX, r.minZ, r.maxX, r.maxZ, r.h, @tagName(r.rise) });
+        try w.print(K.ramp ++ ": {d:.1} {d:.1} {d:.1} {d:.1} {d:.1} {s}\n", .{ r.minX, r.minZ, r.maxX, r.maxZ, r.h, @tagName(r.rise) });
     }
     for (m.obstacles[0..m.obstacle_count]) |o| {
-        try w.print("ob: {s} {d:.2} {d:.2} {d:.2} {d:.2}\n", .{ @tagName(o.Kind), o.Pos.x, o.Pos.z, o.Radius, o.Height });
+        try w.print(K.ob ++ ": {s} {d:.2} {d:.2} {d:.2} {d:.2}\n", .{ @tagName(o.Kind), o.Pos.x, o.Pos.z, o.Radius, o.Height });
     }
     for (m.decor[0..m.decor_count]) |d| {
-        try w.print("decor: {s} {d:.2} {d:.2} {d:.2}\n", .{ @tagName(d.Kind), d.Pos.x, d.Pos.z, d.Size });
+        try w.print(K.decor ++ ": {s} {d:.2} {d:.2} {d:.2}\n", .{ @tagName(d.Kind), d.Pos.x, d.Pos.z, d.Size });
     }
     for (m.packs[0..m.pack_count]) |p| {
-        try w.print("pack: {s} {d} {d:.1} {d:.1}\n", .{ @tagName(p.kind), p.count, p.x, p.z });
+        try w.print(K.pack ++ ": {s} {d} {d:.1} {d:.1}\n", .{ @tagName(p.kind), p.count, p.x, p.z });
     }
 }
 
@@ -304,7 +318,7 @@ pub fn load(path: []const u8) LoadError!Map {
         const rest = std.mem.trim(u8, line[colon + 1 ..], " ");
         var it = std.mem.tokenizeScalar(u8, rest, ' ');
 
-        if (std.mem.eql(u8, key, "version")) {
+        if (std.mem.eql(u8, key, K.version)) {
             const ver = nextF32(&it) catch return fail(lineNo, line, "bad version");
             // Compare as float (never @intFromFloat an unvalidated parse — huge/inf/NaN
             // makes the cast illegal). Require 1 <= ver <= FORMAT_VERSION: the negated,
@@ -312,30 +326,30 @@ pub fn load(path: []const u8) LoadError!Map {
             // truncated/typo'd value (0, negative) that would otherwise load silently.
             if (!(ver >= 1 and ver <= @as(f32, @floatFromInt(FORMAT_VERSION)))) return fail(lineNo, line, "unsupported map format version");
             sawVersion = true;
-        } else if (std.mem.eql(u8, key, "name")) {
+        } else if (std.mem.eql(u8, key, K.name)) {
             m.name.set(rest);
-        } else if (std.mem.eql(u8, key, "boss")) {
+        } else if (std.mem.eql(u8, key, K.boss)) {
             m.boss.set(rest);
-        } else if (std.mem.eql(u8, key, "size")) {
+        } else if (std.mem.eql(u8, key, K.size)) {
             m.halfW = nextF32(&it) catch return fail(lineNo, line, "bad size");
             m.halfD = nextF32(&it) catch return fail(lineNo, line, "bad size");
-        } else if (std.mem.eql(u8, key, "half")) {
+        } else if (std.mem.eql(u8, key, K.half)) {
             // Legacy v1 square arena: one extent for both axes.
             m.halfW = nextF32(&it) catch return fail(lineNo, line, "bad half");
             m.halfD = m.halfW;
-        } else if (std.mem.eql(u8, key, "ground")) {
+        } else if (std.mem.eql(u8, key, K.ground)) {
             m.ground = rgba(nextU8(&it) catch return fail(lineNo, line, "bad ground"), nextU8(&it) catch return fail(lineNo, line, "bad ground"), nextU8(&it) catch return fail(lineNo, line, "bad ground"), 255);
-        } else if (std.mem.eql(u8, key, "accent")) {
+        } else if (std.mem.eql(u8, key, K.accent)) {
             m.accent = rgba(nextU8(&it) catch return fail(lineNo, line, "bad accent"), nextU8(&it) catch return fail(lineNo, line, "bad accent"), nextU8(&it) catch return fail(lineNo, line, "bad accent"), 255);
-        } else if (std.mem.eql(u8, key, "light")) {
+        } else if (std.mem.eql(u8, key, K.light)) {
             for (0..3) |i| m.light[i] = nextF32(&it) catch return fail(lineNo, line, "bad light");
-        } else if (std.mem.eql(u8, key, "spawn")) {
+        } else if (std.mem.eql(u8, key, K.spawn)) {
             m.spawn = v3(nextF32(&it) catch return fail(lineNo, line, "bad spawn"), 0, nextF32(&it) catch return fail(lineNo, line, "bad spawn"));
-        } else if (std.mem.eql(u8, key, "portal")) {
+        } else if (std.mem.eql(u8, key, K.portal)) {
             m.portal = v3(nextF32(&it) catch return fail(lineNo, line, "bad portal"), 0, nextF32(&it) catch return fail(lineNo, line, "bad portal"));
-        } else if (std.mem.eql(u8, key, "bossat")) {
+        } else if (std.mem.eql(u8, key, K.bossat)) {
             m.bossPos = v3(nextF32(&it) catch return fail(lineNo, line, "bad bossat"), 0, nextF32(&it) catch return fail(lineNo, line, "bad bossat"));
-        } else if (std.mem.eql(u8, key, "ledge")) {
+        } else if (std.mem.eql(u8, key, K.ledge)) {
             if (m.ledge_count >= world.MAX_LEDGES) return fail(lineNo, line, "too many ledges");
             m.ledges[m.ledge_count] = .{
                 .minX = nextF32(&it) catch return fail(lineNo, line, "bad ledge"),
@@ -345,7 +359,7 @@ pub fn load(path: []const u8) LoadError!Map {
                 .h = nextF32(&it) catch return fail(lineNo, line, "bad ledge"),
             };
             m.ledge_count += 1;
-        } else if (std.mem.eql(u8, key, "ramp")) {
+        } else if (std.mem.eql(u8, key, K.ramp)) {
             if (m.ramp_count >= world.MAX_RAMPS) return fail(lineNo, line, "too many ramps");
             m.ramps[m.ramp_count] = .{
                 .minX = nextF32(&it) catch return fail(lineNo, line, "bad ramp"),
@@ -356,7 +370,7 @@ pub fn load(path: []const u8) LoadError!Map {
                 .rise = nextEnum(world.RampRise, &it) catch return fail(lineNo, line, "bad ramp rise"),
             };
             m.ramp_count += 1;
-        } else if (std.mem.eql(u8, key, "ob")) {
+        } else if (std.mem.eql(u8, key, K.ob)) {
             if (m.obstacle_count >= world.MAX_OBSTACLES) return fail(lineNo, line, "too many obstacles");
             const kind = nextEnum(world.ObstacleKind, &it) catch return fail(lineNo, line, "bad obstacle kind");
             m.obstacles[m.obstacle_count] = .{
@@ -366,7 +380,7 @@ pub fn load(path: []const u8) LoadError!Map {
                 .Height = nextF32(&it) catch return fail(lineNo, line, "bad ob"),
             };
             m.obstacle_count += 1;
-        } else if (std.mem.eql(u8, key, "decor")) {
+        } else if (std.mem.eql(u8, key, K.decor)) {
             if (m.decor_count >= world.MAX_DECOR) return fail(lineNo, line, "too many decor");
             const kind = nextEnum(world.DecorKind, &it) catch return fail(lineNo, line, "bad decor kind");
             m.decor[m.decor_count] = .{
@@ -375,7 +389,7 @@ pub fn load(path: []const u8) LoadError!Map {
                 .Size = nextF32(&it) catch return fail(lineNo, line, "bad decor"),
             };
             m.decor_count += 1;
-        } else if (std.mem.eql(u8, key, "pack")) {
+        } else if (std.mem.eql(u8, key, K.pack)) {
             if (m.pack_count >= MAX_PACKS) return fail(lineNo, line, "too many packs");
             const kind = nextEnum(monster.MonsterKind, &it) catch return fail(lineNo, line, "bad pack kind");
             const count = it.next() orelse return fail(lineNo, line, "bad pack");
@@ -391,7 +405,7 @@ pub fn load(path: []const u8) LoadError!Map {
         }
         // Leftover tokens mean a typo'd/merge-mangled line — reject loudly, as with
         // unknown keys. `name`/`boss` hold free text and never consume their tokens.
-        if (!std.mem.eql(u8, key, "name") and !std.mem.eql(u8, key, "boss") and it.next() != null) {
+        if (!std.mem.eql(u8, key, K.name) and !std.mem.eql(u8, key, K.boss) and it.next() != null) {
             return fail(lineNo, line, "trailing data");
         }
     }
@@ -419,8 +433,8 @@ fn sanitizeFeatureRect(f: anytype, hw: f32, hd: f32) void {
 // Harden a parsed map against hand-edited nonsense: zero-size arenas, inverted
 // feature rects, empty pack counts (a pack of 0 divides by zero in the tick ring).
 fn sanitize(m: *Map) void {
-    m.halfW = std.math.clamp(m.halfW, 12, 60);
-    m.halfD = std.math.clamp(m.halfD, 12, 60);
+    m.halfW = std.math.clamp(m.halfW, HALF_MIN, HALF_MAX);
+    m.halfD = std.math.clamp(m.halfD, HALF_MIN, HALF_MAX);
     if (m.name.len == 0) m.name.set("Unnamed");
     if (m.boss.len == 0) m.boss.set("Champion");
     // Clamp every stored coordinate to the arena walls. nextF32 rejected inf/NaN, but
@@ -449,7 +463,7 @@ fn sanitize(m: *Map) void {
         d.Size = std.math.clamp(d.Size, 0.02, 3);
     }
     for (m.packs[0..m.pack_count]) |*p| {
-        p.count = std.math.clamp(p.count, 1, 16);
+        p.count = std.math.clamp(p.count, PACK_MEMBERS_MIN, PACK_MEMBERS_MAX);
         p.x = std.math.clamp(p.x, -hw, hw);
         p.z = std.math.clamp(p.z, -hd, hd);
     }

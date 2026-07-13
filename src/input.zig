@@ -50,11 +50,19 @@ pub fn padCastDown() bool {
 pub fn padDodgePressed() bool {
     return padPressed(.right_face_right); // Circle / B
 }
-pub fn padHealthPotPressed() bool {
+fn padHealthPotPressed() bool {
     return padPressed(.left_trigger_1); // L1
 }
-pub fn padManaPotPressed() bool {
+fn padManaPotPressed() bool {
     return padPressed(.right_trigger_1); // R1
+}
+/// Quaff a health / mana potion. Discrete action (not movement), so it lives here:
+/// number keys 1 / 2 on the keyboard, L1 / R1 on the pad.
+pub fn healthPotPressed() bool {
+    return rl.isKeyPressed(.one) or padHealthPotPressed();
+}
+pub fn manaPotPressed() bool {
+    return rl.isKeyPressed(.two) or padManaPotPressed();
 }
 
 // ── Menu / UI navigation (keyboard + gamepad) ──

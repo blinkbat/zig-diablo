@@ -51,7 +51,7 @@ const DUST_COLOR = rgba(200, 172, 132, 255);
 // floor: lower breaks the shadow cam's 150-deg FOV clamp or stops clearing a
 // zombie/brute head (~3.9) so they'd stop casting; only the boss crown (~4.9) pokes above.
 const TORCH_HEIGHT = 4.5;
-const TORCH_RADIUS = 12.0;
+const TORCH_RADIUS = 11.0;
 
 // Hero drawn scaled up about his feet (uniform, so normals stay valid). 1.22 makes
 // the drawn torso fill the collision radius (playermod.radius 0.55).
@@ -73,10 +73,12 @@ const BOW_GRIP_Y = 1.15;
 // radius. Modeled overhead like the torch so its downward shadow map stays oriented.
 const FIRE_HEIGHT = 3.5;
 const FIRE_RADIUS = 7.0;
-// Vision radius gating targeting/health bars/popups — a little past the lit disc so an
-// edge foe can still be engaged. Body DRAWING is gated tighter at TORCH_RADIUS
-// (bodyVisible), so nothing dynamic bleeds into the fog "seen" band.
-const CULL = TORCH_RADIUS + 3;
+// Vision radius gating targeting/health bars/popups — the lit disc itself: you can only
+// select (auto-nearest OR manual hover/stick) a foe you can actually see by torchlight.
+// Held to TORCH_RADIUS, not the breathing radius, so edge selection stays stable rather
+// than flickering with the torch. Body DRAWING gates on the frame's breathing radius
+// (bodyVisible), always <= this, so nothing dynamic bleeds into the fog "seen" band.
+const CULL = TORCH_RADIUS;
 
 pub const DAMAGE_FLASH_DUR = 0.4;
 pub const TOAST_DUR = 2.5;
@@ -310,6 +312,16 @@ fn heroBowHand(base: rl.Vector3, f: rl.Vector3, right: rl.Vector3, bob: f32) rl.
     );
 }
 
+// Torch-hand anchor (hero-local frame, see TORCH_GRIP_*). ONE XZ formula for the
+// sleeve, the drawn stick, and the flame so they can't detach; caller passes the Y.
+fn heroTorchHand(base: rl.Vector3, f: rl.Vector3, right: rl.Vector3, y: f32) rl.Vector3 {
+    return v3(
+        base.x - right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD,
+        y,
+        base.z - right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD,
+    );
+}
+
 // ---- Game state ----
 
 pub const Game = struct {
@@ -468,13 +480,16 @@ pub const Game = struct {
     // champion. Difficulty tier = campaign position.
     fn spawnPacks(g: *Game) void {
         const tier: i32 = @intCast(g.areaIndex);
+        // Boss FIRST so the champion always claims a slot: an editor/hand-authored map
+        // whose packs exceed MAX_MONSTERS (24 packs x up to 16 = 384) must drop
+        // rank-and-file, never the boss — else the area "clears" with no champion.
+        g.spawn(monster.makeBoss(tier, g.map.boss.slice(), &g.rng, g.randomOpenTileNear(g.map.bossPos, 3)));
         for (g.map.packList()) |pk| {
             var i: i32 = 0;
             while (i < pk.count) : (i += 1) {
                 g.spawn(monster.makeMonster(pk.kind, tier, &g.rng, g.randomOpenTileNear(v3(pk.x, 0, pk.z), 5)));
             }
         }
-        g.spawn(monster.makeBoss(tier, g.map.boss.slice(), &g.rng, g.randomOpenTileNear(g.map.bossPos, 3)));
     }
 
     fn spawn(g: *Game, m_in: Monster) void {
@@ -619,9 +634,9 @@ fn handleInput(g: *Game) void {
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0) g.rig.addZoom(wheel);
 
-    // Potions.
-    if (rl.isKeyPressed(.one)) useHealthPotion(g);
-    if (rl.isKeyPressed(.two)) useManaPotion(g);
+    // Potions (keyboard + pad routed through input.zig — one binding, called once).
+    if (input.healthPotPressed()) useHealthPotion(g);
+    if (input.manaPotPressed()) useManaPotion(g);
 
     // Keyboard movement (WASD / arrows) takes precedence over click-to-move.
     var kb = mathx.zero3;
@@ -806,9 +821,6 @@ fn handleGamepad(g: *Game) void {
         doDodge(g, dir);
     }
 
-    // L1 / R1: potions.
-    if (input.padHealthPotPressed()) useHealthPotion(g);
-    if (input.padManaPotPressed()) useManaPotion(g);
 }
 
 // updateAim refreshes the ground point under the cursor and the hovered monster.
@@ -978,7 +990,7 @@ fn damageMonster(g: *Game, m: *Monster, dmg: stats.Damage, crit: bool) void {
     }
     // Hit sparks: pale chips off the body; crits flare bigger and golder. (No floating
     // damage numbers by owner decree — the sparks ARE the feedback.)
-    const hitAt = v3(m.Pos.x, m.Pos.y + MONSTER_TORSO_BASE + m.Height * 0.5, m.Pos.z);
+    const hitAt = v3(m.Pos.x, monsterChestY(m, 0.5), m.Pos.z);
     if (crit) {
         g.parts.burst(&g.rng, hitAt, 12, 5.5, 0.11, 0.5, rgba(255, 215, 90, 255), 9);
     } else {
@@ -997,7 +1009,7 @@ fn killMonster(g: *Game, m: *Monster) void {
     g.kills += 1;
     g.rumble.play(rumble.kill);
     // Death burst: the body's own color scattering out, with dark gore underneath.
-    const at = v3(m.Pos.x, m.Pos.y + MONSTER_TORSO_BASE + m.Height * 0.45, m.Pos.z);
+    const at = v3(m.Pos.x, monsterChestY(m, 0.45), m.Pos.z);
     const n: usize = if (m.boss) 34 else 16;
     g.parts.burst(&g.rng, at, n, 6.0, 0.13, 0.7, lerpColor(m.Color, rl.Color.white, 0.25), 10);
     g.parts.burst(&g.rng, at, n / 2, 3.5, 0.16, 0.9, lerpColor(m.Color, rl.Color.black, 0.45), 12);
@@ -1018,7 +1030,7 @@ fn killMonster(g: *Game, m: *Monster) void {
     const firstNew = g.lootList.items.len;
     loot.rollLoot(m, &g.rng, &g.lootList);
     for (g.lootList.items[firstNew..]) |*d| d.Pos = g.w.snapY(d.Pos);
-    if (m.boss) g.setToast("{s} has been slain!", .{m.name()});
+    if (m.boss) g.setToast("{s} has been slain!", .{m.name.slice()});
     // Drop the slain foe from selection AND the chase; both re-resolve next frame
     // (selection to the new nearest, the chase stays off until you re-engage).
     if (g.p.targetMonster == m.id) g.p.targetMonster = -1;
@@ -1226,7 +1238,7 @@ fn resolveMonsterAttack(g: *Game, m: *Monster) void {
         // flying shaft are one motion. It angles to the player's true elevation — a
         // rampart is cover from the cliff side, not from a clean line.
         const bowHead = skelBow(m).head;
-        const from = v3(bowHead.x, m.Pos.y, bowHead.z);
+        const from = v3(bowHead.x, m.Pos.y + bowHead.y, bowHead.z);
         g.projs.add(projectile.newArrow(from, dirXZ(from, g.p.Pos), dmg, aimYVel(from.y + projectile.arrowMuzzleDY, g.p.Pos.y + 1.0, distXZ(from, g.p.Pos), projectile.arrowSpeed)));
         // String-snap: a flick of pale sparks off the arrowhead at release.
         g.parts.burst(&g.rng, v3(bowHead.x, m.Pos.y + bowHead.y, bowHead.z), 5, 2.6, 0.05, 0.3, rgba(255, 240, 210, 230), 4);
@@ -1272,6 +1284,10 @@ fn separateMonsters(g: *Game) void {
 fn onPlayerDeath(g: *Game) void {
     if (g.p.alive()) return;
     g.rumble.play(rumble.death);
+    // Presentation timers only decay in .playing; the lethal hit's flash/shake would
+    // otherwise judder the death screen forever. Clear them as we leave gameplay.
+    g.damageFlash = 0;
+    g.shake = 0;
     g.scene = .dead;
     g.canResume = false; // the run is over — the menu offers a fresh start
 }
@@ -1470,7 +1486,8 @@ fn updateGasClouds(g: *Game, dt: f32) void {
 // is FELT (flash + rumble + a cough of green).
 fn gasHurtPlayer(g: *Game, dmg: f32) void {
     // Miasma is poison — classed as chaos, so chaos resist (not armor) blunts it.
-    _ = g.p.takeDamage(stats.Damage.one(.chaos, dmg));
+    // Zero landed (fully resisted) → no cough/flash/rumble, mirroring hitPlayer.
+    if (g.p.takeDamage(stats.Damage.one(.chaos, dmg)) <= 0) return;
     g.damageFlash = maxF(g.damageFlash, DAMAGE_FLASH_DUR * 0.5);
     g.rumble.play(rumble.gas_tick);
     g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 1.3, g.p.Pos.z), 4, 1.8, 0.08, 0.5, rgba(140, 180, 80, 200), -1);
@@ -1517,7 +1534,7 @@ fn updateAmbientFX(g: *Game, dt: f32) void {
             if (!m.boss or !m.alive()) continue;
             if (distXZ(m.Pos, g.p.Pos) > TORCH_RADIUS or g.rng.float() > 0.55) continue;
             g.parts.spawn(.{
-                .Pos = v3(m.Pos.x + (g.rng.float() - 0.5) * m.Radius * 1.7, m.Pos.y + MONSTER_TORSO_BASE + m.Height * (0.5 + g.rng.float() * 0.35), m.Pos.z + (g.rng.float() - 0.5) * m.Radius * 1.7),
+                .Pos = v3(m.Pos.x + (g.rng.float() - 0.5) * m.Radius * 1.7, monsterChestY(m, 0.5 + g.rng.float() * 0.35), m.Pos.z + (g.rng.float() - 0.5) * m.Radius * 1.7),
                 .Vel = v3((g.rng.float() - 0.5) * 0.4, 0.9 + g.rng.float() * 0.8, (g.rng.float() - 0.5) * 0.4),
                 .Life = 0.7 + g.rng.float() * 0.4,
                 .maxLife = 1.1,
@@ -1573,6 +1590,10 @@ fn updatePortal(g: *Game) void {
             endPlaytest(g);
             g.ed.status("portal reached - playtest complete", .{});
         } else if (g.w.IsLast) {
+            // Same as death: stop gameplay timers decaying, so a last-frame hit's
+            // flash/shake can't judder the victory screen.
+            g.damageFlash = 0;
+            g.shake = 0;
             g.scene = .victory;
             g.canResume = false; // the run is won — nothing to resume
         } else {
@@ -1589,6 +1610,7 @@ fn resetArena(g: *Game) void {
     g.projs.count = 0;
     g.lootList.clearRetainingCapacity();
     g.gasCount = 0; // miasma stays with its corpse — it never rides the portal
+    g.gasHurtCD = 0; // don't carry a mid-countdown tick into the new area
     g.parts.clear(); // stray sparks must not carry across the portal
     g.damageFlash = 0; // timers only decay in .playing, so a killing blow's
     g.shake = 0; // flash/shake would otherwise replay over the fresh area
@@ -1692,7 +1714,7 @@ fn drawHeroBody(p: *const Player) void {
     const sleeve = lerpColor(hood, rl.Color.black, 0.1);
     const bhandB = heroBowHand(base, f, right, bob);
     rl.drawCapsule(v3(base.x + right.x * 0.28 + f.x * 0.05, 1.3 + bob, base.z + right.z * 0.28 + f.z * 0.05), bhandB, 0.1, 6, 4, sleeve);
-    const thandB = v3(base.x - right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD, 1.28, base.z - right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD);
+    const thandB = heroTorchHand(base, f, right, 1.28);
     rl.drawCapsule(v3(base.x - right.x * 0.28 + f.x * 0.02, 1.3 + bob, base.z - right.z * 0.28 + f.z * 0.02), thandB, 0.1, 6, 4, sleeve);
 
     sphere(v3(base.x, 1.72 + bob, base.z), 0.34, hood);
@@ -1712,7 +1734,7 @@ fn drawHeroBody(p: *const Player) void {
     rl.drawCylinderEx(bhand, v3(bhand.x - f.x * 0.18, bhand.y + 0.62, bhand.z - f.z * 0.18), 0.07, 0.03, 5, bowCol);
     rl.drawCylinderEx(bhand, v3(bhand.x - f.x * 0.18, bhand.y - 0.62, bhand.z - f.z * 0.18), 0.07, 0.03, 5, bowCol);
 
-    const thand = v3(base.x - right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD, 0.95, base.z - right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD);
+    const thand = heroTorchHand(base, f, right, 0.95);
     rl.drawCylinderEx(thand, v3(thand.x, thand.y + 0.55, thand.z), 0.05, 0.04, 5, rgba(70, 48, 30, 255));
 }
 
@@ -1727,7 +1749,7 @@ fn drawHeroFX(p: *const Player, t: f32) void {
 
     if (p.rolling()) {
         const tt = p.rollTimer / playermod.rollDur;
-        rl.drawCircle3D(v3(base.x, 0.05, base.z), playermod.radius + 0.4 * (1 - tt), v3(1, 0, 0), 90, rgba(200, 210, 230, mathx.u8f(120 * tt)));
+        groundRing(v3(base.x, 0.05, base.z), playermod.radius + 0.4 * (1 - tt), rgba(200, 210, 230, mathx.u8f(120 * tt)));
         return;
     }
 
@@ -1753,7 +1775,7 @@ fn drawHeroFX(p: *const Player, t: f32) void {
     // The torch burns like the firebolt: wide corona, orange body, a swaying flame
     // TONGUE, a white-hot heart, plus the ember drift above.
     const flick = 1 + 0.18 * sinf(t * 22) + 0.1 * sinf(t * 37);
-    const thand = v3(base.x - right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD, 0.95, base.z - right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD);
+    const thand = heroTorchHand(base, f, right, 0.95);
     const flame = v3(thand.x, TORCH_FLAME_Y, thand.z);
     sphere(flame, 0.5 * flick, rgba(230, 80, 20, 40)); // wide soft halo
     sphere(flame, 0.32 * flick, rgba(235, 95, 25, 120));
@@ -1771,7 +1793,7 @@ fn drawHeroFX(p: *const Player, t: f32) void {
         sphere(ep, 0.045 * (1 - ph), rgba(255, 160, 60, mathx.u8f((1 - ph) * 170)));
     }
 
-    rl.drawCircle3D(v3(base.x, 0.045, base.z), playermod.radius + 0.15, v3(1, 0, 0), 90, rgba(150, 190, 255, 90));
+    groundRing(v3(base.x, 0.045, base.z), playermod.radius + 0.15, rgba(150, 190, 255, 90));
 }
 
 pub fn drawWalls(w: *const world.World) void {
@@ -1822,6 +1844,12 @@ const MONSTER_HEAD_GAP = 0.25;
 
 fn monsterBob(m: *const Monster) f32 {
     return MONSTER_BOB_AMP * sinf(m.bob);
+}
+
+// World Y of a point up the drawn torso (frac 0=feet base, ~1=shoulders). FX anchor —
+// distinct from the firebolt HITBOX center, which deliberately omits MONSTER_TORSO_BASE.
+fn monsterChestY(m: *const Monster, frac: f32) f32 {
+    return m.Pos.y + MONSTER_TORSO_BASE + m.Height * frac;
 }
 
 // The pib's knife arm through every pose, in one place: body draw, FX glint, and swing
@@ -2220,6 +2248,21 @@ fn bodyVisible(pos: rl.Vector3, lightXZ: rl.Vector3, torchR: f32, fp: tl.FirePar
     return fp.intensity > 0 and dist2XZ(pos, fp.pos) <= fp.radius * fp.radius;
 }
 
+// A flat ring on the floor (XY circle rotated onto XZ). One spelling of the axis/angle
+// so a stray literal can't tilt a single reticle/telegraph off the ground. (pub: the
+// editor draws its author-time rings through the same helper, not raw drawCircle3D.)
+pub fn groundRing(center: rl.Vector3, r: f32, col: rl.Color) void {
+    rl.drawCircle3D(center, r, v3(1, 0, 0), 90, col);
+}
+
+// Everything that casts a shadow, submitted in one place so a new caster can't be
+// added to one depth pass and forgotten in the other.
+fn submitCasters(g: *Game, ms: []const Monster, lightGround: rl.Vector3, torchR: f32, fp: tl.FireParams, drawHero: bool) void {
+    g.sceneMesh.drawDepth();
+    drawMonstersCast(ms, lightGround, torchR, fp);
+    if (drawHero) drawHeroBody(&g.p);
+}
+
 // Depth pass: visible living bodies cast. Bodies neither near the torch nor fireball-lit
 // render black, so shadowing them is pointless.
 fn drawMonstersCast(ms: []const Monster, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams) void {
@@ -2252,12 +2295,12 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
             // "locked on", distinct from the boss's red ring and any telegraph.
             const pulse = 0.1 * sinf(t * 5);
             const tc = TARGET_TINT;
-            rl.drawCircle3D(v3(m.Pos.x, 0.05, m.Pos.z), m.Radius + 0.34 + pulse, v3(1, 0, 0), 90, mathx.withAlpha(tc, 235));
-            rl.drawCircle3D(v3(m.Pos.x, 0.05, m.Pos.z), m.Radius + 0.5 + pulse, v3(1, 0, 0), 90, mathx.withAlpha(tc, 120));
+            groundRing(v3(m.Pos.x, 0.05, m.Pos.z), m.Radius + 0.34 + pulse, mathx.withAlpha(tc, 235));
+            groundRing(v3(m.Pos.x, 0.05, m.Pos.z), m.Radius + 0.5 + pulse, mathx.withAlpha(tc, 120));
         }
         if (m.boss) {
-            rl.drawCircle3D(v3(m.Pos.x, 0.06, m.Pos.z), m.Radius + 0.4, v3(1, 0, 0), 90, rgba(255, 60, 60, 200));
-            rl.drawCircle3D(v3(m.Pos.x, 0.06, m.Pos.z), m.Radius + 0.55 + 0.1 * sinf(t * 3), v3(1, 0, 0), 90, rgba(255, 60, 60, 90));
+            groundRing(v3(m.Pos.x, 0.06, m.Pos.z), m.Radius + 0.4, rgba(255, 60, 60, 200));
+            groundRing(v3(m.Pos.x, 0.06, m.Pos.z), m.Radius + 0.55 + 0.1 * sinf(t * 3), rgba(255, 60, 60, 90));
         }
         // Ground telegraph — only for kinds that still use one. Pib/zombie/skeleton carry
         // their warning entirely in the body anim: no marking for them, by design.
@@ -2272,8 +2315,8 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
                 // Kill zone fills as the blow comes down: a red disc swelling to true reach, ringed at the edge.
                 const rr = meleeReach(m.atkRange, playermod.radius);
                 rl.drawCylinderEx(v3(m.Pos.x, 0.015, m.Pos.z), v3(m.Pos.x, 0.045, m.Pos.z), rr * tp, rr * tp, 24, rgba(255, 50, 30, mathx.u8f(26 + 44 * tp)));
-                rl.drawCircle3D(v3(m.Pos.x, 0.09, m.Pos.z), rr, v3(1, 0, 0), 90, rgba(255, 60, 40, a));
-                rl.drawCircle3D(v3(m.Pos.x, 0.09, m.Pos.z), rr * tp, v3(1, 0, 0), 90, rgba(255, 100, 50, a));
+                groundRing(v3(m.Pos.x, 0.09, m.Pos.z), rr, rgba(255, 60, 40, a));
+                groundRing(v3(m.Pos.x, 0.09, m.Pos.z), rr * tp, rgba(255, 100, 50, a));
             }
         }
         // The pib knife catches the light: a white star at the point, flaring as the cock
@@ -2425,7 +2468,7 @@ fn drawLoot(lootList: *std.ArrayList(LootDrop), lightXZ: rl.Vector3, torchR: f32
         rl.drawCylinderEx(v3(d.Pos.x, 0.05, d.Pos.z), v3(d.Pos.x, 1.3, d.Pos.z), 0.14, 0.02, 6, mathx.withAlpha(beamCol, mathx.u8f(34 * pulse)));
         // The beam foreshortens to a dot from the iso camera, so the floor talks: a glow pool plus a crisp ring.
         rl.drawCylinderEx(v3(d.Pos.x, 0.012, d.Pos.z), v3(d.Pos.x, 0.03, d.Pos.z), 0.45, 0.45, 20, mathx.withAlpha(beamCol, mathx.u8f(28 * pulse)));
-        rl.drawCircle3D(v3(d.Pos.x, 0.04, d.Pos.z), 0.4 + 0.05 * sinf(d.bob), v3(1, 0, 0), 90, mathx.withAlpha(beamCol, mathx.u8f(140 * pulse)));
+        groundRing(v3(d.Pos.x, 0.04, d.Pos.z), 0.4 + 0.05 * sinf(d.bob), mathx.withAlpha(beamCol, mathx.u8f(140 * pulse)));
         switch (d.Kind) {
             .gold => {
                 // A nugget pile on the floor rather than one hovering ball.
@@ -2451,8 +2494,8 @@ pub fn drawPortal(w: *const world.World, t: f32) void {
         // banked and waiting.
         rl.drawCylinderEx(v3(pp.x, 0.02, pp.z), v3(pp.x, 0.06, pp.z), 2.0, 2.0, 24, rgba(42, 42, 58, 220));
         const pulse = mathx.u8f(70 + 45 * sinf(t * 1.4));
-        rl.drawCircle3D(v3(pp.x, 0.09, pp.z), 1.55, v3(1, 0, 0), 90, rgba(110, 100, 170, pulse));
-        rl.drawCircle3D(v3(pp.x, 0.09, pp.z), 1.15, v3(1, 0, 0), 90, rgba(110, 100, 170, pulse / 2));
+        groundRing(v3(pp.x, 0.09, pp.z), 1.55, rgba(110, 100, 170, pulse));
+        groundRing(v3(pp.x, 0.09, pp.z), 1.15, rgba(110, 100, 170, pulse / 2));
         sphere(v3(pp.x, 0.18, pp.z), 0.11 + 0.02 * sinf(t * 1.4), rgba(120, 105, 210, pulse));
         sphere(v3(pp.x, 0.18, pp.z), 0.26, rgba(120, 105, 210, pulse / 4));
         return;
@@ -2477,8 +2520,8 @@ pub fn drawPortal(w: *const world.World, t: f32) void {
         }
     }
     // Breathing rim rings anchor the throat to the dais.
-    rl.drawCircle3D(v3(pp.x, 0.1, pp.z), 1.6 + 0.08 * sinf(t * 2.1), v3(1, 0, 0), 90, rgba(200, 170, 255, 190));
-    rl.drawCircle3D(v3(pp.x, 0.1, pp.z), 1.25 + 0.06 * sinf(t * 2.1 + 1.5), v3(1, 0, 0), 90, rgba(160, 130, 255, 130));
+    groundRing(v3(pp.x, 0.1, pp.z), 1.6 + 0.08 * sinf(t * 2.1), rgba(200, 170, 255, 190));
+    groundRing(v3(pp.x, 0.1, pp.z), 1.25 + 0.06 * sinf(t * 2.1 + 1.5), rgba(160, 130, 255, 130));
     // A sky-beam over the gate — the arena's one landmark, a violet column readable across the dark.
     rl.drawCylinderEx(v3(pp.x, 0.1, pp.z), v3(pp.x, 8.0, pp.z), 1.05, 0.28, 12, rgba(150, 110, 255, 26));
     rl.drawCylinderEx(v3(pp.x, 0.1, pp.z), v3(pp.x, 5.4, pp.z), 0.5, 0.12, 10, rgba(200, 170, 255, 44));
@@ -2497,7 +2540,8 @@ pub fn drawPortal(w: *const world.World, t: f32) void {
 // time+index (no state), each wandering a slow lissajous around a fixed seat, so the
 // unexplored black reads as living night.
 fn drawFireflies(g: *const Game, t: f32) void {
-    // Per-area swarm color: moor green, plains wisps, dark-wood green, catacomb violet.
+    // Per-area swarm color (one per campaign map, areaIndex-keyed): moor green, plains
+    // wisps, stony amber, dark-wood green, catacomb violet.
     const cols = [_]rl.Color{
         rgba(180, 220, 100, 255),
         rgba(170, 205, 255, 255),
@@ -2732,17 +2776,13 @@ fn drawWorld(g: *Game) void {
 
     // --- torch depth pass (obstacle mesh + nearby monsters + player cast) ---
     g.torch.beginShadowPass(lp);
-    g.sceneMesh.drawDepth();
-    drawMonstersCast(ms, lightGround, lp.radius, fp);
-    if (drawHero) drawHeroBody(&g.p);
+    submitCasters(g, ms, lightGround, lp.radius, fp, drawHero);
     g.torch.endShadowPass();
 
     // --- fireball depth pass (only when a bolt is live) ---
     if (fp.intensity > 0) {
         g.torch.beginFireShadowPass(fp);
-        g.sceneMesh.drawDepth();
-        drawMonstersCast(ms, lightGround, lp.radius, fp);
-        if (drawHero) drawHeroBody(&g.p);
+        submitCasters(g, ms, lightGround, lp.radius, fp, drawHero);
         g.torch.endFireShadowPass();
     }
 
@@ -2797,6 +2837,9 @@ pub fn run(shot: bool) void {
         mathx.ground(0, 0),
         mathx.ground(g.w.PortalPos.x, g.w.PortalPos.z + 5),
     };
+    // Which sweep vantage gets the family-portrait staging (arena center). The portal
+    // shot is always the last vantage (sweep.len - 1). Named so a reorder is one edit.
+    const FAMILY_SHOT = 1;
     if (shot) {
         g.scene = .playing;
         teleportHero(&g, sweep[0]);
@@ -2921,7 +2964,7 @@ pub fn run(shot: bool) void {
                 }
                 teleportHero(&g, sweep[shotIdx]);
                 g.banner.time = 0; // the area banner would sit right over the subjects
-                if (shotIdx == 1) {
+                if (shotIdx == FAMILY_SHOT) {
                     // Family portrait: one of each kind around the hero, three-quarter and zoomed — verifies every silhouette.
                     const px = g.p.Pos.x;
                     const pz = g.p.Pos.z;
