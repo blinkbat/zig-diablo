@@ -168,17 +168,46 @@ pub const MENU_OPTIONS_IDX: i32 = @intFromEnum(RootItem.options);
 pub const OptionsItem = enum(i32) { display, debug, back };
 pub const MENU_OPTIONS_COUNT: i32 = @typeInfo(OptionsItem).@"enum".fields.len;
 
-// Stat sheet rows: the six attributes (stats.zig display order) then the three skills.
-// Nav-wrap and hudx layout derive their count from these.
+// Stat sheet rows: the six attributes (stats.zig display order) then the RANKABLE skills.
+// Nav-wrap and hudx layout derive their count from these. Consumables (potions) are
+// Skills but carry no rank, so they're excluded — the assert pins exactly that.
 pub const sheetSkills = [_]playermod.Skill{ .melee, .firebolt, .dodge };
 comptime {
-    std.debug.assert(sheetSkills.len == playermod.Skill.count); // every skill has a row
+    var rankable = 0;
+    for (playermod.Skill.all) |s| {
+        if (!s.consumable()) rankable += 1;
+    }
+    std.debug.assert(sheetSkills.len == rankable); // every rankable skill has a row...
+    for (sheetSkills) |s| std.debug.assert(!s.consumable()); // ...and no consumable does
 }
 pub const SHEET_ATTR_COUNT: i32 = @intCast(stats.Attribs.order.len);
 pub const SHEET_ROW_COUNT: i32 = SHEET_ATTR_COUNT + @as(i32, @intCast(sheetSkills.len));
 
-// Drive the open stat sheet: arrows move, confirm/nav-right spends a point, cancel closes.
-fn updateSheet(g: *Game, altHeld: bool) void {
+// Character screen pages. Stats = attributes/skills/derived (as before); Skills = the
+// reassignable bar. Both keyboard and gamepad drive every page (see updateCharScreen).
+pub const CharTab = enum { stats, skills };
+
+// Where the persisted loadout lives (CWD, like lightlog.txt). A small `version:`-headed
+// config; see playermod.SkillBar.save/load.
+pub const SKILLBAR_PATH = "skillbar.cfg";
+
+// Drive the open character screen. Controller-first: L1/R1 flip the page, the d-pad
+// navigates, A confirms/cycles, B closes; keyboard mirrors each. Cancel persists the
+// loadout on the way out.
+fn updateCharScreen(g: *Game, altHeld: bool) void {
+    if (input.charTabTogglePressed()) g.charTab = if (g.charTab == .stats) .skills else .stats;
+    if (input.cancel()) {
+        g.closeCharScreen();
+        return;
+    }
+    switch (g.charTab) {
+        .stats => updateStatsTab(g, altHeld),
+        .skills => updateSkillsTab(g, altHeld),
+    }
+}
+
+// Stats page: up/down move the row, A / right spends a point on it.
+fn updateStatsTab(g: *Game, altHeld: bool) void {
     if (input.navDown()) g.sheetSel = @mod(g.sheetSel + 1, SHEET_ROW_COUNT);
     if (input.navUp()) g.sheetSel = @mod(g.sheetSel - 1 + SHEET_ROW_COUNT, SHEET_ROW_COUNT);
     if (input.confirm(altHeld) or input.navRight()) {
@@ -188,7 +217,16 @@ fn updateSheet(g: *Game, altHeld: bool) void {
             _ = g.p.allocSkill(sheetSkills[@intCast(g.sheetSel - SHEET_ATTR_COUNT)]);
         }
     }
-    if (input.cancel()) g.sheetOpen = false;
+}
+
+// Skills page: the d-pad's left/right move the focused button; up/down (or A) cycle the
+// skill on it. The mouse mirrors this in hudx, but the pad is the primary path.
+fn updateSkillsTab(g: *Game, altHeld: bool) void {
+    const n: i32 = playermod.SKILL_SLOTS;
+    if (input.navLeft()) g.skillSel = @mod(g.skillSel - 1 + n, n);
+    if (input.navRight()) g.skillSel = @mod(g.skillSel + 1, n);
+    if (input.navDown() or input.confirm(altHeld)) g.p.bar.cycle(@intCast(g.skillSel), 1);
+    if (input.navUp()) g.p.bar.cycle(@intCast(g.skillSel), -1);
 }
 
 // Switch display mode, unwinding the active mode first (raylib toggles are on/off latches).
@@ -349,6 +387,13 @@ pub const Game = struct {
     // Character stat sheet (C / Select in play): freezes the world, allocates points on sheetSel.
     sheetOpen: bool = false,
     sheetSel: i32 = 0,
+    // Character-screen page + skill-tab focus. The screen is `sheetOpen`; charTab picks
+    // the page; skillSel is the focused bar slot on the Skills tab.
+    charTab: CharTab = .stats,
+    skillSel: i32 = 0,
+    // Persisted loadout: loaded once at init, applied to each fresh hero, saved on every
+    // change. Survives runs and app restarts.
+    loadout: playermod.SkillBar = playermod.SkillBar.default(),
     // True while a live run is paused behind the menu, so the top row resumes instead of
     // starting fresh. Cleared on death/victory.
     canResume: bool = false,
@@ -415,6 +460,8 @@ pub const Game = struct {
         g.sceneMesh = scenemesh.SceneMesh.init(&g.w, g.torch.scene, g.torch.depthShader);
         g.fog.reset(g.w.HalfW, g.w.HalfD);
         g.p = playermod.newPlayer(g.map.spawn);
+        g.loadout = playermod.SkillBar.load(SKILLBAR_PATH); // persisted bindings (or defaults)
+        g.p.bar = g.loadout;
         g.areaIndex = 0;
         g.torch.setLightColor(g.map.light);
         g.spawnPacks();
@@ -438,6 +485,10 @@ pub const Game = struct {
     }
 
     pub fn deinit(g: *Game) void {
+        // Catch edits made with the character screen still open at quit (the normal save
+        // point is closeCharScreen). Only writes when actually changed, so a player who
+        // never touched the loadout leaves no config file behind.
+        if (!std.meta.eql(g.p.bar, g.loadout)) playermod.SkillBar.save(&g.p.bar, SKILLBAR_PATH) catch {};
         g.sceneMesh.deinit();
         g.fog.deinit();
         g.torch.deinit();
@@ -453,9 +504,10 @@ pub const Game = struct {
     pub fn startRun(g: *Game) void {
         g.playtest = false;
         g.paused = false; // a pause from the previous run must not freeze this one
-        g.sheetOpen = false; // never resume into a leftover open sheet
+        g.resetCharScreen(); // never resume into a leftover open character screen
         g.canResume = true; // a live run now exists to return to
         g.p = playermod.newPlayer(mathx.zero3);
+        g.p.bar = g.loadout; // carry the persisted loadout into the new hero
         g.kills = 0;
         g.elapsed = 0;
         g.enterArea(0);
@@ -556,6 +608,25 @@ pub const Game = struct {
         g.banner.set(dur, fmt, args);
     }
 
+    /// Clear character-screen state without touching disk (used by run resets, which
+    /// build a fresh hero anyway).
+    pub fn resetCharScreen(g: *Game) void {
+        g.sheetOpen = false;
+        g.charTab = .stats;
+        g.skillSel = 0;
+    }
+
+    /// Close the character screen, persisting the loadout if the bindings changed. The
+    /// single save point: bindings only change while the screen is open, so saving on
+    /// close covers every edit without writing on every keystroke.
+    pub fn closeCharScreen(g: *Game) void {
+        if (!std.meta.eql(g.p.bar, g.loadout)) {
+            g.loadout = g.p.bar;
+            playermod.SkillBar.save(&g.p.bar, SKILLBAR_PATH) catch {};
+        }
+        g.resetCharScreen();
+    }
+
 };
 
 // ---- Simulation ----
@@ -635,10 +706,6 @@ fn handleInput(g: *Game) void {
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0) g.rig.addZoom(wheel);
 
-    // Potions (keyboard + pad routed through input.zig — one binding, called once).
-    if (input.healthPotPressed()) useHealthPotion(g);
-    if (input.manaPotPressed()) useManaPotion(g);
-
     // Keyboard movement (WASD / arrows) takes precedence over click-to-move.
     var kb = mathx.zero3;
     if (rl.isKeyDown(.w) or rl.isKeyDown(.up)) kb.z -= 1;
@@ -664,8 +731,58 @@ fn handleInput(g: *Game) void {
     const mouse = rl.getMousePosition();
     const overHUD = mouse.y > @as(f32, @floatFromInt(rl.getScreenHeight() - hudReserve));
 
-    // Left mouse: chase+attack the hovered foe, else walk to the point.
-    if (rl.isMouseButtonDown(.left) and !overHUD and lenXZ(g.kbMove) == 0 and !p.rolling()) {
+    // Skill bar. Mouse fires slots 0/1 (LMB carries the click-to-move fallback); keys
+    // Q/E/R fire slots 2-4. Combat skills fire while HELD (auto-repeat under cooldown);
+    // consumables (potions) fire on the down-EDGE so a held button doesn't chug the belt.
+    if (!p.rolling()) {
+        if (!overHUD) {
+            if (mouseSlotFires(g, 0, .left)) fireSlot(g, 0, true);
+            if (mouseSlotFires(g, 1, .right)) fireSlot(g, 1, false);
+        }
+        var slot: usize = 2;
+        while (slot < playermod.SKILL_SLOTS) : (slot += 1) {
+            if (keySlotFires(g, slot)) fireSlot(g, slot, false);
+        }
+    }
+}
+
+// A slot bound to a consumable fires on the button's down-EDGE (one drink per tap); any
+// other skill fires while HELD (auto-repeat gated by its own cooldown). One rule, applied
+// to every input source so a potion can't chug no matter which button it's on.
+fn slotConsumable(g: *const Game, slot: usize) bool {
+    return if (g.p.bar.slots[slot]) |s| s.consumable() else false;
+}
+fn mouseSlotFires(g: *const Game, slot: usize, btn: rl.MouseButton) bool {
+    return if (slotConsumable(g, slot)) rl.isMouseButtonPressed(btn) else rl.isMouseButtonDown(btn);
+}
+fn keySlotFires(g: *const Game, slot: usize) bool {
+    return if (slotConsumable(g, slot)) input.slotKeyPressed(slot) else input.slotKeyDown(slot);
+}
+
+// Fire the skill bound to `slot`. An empty slot is a no-op — except LMB, which keeps
+// click-to-move so clearing slot 0 never strands the hero. `isLMB` marks the left mouse
+// button, the only slot that carries move-to-ground context.
+fn fireSlot(g: *Game, slot: usize, isLMB: bool) void {
+    const skill = g.p.bar.slots[slot] orelse {
+        if (isLMB) lmbMove(g);
+        return;
+    };
+    switch (skill) {
+        .melee => meleeAction(g, isLMB),
+        .firebolt => castFirebolt(g),
+        .dodge => fireDodge(g),
+        .health_potion => useHealthPotion(g),
+        .mana_potion => useManaPotion(g),
+    }
+}
+
+// Melee slot: engage the selected foe for auto-attack. On LMB it doubles as
+// click-to-move (walk to the ground point when not on a foe), matching Diablo's
+// left-click; on a key or pad button it only commits the chase against the selection.
+fn meleeAction(g: *Game, isLMB: bool) void {
+    const p = &g.p;
+    if (isLMB) {
+        if (lenXZ(g.kbMove) != 0) return; // WASD owns movement this frame
         const hm = g.monsterByID(g.hoverMonster);
         if (hm != null and hm.?.alive()) {
             p.targetMonster = hm.?.id; // click a foe: select AND engage (chase into melee)
@@ -676,12 +793,28 @@ fn handleInput(g: *Game) void {
             p.moveTarget = g.mouseGround;
             p.hasMoveTarget = true;
         }
+    } else if (p.targetMonster >= 0) {
+        p.chaseMonster = p.targetMonster; // button melee: chase whoever's selected
+        p.hasMoveTarget = false;
     }
+}
 
-    // Right mouse: cast Firebolt toward the cursor.
-    if (rl.isMouseButtonDown(.right) and !overHUD and !p.rolling()) {
-        castFirebolt(g);
-    }
+// Left-click on an empty slot 0: pure click-to-move, so unbinding the primary slot
+// can't cost you movement.
+fn lmbMove(g: *Game) void {
+    const p = &g.p;
+    if (lenXZ(g.kbMove) != 0) return;
+    p.chaseMonster = -1;
+    p.moveTarget = g.mouseGround;
+    p.hasMoveTarget = true;
+}
+
+// Dodge slot: roll toward movement intent, else toward the aim/cursor point. (Space and
+// pad B stay permanent dodge shortcuts regardless of what the bar holds.)
+fn fireDodge(g: *Game) void {
+    var dir = g.kbMove;
+    if (lenXZ(dir) < 1e-3) dir = dirXZ(g.p.Pos, g.mouseGround);
+    doDodge(g, dir);
 }
 
 fn castFirebolt(g: *Game) void {
@@ -744,9 +877,9 @@ fn useManaPotion(g: *Game) void {
 }
 
 // ---- Gamepad ----
-// Left stick moves; right stick aims/targets; X attacks, Y casts Firebolt, B dodges,
-// L1/R1 potions, Start opens the menu (in run()). Scheme lives in input.zig; these
-// aliases keep call sites terse.
+// Left stick moves; right stick aims/targets; the skill slots fire on X/Y + the d-pad
+// (slotPad in input.zig); B dodges, L1/R1 potions, Start opens the menu (in run()).
+// Scheme lives in input.zig; these aliases keep call sites terse.
 const PAD = input.PAD;
 const AIM_REACH = input.AIM_REACH;
 
@@ -798,21 +931,33 @@ fn handleGamepad(g: *Game) void {
         if (aimTarget) |id| p.targetMonster = id; // sticky manual pick via the right stick
     }
 
-    // X: engage — commit to chase+melee the selected foe (the stick pick, the nearest
-    // default, or a fresh nearest scan), driving movement like a mouse click on a foe.
-    if (input.padAttackDown() and !p.rolling()) {
-        const id = (if (scannedAim) aimTarget else null) orelse (if (p.targetMonster >= 0) p.targetMonster else padAcquireTarget(g, aimDir));
-        if (id) |tid| {
-            p.targetMonster = tid;
-            p.chaseMonster = tid;
-            p.hasMoveTarget = false;
+    // Fire every slot whose controller button is held (X=0, Y=1, d-pad=2/3/4). A slot
+    // holding an offensive skill needs a selected target + a projected aim point first,
+    // so scan once if any firing slot is offensive (mirroring the old X-acquires-nearest).
+    var offensiveFiring = false;
+    {
+        var s: usize = 0;
+        while (s < playermod.SKILL_SLOTS) : (s += 1) {
+            if (input.slotPadDown(s)) {
+                if (p.bar.slots[s]) |sk| {
+                    if (sk == .melee or sk == .firebolt) offensiveFiring = true;
+                }
+            }
         }
     }
-
-    // Y: cast Firebolt toward the aim point (falls back to facing when not aiming).
-    if (input.padCastDown() and !p.rolling()) {
+    if (offensiveFiring and !p.rolling()) {
+        if (p.targetMonster < 0) {
+            if ((if (scannedAim) aimTarget else padAcquireTarget(g, aimDir))) |tid| p.targetMonster = tid;
+        }
         if (!aiming) g.mouseGround = v3(p.Pos.x + p.Facing.x * AIM_REACH, 0, p.Pos.z + p.Facing.z * AIM_REACH);
-        castFirebolt(g);
+    }
+    if (!p.rolling()) {
+        var s: usize = 0;
+        while (s < playermod.SKILL_SLOTS) : (s += 1) {
+            // Potions on the down-EDGE (one per tap); combat skills while held.
+            const fires = if (slotConsumable(g, s)) input.slotPadPressed(s) else input.slotPadDown(s);
+            if (fires) fireSlot(g, s, false);
+        }
     }
 
     // B: dodge roll (movement direction, else aim direction, else facing).
@@ -1636,8 +1781,9 @@ pub fn startPlaytest(g: *Game) void {
     g.playtest = true;
     g.paused = false;
     g.canResume = false; // a playtest is not a resumable adventure
-    g.sheetOpen = false;
+    g.resetCharScreen();
     g.p = playermod.newPlayer(g.map.spawn);
+    g.p.bar = g.loadout;
     g.w.PortalOpen = false;
     resetArena(g);
     teleportHero(g, g.p.Pos);
@@ -1859,7 +2005,7 @@ fn monsterChestY(m: *const Monster, frac: f32) f32 {
 // The arc IS the pib's entire telegraph: rest shoulders the blade near-vertical; windup
 // hauls it back and UP behind the shoulder; the swing whips it around the front (damage
 // at midpoint, where it crosses you); flee waves it overhead.
-const PibGrip = struct { hand: rl.Vector3, tip: rl.Vector3, out: rl.Vector3, f: rl.Vector3 };
+const PibGrip = struct { hand: rl.Vector3, tip: rl.Vector3, out: rl.Vector3 };
 
 // Swing-arc azimuth anchors in the body frame (0 = right, pi/2 = ahead): cocked behind
 // the shoulder, across the front, through to the far left. Front-crossing = arc
@@ -1900,7 +2046,6 @@ fn pibGripAt(m: *const Monster, wp: f32, sp: f32) PibGrip {
         .hand = hand,
         .tip = v3(hand.x + dir.x * out, hand.y + up, hand.z + dir.z * out),
         .out = dir,
-        .f = f,
     };
 }
 
@@ -1916,8 +2061,6 @@ const SkelBow = struct {
     nock: rl.Vector3, // string hand: slides back as the draw builds
     head: rl.Vector3, // arrowhead past the bow — the glint and the loosed arrow ride here
     axis: rl.Vector3, // unit bow axis (canted): tips sit at grip +/- axis * BOW_HALF
-    f: rl.Vector3,
-    right: rl.Vector3,
 };
 const BOW_HALF = 0.62;
 
@@ -1935,8 +2078,6 @@ fn skelBow(m: *const Monster) SkelBow {
         .nock = v3(grip.x - f.x * (0.18 + 0.42 * wp), gy - 0.02, grip.z - f.z * (0.18 + 0.42 * wp)),
         .head = v3(grip.x + f.x * 0.34, gy + 0.02, grip.z + f.z * 0.34),
         .axis = axis,
-        .f = f,
-        .right = right,
     };
 }
 fn monsterHeadY(m: *const Monster, shrink: f32) f32 {
@@ -2746,6 +2887,25 @@ fn debugFrameProbe(g: *Game) void {
     f.writeAll(fbs.getWritten()) catch {};
 }
 
+// The main-pass frame setup shared by the game and the editor: open the frame, push the
+// torch/fire/fog uniforms, enter 3D, and lay down the static scene (baked mesh, ground,
+// walls). Both renderers MUST agree here or the frozen lighting drifts, so it lives once.
+// The depth pre-pass differs per renderer and stays at the call site.
+pub fn beginSceneFrame(g: *Game, cam: rl.Camera3D, lp: tl.LightParams, fp: tl.FireParams) void {
+    rl.beginDrawing();
+    rl.clearBackground(theme.voidColor);
+    g.torch.applyUniforms(lp);
+    g.torch.applyFireUniforms(fp);
+    g.torch.applyFogUniforms(.{ .texId = @intCast(g.fog.tex.id), .halfW = g.fog.halfW, .halfD = g.fog.halfD });
+    rl.beginMode3D(cam);
+    g.torch.beginScene();
+    // beginScene left the shadow map active on slot 10; reset to 0 so immediate-mode binds land on slot 0.
+    rl.gl.rlActiveTextureSlot(0);
+    g.sceneMesh.drawScene();
+    rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(g.w.HalfW * 2, g.w.HalfD * 2), g.w.Ground);
+    drawWalls(&g.w);
+}
+
 // drawWorld renders one frame of the 3D scene through the frozen torch pipeline.
 fn drawWorld(g: *Game) void {
     var cam = g.rig.cam;
@@ -2789,18 +2949,7 @@ fn drawWorld(g: *Game) void {
     }
 
     // --- main pass ---
-    rl.beginDrawing();
-    rl.clearBackground(theme.voidColor);
-    g.torch.applyUniforms(lp);
-    g.torch.applyFireUniforms(fp);
-    g.torch.applyFogUniforms(.{ .texId = @intCast(g.fog.tex.id), .halfW = g.fog.halfW, .halfD = g.fog.halfD });
-    rl.beginMode3D(cam);
-    g.torch.beginScene();
-    // beginScene left the shadow map active on slot 10; reset to 0 so immediate-mode binds land on slot 0.
-    rl.gl.rlActiveTextureSlot(0);
-    g.sceneMesh.drawScene();
-    rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(g.w.HalfW * 2, g.w.HalfD * 2), g.w.Ground);
-    drawWalls(&g.w);
+    beginSceneFrame(g, cam, lp, fp);
     drawMonstersLit(ms, lightGround, lp.radius, fp, g.p.targetMonster);
     if (drawHero) drawHeroBody(&g.p);
     g.torch.endScene();
@@ -2889,11 +3038,21 @@ pub fn run(shot: bool) void {
                 g.rig.follow(g.p.Pos, dt); // let the backdrop drift
             },
             .playing => {
-                // Character sheet: toggles with C / Select and freezes the world.
-                if (input.sheetTogglePressed()) g.sheetOpen = !g.sheetOpen;
+                // Character screen (Select / C) freezes the world; it has Stats + Skills
+                // pages. K is a keyboard shortcut straight to the Skills page. Both close
+                // paths route through closeCharScreen so the loadout persists.
+                if (input.sheetTogglePressed()) {
+                    if (g.sheetOpen) g.closeCharScreen() else g.sheetOpen = true;
+                }
+                if (input.skillsShortcutPressed()) {
+                    if (g.sheetOpen and g.charTab == .skills) g.closeCharScreen() else {
+                        g.sheetOpen = true;
+                        g.charTab = .skills;
+                    }
+                }
                 if (g.sheetOpen) {
-                    updateSheet(&g, altHeld);
-                    g.rig.follow(g.p.Pos, dt); // keep the camera live behind the sheet
+                    updateCharScreen(&g, altHeld);
+                    g.rig.follow(g.p.Pos, dt); // keep the camera live behind the screen
                 } else {
                     // Exit to menu is Escape/Start ONLY — never pad B (dodge in play).
                     if (rl.isKeyPressed(.escape) or input.startPressed()) {

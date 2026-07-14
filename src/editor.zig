@@ -185,6 +185,12 @@ const SelRect = struct {
     fn contains(s: SelRect, x: f32, z: f32) bool {
         return world.inRect(s.minX, s.maxX, s.minZ, s.maxZ, x, z);
     }
+    fn cx(s: SelRect) f32 {
+        return (s.minX + s.maxX) / 2;
+    }
+    fn cz(s: SelRect) f32 {
+        return (s.minZ + s.maxZ) / 2;
+    }
 };
 
 fn normRect(a: rl.Vector3, b: rl.Vector3) SelRect {
@@ -657,8 +663,8 @@ fn eraseWithin(g: *Game, p: rl.Vector3, r: f32) bool {
 fn copySelection(g: *Game, cut: bool) void {
     const ed = &g.ed;
     const s = ed.sel orelse return ed.status("nothing selected (Shift+drag)", .{});
-    const cx = (s.minX + s.maxX) / 2;
-    const cz = (s.minZ + s.maxZ) / 2;
+    const cx = s.cx();
+    const cz = s.cz();
     const m = &g.map;
     // Capture into local counts first: an empty selection must NOT wipe the existing
     // clipboard (the counts/clipHas are committed only once we know the grab is non-empty).
@@ -1496,17 +1502,7 @@ pub fn draw(g: *Game) void {
     drawEncounterPreviews(g);
     g.torch.endShadowPass();
 
-    rl.beginDrawing();
-    rl.clearBackground(theme.voidColor);
-    g.torch.applyUniforms(lp);
-    g.torch.applyFireUniforms(fp);
-    g.torch.applyFogUniforms(.{ .texId = @intCast(g.fog.tex.id), .halfW = g.fog.halfW, .halfD = g.fog.halfD });
-    rl.beginMode3D(cam);
-    g.torch.beginScene();
-    rl.gl.rlActiveTextureSlot(0);
-    g.sceneMesh.drawScene();
-    rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(g.w.HalfW * 2, g.w.HalfD * 2), g.w.Ground);
-    gamemod.drawWalls(&g.w);
+    gamemod.beginSceneFrame(g, cam, lp, fp);
     drawEncounterPreviews(g);
     g.torch.endScene();
     gamemod.drawPortal(&g.w, g.elapsed);

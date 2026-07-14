@@ -162,10 +162,11 @@ fn bakeGravestone(b: *Builder, o: world.Obstacle) void {
     // a full sphere ballooned past the faces into a lollipop) + a foot plinth.
     const gy = o.Pos.y;
     const dark = lerpColor(o.Tint, rl.Color.black, 0.3);
+    const ridge_r = 0.19; // rounded-top ridge: cylinder + its two end-cap spheres must match
     b.addCube(v3(o.Pos.x, gy + o.Height / 2, o.Pos.z), v3(o.Radius * 2, o.Height, 0.35), o.Tint);
-    b.addCylinder(v3(o.Pos.x - o.Radius, gy + o.Height, o.Pos.z), v3(o.Pos.x + o.Radius, gy + o.Height, o.Pos.z), 0.19, 0.19, 8, o.Tint);
-    b.addSphere(v3(o.Pos.x - o.Radius, gy + o.Height, o.Pos.z), 0.19, 6, 6, o.Tint);
-    b.addSphere(v3(o.Pos.x + o.Radius, gy + o.Height, o.Pos.z), 0.19, 6, 6, o.Tint);
+    b.addCylinder(v3(o.Pos.x - o.Radius, gy + o.Height, o.Pos.z), v3(o.Pos.x + o.Radius, gy + o.Height, o.Pos.z), ridge_r, ridge_r, 8, o.Tint);
+    b.addSphere(v3(o.Pos.x - o.Radius, gy + o.Height, o.Pos.z), ridge_r, 6, 6, o.Tint);
+    b.addSphere(v3(o.Pos.x + o.Radius, gy + o.Height, o.Pos.z), ridge_r, 6, 6, o.Tint);
     b.addCube(v3(o.Pos.x, gy + 0.14, o.Pos.z), v3(o.Radius * 2 + 0.3, 0.28, 0.62), dark);
 }
 
@@ -185,13 +186,14 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
         const reach = 0.5 + 0.18 * sinf(o.Height * 3 + rf * 2.1);
         b.addCylinder(v3(x, gy + 0.32, z), v3(x + cosf(ang) * reach, gy + 0.02, z + sinf(ang) * reach), 0.15, 0.045, 5, rootCol);
     }
+    const trunk_r = 0.38; // trunk base radius, tapering up the segments
     var prev = v3(x, gy, z);
     var i: i32 = 1;
     while (i <= segs_n) : (i += 1) {
         const f: f32 = @as(f32, @floatFromInt(i)) / segs_n;
         const top = v3(x + lean.x * o.Height * f * f, gy + o.Height * 0.62 * f, z + lean.z * o.Height * f * f);
-        const r0 = 0.38 * (1 - 0.6 * @as(f32, @floatFromInt(i - 1)) / segs_n);
-        const r1 = 0.38 * (1 - 0.6 * f);
+        const r0 = trunk_r * (1 - 0.6 * @as(f32, @floatFromInt(i - 1)) / segs_n);
+        const r1 = trunk_r * (1 - 0.6 * f);
         b.addCylinder(prev, top, r0, r1, 8, bark);
         prev = top;
     }

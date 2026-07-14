@@ -1,3 +1,4 @@
+const std = @import("std");
 const rl = @import("raylib");
 const mathx = @import("mathx.zig");
 const stats = @import("stats.zig");
@@ -65,17 +66,188 @@ pub const Skill = enum {
     melee,
     firebolt,
     dodge,
+    // Consumables — potion use is a reassignable action too, so it lives on the bar
+    // alongside the combat skills. Not rankable; draws from the belt counts.
+    health_potion,
+    mana_potion,
 
     pub const count = @typeInfo(Skill).@"enum".fields.len;
+    // Canonical variant list — the single source for "iterate every skill" (skill-bar
+    // palette, sheet). Hand-listed, so the assert pins it: a new Skill without a matching
+    // entry here is a compile error rather than a silently-missing palette chip.
+    pub const all = [_]Skill{ .melee, .firebolt, .dodge, .health_potion, .mana_potion };
+    comptime {
+        std.debug.assert(all.len == count);
+    }
+
+    // Consumables fire on a button TAP (one per press) and draw from a belt count;
+    // combat skills fire while held and never run out. One source so input + HUD agree.
+    pub fn consumable(s: Skill) bool {
+        return s == .health_potion or s == .mana_potion;
+    }
 
     pub fn label(s: Skill) [:0]const u8 {
         return switch (s) {
             .melee => "Melee",
             .firebolt => "Firebolt",
             .dodge => "Dodge",
+            .health_potion => "Health Potion",
+            .mana_potion => "Mana Potion",
+        };
+    }
+
+    // One-line description for the loadout screen — what the button does, in plain terms.
+    pub fn blurb(s: Skill) [:0]const u8 {
+        return switch (s) {
+            .melee => "Strike the selected foe up close.",
+            .firebolt => "Hurl a bolt of fire at your target. Costs mana.",
+            .dodge => "Roll a quick dash with a moment of invulnerability.",
+            .health_potion => "Drink to restore health. Uses one from your belt.",
+            .mana_potion => "Drink to restore mana. Uses one from your belt.",
         };
     }
 };
+
+// ── Reassignable skill bar ────────────────────────────────────────────────────
+// The hero's loadout: one skill (or none) per input slot. Slots map to controller
+// buttons by index (see input.slotPad): 0=X, 1=Y, 2/3/4=d-pad; keyboard mirrors on the
+// mouse buttons + Q/E/R (input.slotKeyDown). A skill lives in AT MOST ONE slot —
+// `assign` enforces uniqueness so the palette↔bar mapping can't double-bind.
+// Reassignment is the Skills loadout screen (hudx); combat fires through these slots
+// (game.zig).
+pub const SKILL_SLOTS = 5;
+
+pub const SkillBar = struct {
+    slots: [SKILL_SLOTS]?Skill = [_]?Skill{null} ** SKILL_SLOTS,
+
+    /// The out-of-the-box loadout: fills all five slots — melee, firebolt, dodge, then
+    /// the two potions. Used by a fresh hero and as the fallback when no saved bindings
+    /// exist (or when a pre-potion save is migrated).
+    pub fn default() SkillBar {
+        var b = SkillBar{};
+        b.assign(0, .melee);
+        b.assign(1, .firebolt);
+        b.assign(2, .dodge);
+        b.assign(3, .health_potion);
+        b.assign(4, .mana_potion);
+        return b;
+    }
+
+    /// Bind `s` (or clear, when null) to `slot`. A skill is unique across the bar, so
+    /// it's first removed from any other slot — assigning Firebolt to a new button pulls
+    /// it off its old one rather than leaving a phantom copy behind.
+    pub fn assign(b: *SkillBar, slot: usize, s: ?Skill) void {
+        if (s) |sk| {
+            for (&b.slots) |*e| {
+                if (e.* == sk) e.* = null;
+            }
+        }
+        b.slots[slot] = s;
+    }
+
+    /// The slot holding `s`, or null if it's unbound.
+    pub fn slotOf(b: *const SkillBar, s: Skill) ?usize {
+        for (b.slots, 0..) |e, i| {
+            if (e == s) return i;
+        }
+        return null;
+    }
+
+    /// Cycle `slot` forward (dir=+1) or back (-1) through the skills available to it —
+    /// each skill that's free or already here, plus "empty". A skill bound to ANOTHER
+    /// slot is skipped, so cycling never steals a binding (uniqueness holds without the
+    /// stealing that plain `assign` would do). This is the controller/keyboard analogue
+    /// of cycling a slot with the mouse (click / scroll).
+    pub fn cycle(b: *SkillBar, slot: usize, dir: i32) void {
+        var opts: [Skill.count + 1]?Skill = undefined;
+        var n: usize = 0;
+        for (Skill.all) |s| {
+            const at = b.slotOf(s);
+            if (at == null or at.? == slot) {
+                opts[n] = s;
+                n += 1;
+            }
+        }
+        opts[n] = null; // empty is always reachable
+        n += 1;
+        var cur: usize = n - 1; // fall back to the empty option if current isn't listed
+        for (opts[0..n], 0..) |o, i| {
+            if (o == b.slots[slot]) {
+                cur = i;
+                break;
+            }
+        }
+        const ni = @mod(@as(i32, @intCast(cur)) + dir, @as(i32, @intCast(n)));
+        b.slots[slot] = opts[@intCast(ni)];
+    }
+
+    // ── Persistence ──
+    // The loadout is a player preference, so it survives across runs and app restarts.
+    // Format mirrors the map files: a `version:` header then `slotN: token` lines
+    // (@tagName tokens, "-" for empty). Load is deliberately LENIENT — a missing or
+    // corrupt file falls back to default() rather than erroring, since a bad binding
+    // file must never keep the player out of the game.
+    //
+    // FORMAT 2 added the potions to the bar. A file from an older format is migrated by
+    // resetting to default() — otherwise a pre-potion save (potions in no slot) would
+    // leave the player unable to quaff, since potions now fire ONLY from their slot.
+    pub const FORMAT = 2;
+
+    pub fn save(b: *const SkillBar, path: []const u8) !void {
+        const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer f.close();
+        var w = f.writer();
+        try w.print("version: {d}\n", .{FORMAT});
+        for (b.slots, 0..) |e, i| {
+            try w.print("slot{d}: {s}\n", .{ i, if (e) |s| @tagName(s) else "-" });
+        }
+    }
+
+    pub fn load(path: []const u8) SkillBar {
+        const f = std.fs.cwd().openFile(path, .{}) catch return default();
+        defer f.close();
+        var buf: [512]u8 = undefined;
+        const n = f.reader().readAll(&buf) catch return default();
+
+        var parsed = SkillBar{};
+        var sawVersion = false;
+        var sawSlot = false;
+        var it = std.mem.tokenizeScalar(u8, buf[0..n], '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \r\t");
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, "version:")) {
+                // Only the current format is trusted; anything else migrates to default().
+                const v = std.fmt.parseInt(u32, std.mem.trim(u8, line["version:".len..], " "), 10) catch return default();
+                if (v != FORMAT) return default();
+                sawVersion = true;
+                continue;
+            }
+            if (!std.mem.startsWith(u8, line, "slot")) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const idx = std.fmt.parseInt(usize, std.mem.trim(u8, line["slot".len..colon], " "), 10) catch continue;
+            if (idx >= SKILL_SLOTS) continue;
+            parsed.slots[idx] = skillFromToken(std.mem.trim(u8, line[colon + 1 ..], " "));
+            sawSlot = true;
+        }
+        if (!sawVersion or !sawSlot) return default();
+        // Rebuild through assign so a hand-edited/corrupt file with a duplicate binding
+        // is de-duplicated (uniqueness invariant), not carried through verbatim.
+        var clean = SkillBar{};
+        for (parsed.slots, 0..) |e, i| {
+            if (e) |s| clean.assign(i, s);
+        }
+        return clean;
+    }
+};
+
+// Skill for a saved token (@tagName), or null for "-"/unknown.
+fn skillFromToken(tok: []const u8) ?Skill {
+    inline for (Skill.all) |s| {
+        if (std.mem.eql(u8, tok, @tagName(s))) return s;
+    }
+    return null;
+}
 
 // Player is the hero — an Amazon-ish ranged/melee hybrid.
 pub const Player = struct {
@@ -96,6 +268,9 @@ pub const Player = struct {
     meleeRank: i32 = 1,
     fireboltRank: i32 = 1,
     dodgeRank: i32 = 1,
+
+    // Reassignable loadout (defaults set in newPlayer). Persists across areas.
+    bar: SkillBar = .{},
 
     HP: f32 = 0,
     MaxHP: f32 = 0,
@@ -237,18 +412,21 @@ pub const Player = struct {
             .melee => p.meleeRank,
             .firebolt => p.fireboltRank,
             .dodge => p.dodgeRank,
+            .health_potion, .mana_potion => 1, // consumables have no rank
         };
     }
 
-    /// Spend one skill point ranking up `s`. False if none are available.
+    /// Spend one skill point ranking up `s`. False if none are available or `s` isn't
+    /// rankable (consumables). The point is spent only once a rank actually increments.
     pub fn allocSkill(p: *Player, s: Skill) bool {
         if (p.skillPoints <= 0) return false;
-        p.skillPoints -= 1;
         switch (s) {
             .melee => p.meleeRank += 1,
             .firebolt => p.fireboltRank += 1,
             .dodge => p.dodgeRank += 1,
+            .health_potion, .mana_potion => return false, // not rankable
         }
+        p.skillPoints -= 1;
         p.recompute();
         return true;
     }
@@ -337,6 +515,8 @@ pub fn newPlayer(pos: rl.Vector3) Player {
         .spellCost = BASE_SPELL_COST,
         .def = .{ .armor = BASE_ARMOR },
     };
+    // Default loadout (the game applies any persisted bindings over this after spawn).
+    p.bar = SkillBar.default();
     // Derive stats from the starting attributes, then top off.
     p.recompute();
     p.HP = p.MaxHP;

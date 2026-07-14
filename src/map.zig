@@ -239,7 +239,8 @@ const K = struct {
 pub fn save(m: *const Map, path: []const u8) !void {
     std.fs.cwd().makePath(dir) catch {};
     // Keep a .bak of whatever was there before, so we never clobber the only copy.
-    var bakBuf: [160]u8 = undefined;
+    // Sized off PATH_CAP so raising the path cap can't silently outgrow this buffer.
+    var bakBuf: [PATH_CAP + ".bak".len]u8 = undefined;
     if (std.fmt.bufPrint(&bakBuf, "{s}.bak", .{path})) |bak| {
         std.fs.cwd().copyFile(path, std.fs.cwd(), bak, .{}) catch {};
     } else |_| {}

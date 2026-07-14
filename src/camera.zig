@@ -13,6 +13,10 @@ pub const CamRig = struct {
     cam: rl.Camera3D,
     zoom: f32, // 1 = default framing; larger = closer
 
+    /// Height above the target the camera looks at — the framing pivot. Single source
+    /// so the smoothed follow and the hard snap can't frame the target differently.
+    const LOOK_HEIGHT = 1.0;
+
     /// Fixed iso offset from the target, pulled closer as zoom rises. Single source
     /// for both the smoothed follow and the hard snap.
     fn isoOffset(zoom: f32) rl.Vector3 {
@@ -27,14 +31,14 @@ pub const CamRig = struct {
         const want = v3(target.x + off.x, target.y + off.y, target.z + off.z);
         const a = clampF(dt * 8, 0, 1);
         c.cam.position = c.cam.position.lerp(want, a);
-        const lookAt = v3(target.x, target.y + 1.0, target.z);
+        const lookAt = v3(target.x, target.y + LOOK_HEIGHT, target.z);
         c.cam.target = c.cam.target.lerp(lookAt, a);
     }
 
     pub fn snap(c: *CamRig, target: rl.Vector3) void {
         const off = isoOffset(c.zoom);
         c.cam.position = v3(target.x + off.x, target.y + off.y, target.z + off.z);
-        c.cam.target = v3(target.x, target.y + 1.0, target.z);
+        c.cam.target = v3(target.x, target.y + LOOK_HEIGHT, target.z);
     }
 
     pub fn addZoom(c: *CamRig, delta: f32) void {

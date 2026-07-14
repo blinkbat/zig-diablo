@@ -5,3 +5,5 @@ zig-out/
 *.png
 shots/
 *.bak
+skillbar.cfg
+lightlog.txt
