@@ -1,9 +1,8 @@
-version: 2
+version: 3
 name: The Blood Moor
 boss: Bishibosh
 size: 48.0 38.0
-ground: 62 58 48
-accent: 48 46 38
+floor: grass dirt mud
 light: 0.88 1.00 0.88
 spawn: 0.0 32.0
 portal: 0.0 -31.0
@@ -276,3 +275,17 @@ pack: zombie 2 2.2 -16.1
 pack: zombie 4 25.7 1.7
 pack: skeleton 2 -16.0 -6.0
 pack: skeleton 2 18.0 -18.0
+decor: bigshroom -35.60 3.20 1.10
+decor: bigshroom -38.90 6.80 0.85
+decor: bigshroom -44.20 -0.40 0.70
+decor: bigshroom 26.20 -10.40 1.20
+decor: bigshroom 30.00 -6.60 0.80
+decor: bigshroom -1.80 11.60 0.95
+decor: bigshroom 4.20 8.80 0.70
+decor: bigshroom -32.80 -30.40 1.05
+decor: bigshroom 11.60 -4.80 0.80
+decor: bigshroom 29.40 -24.00 0.90
+decor: bigshroom 4.50 -27.50 1.10
+decor: bigshroom -5.20 -28.90 0.85
+decor: bigshroom -6.80 -2.40 1.00
+decor: bigshroom 24.60 9.80 0.90

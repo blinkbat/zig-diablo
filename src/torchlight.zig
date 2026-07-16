@@ -1,5 +1,6 @@
 const std = @import("std");
 const rl = @import("raylib");
+const world = @import("world.zig");
 
 // TORCHLIGHT — torch lighting + cast-shadow + light-radius pipeline, adapted from
 // demo2.zig. Two deliberate divergences from the demo: (1) the scene shader is purely
@@ -91,6 +92,7 @@ const sceneFS =
     \\uniform vec3 fireColor;
     \\uniform float fireRadius;
     \\uniform float fireIntensity;
+    \\uniform ivec3 floorMats;
     \\out vec4 finalColor;
     \\// Cheap hash / value noise over world XZ: mottles the flat vertex colors into
     \\// dirt, stone grain, and moss so broad surfaces don't read as untextured plastic.
@@ -105,6 +107,69 @@ const sceneFS =
     \\    f = f*f*(3.0 - 2.0*f);
     \\    return mix(mix(hash21(i), hash21(i + vec2(1, 0)), f.x),
     \\               mix(hash21(i + vec2(0, 1)), hash21(i + vec2(1, 1)), f.x), f.y);
+    \\}
+    \\// ---- FLOOR MATERIALS ----
+    \\// One procedural look per world.FloorMat, ids matching that enum's order (its
+    \\// base() tones mirror these — keep in sync). Pre-gamma albedo at a ground point.
+    \\vec3 matAlbedo(int id, vec2 p) {
+    \\    if (id == 1) { // GRASS: fine blade grain over sickly green, whole patches dead
+    \\        float blades = vnoise(p*6.5)*0.6 + vnoise(p*13.0)*0.4;
+    \\        float dead = smoothstep(0.35, 0.75, vnoise(p*0.09 + 3.7));
+    \\        vec3 c = mix(vec3(0.13, 0.18, 0.09), vec3(0.25, 0.21, 0.11), dead);
+    \\        return c*(0.70 + 0.60*blades);
+    \\    }
+    \\    if (id == 2) { // STONE: worn slabs, dark grout seams, moss creeping in the damp
+    \\        vec2 gp = p*0.42;
+    \\        vec2 f = fract(gp);
+    \\        float seam = smoothstep(0.012, 0.075, min(min(f.x, 1.0 - f.x), min(f.y, 1.0 - f.y)));
+    \\        float tone = 0.76 + 0.46*hash21(floor(gp));
+    \\        vec3 c = vec3(0.235, 0.230, 0.215)*tone*(0.82 + 0.36*vnoise(p*2.7));
+    \\        float moss = smoothstep(0.55, 0.85, vnoise(p*0.23 + 7.7));
+    \\        c = mix(c, vec3(0.11, 0.15, 0.08), moss*0.55);
+    \\        return mix(c*0.32, c, seam);
+    \\    }
+    \\    if (id == 3) { // COBBLE: staggered rounded stones over dark packed earth
+    \\        vec2 gp = p*1.15;
+    \\        gp.x += 0.5*step(0.5, fract(gp.y*0.5));
+    \\        vec2 f = fract(gp) - 0.5;
+    \\        float stone = 1.0 - smoothstep(0.30, 0.46, length(f*vec2(1.0, 1.25)));
+    \\        vec3 rock = vec3(0.225, 0.215, 0.195)*(0.72 + 0.56*hash21(floor(gp)))*(0.85 + 0.30*vnoise(p*4.0));
+    \\        return mix(vec3(0.095, 0.080, 0.055), rock, stone);
+    \\    }
+    \\    if (id == 4) { // MUD: near-black wet earth, broad standing-water darkening
+    \\        float pool = smoothstep(0.35, 0.80, vnoise(p*0.35 + 21.0));
+    \\        vec3 c = mix(vec3(0.155, 0.120, 0.080), vec3(0.070, 0.055, 0.040), pool);
+    \\        return c*(0.80 + 0.40*vnoise(p*2.3));
+    \\    }
+    \\    if (id == 5) { // BONE: ash-dark ground littered with clumped pale fragments
+    \\        vec3 ash = vec3(0.125, 0.110, 0.095)*(0.75 + 0.50*vnoise(p*1.7));
+    \\        float bones = smoothstep(0.80, 0.90, vnoise(p*7.5 + 9.1)*0.55 + vnoise(p*0.5 + 3.3)*0.50);
+    \\        return mix(ash, vec3(0.50, 0.47, 0.39), bones);
+    \\    }
+    \\    // DIRT (0, and the fallback): weathers moss-sick to blood-rust; dry patches
+    \\    // split into a cracked vein network (parched earth), mossy ground doesn't.
+    \\    float grain = vnoise(p*0.85)*0.55 + vnoise(p*3.9)*0.45;
+    \\    float dry = vnoise(p*0.11);
+    \\    vec3 c = vec3(0.235, 0.195, 0.145)*mix(vec3(0.74, 0.92, 0.72), vec3(1.05, 0.80, 0.64), dry);
+    \\    c *= 0.70 + 0.60*grain;
+    \\    float ridge = abs(vnoise(p*0.9 + 17.3) - 0.5)*2.0;
+    \\    float crack = (1.0 - smoothstep(0.0, 0.10, ridge))*smoothstep(0.45, 0.8, vnoise(p*0.13 + 5.1));
+    \\    return c*(1.0 - 0.46*crack);
+    \\}
+    \\// The area's three materials blended across the ground by two low-frequency
+    \\// fields, each border roughened by a mid-frequency octave so transitions read as
+    \\// ragged terrain edges, not contour lines. Pure function of world XZ: the same
+    \\// patches every load, no stored data.
+    \\vec3 floorAlbedo(vec2 p) {
+    \\    float n1 = vnoise(p*0.050) + (vnoise(p*0.55 + 2.2) - 0.5)*0.26;
+    \\    float w1 = smoothstep(0.50, 0.64, n1);
+    \\    float n2 = vnoise(p*0.031 + 40.0) + (vnoise(p*0.63 + 11.0) - 0.5)*0.22;
+    \\    float w2 = smoothstep(0.66, 0.78, n2);
+    \\    vec3 c = mix(matAlbedo(floorMats.x, p), matAlbedo(floorMats.y, p), w1);
+    \\    c = mix(c, matAlbedo(floorMats.z, p), w2);
+    \\    // DAMP BLOTCHES: one very low octave sinks whole stretches toward wet-dark
+    \\    // so the midfield never reads as a single carpet (darken-only).
+    \\    return c*(0.72 + 0.28*vnoise(p*0.045 + 9.7));
     \\}
     \\// Fraction of this fragment in shadow (0 = lit, 1 = shadowed), from a wide 5x5
     \\// PCF tap. `spread` scales the kernel footprint past one texel so the penumbra
@@ -141,30 +206,37 @@ const sceneFS =
     \\void main() {
     \\    vec4 texelColor = texture(texture0, fragTexCoord);
     \\    vec3 normal = normalize(fragNormal);
-    \\    // GROUND GRAIN: two octaves of world-space value noise break the flat vertex
-    \\    // colors into mottled dirt/stone. Strongest on upward faces (the floor, boulder
-    \\    // tops), gentler on walls and bodies so verticals keep their clean silhouette.
     \\    float upMask = smoothstep(0.25, 0.95, normal.y);
-    \\    float grain = vnoise(fragPosition.xz*0.85)*0.55 + vnoise(fragPosition.xz*3.9)*0.45;
-    \\    float gstr = mix(0.12, 0.30, upMask);
-    \\    vec3 albedo = texelColor.rgb*fragColor.rgb*(1.0 - gstr + 2.0*gstr*grain);
-    \\    // DIRT PATCHES: one very low-frequency octave drifts the floor hue between
-    \\    // mossy-cool and dry-warm across meters, so the arena floor reads as ground
-    \\    // that weathered differently place to place, not one uniform carpet. Ground
-    \\    // only (up-faces) so walls and bodies keep their true tints.
-    \\    float dryPatch = vnoise(fragPosition.xz*0.11); // NOT 'patch' — reserved GLSL keyword (Intel rejects it)
-    \\    vec3 patchTint = mix(vec3(0.90, 1.03, 0.90), vec3(1.08, 0.99, 0.90), dryPatch);
-    \\    albedo *= mix(vec3(1.0), patchTint, upMask);
-    \\    // CRACKED EARTH: a ridged octave etches thin dark fissure lines into the
-    \\    // floor, gated to the DRY patches (the mask keys off its own low-frequency
-    \\    // field) — parched ground splits into a vein network, mossy ground doesn't.
-    \\    float ridge = abs(vnoise(fragPosition.xz*0.9 + 17.3) - 0.5)*2.0;
-    \\    float crackMask = smoothstep(0.45, 0.8, vnoise(fragPosition.xz*0.13 + 5.1));
-    \\    float crack = (1.0 - smoothstep(0.0, 0.10, ridge))*crackMask;
-    \\    albedo *= 1.0 - 0.34*crack*upMask;
+    \\    // FLOOR SENTINEL: baked walkable ground carries a NEGATIVE texcoord u
+    \\    // (-1 = blended material field, -2 = masonry pavement on ledge caps / ramp
+    \\    // tops). raylib's immediate-mode draws only emit u >= 0, so props and bodies
+    \\    // can never trip the flag. (The default 1x1 white texture samples white at
+    \\    // any uv, so texture0 stays valid for flagged fragments too.)
+    \\    vec3 albedo;
+    \\    if (fragTexCoord.x < -1.5) {
+    \\        albedo = matAlbedo(2, fragPosition.xz)*fragColor.rgb; // built pavement is stone
+    \\    } else if (fragTexCoord.x < -0.5) {
+    \\        albedo = floorAlbedo(fragPosition.xz)*fragColor.rgb;
+    \\    } else {
+    \\        // PROPS/BODIES: a light 2-octave grain so broad surfaces don't read as
+    \\        // untextured plastic — strongest on up-faces, gentle on silhouettes.
+    \\        float grain = vnoise(fragPosition.xz*0.85)*0.55 + vnoise(fragPosition.xz*3.9)*0.45;
+    \\        float gstr = mix(0.12, 0.24, upMask);
+    \\        albedo = texelColor.rgb*fragColor.rgb*(1.0 - gstr + 2.0*gstr*grain);
+    \\    }
     \\    vec3 l = normalize(lightPos - fragPosition);
     \\    float NdotL = max(dot(normal, l), 0.0);
-    \\    vec3 lightDot = lightColor.rgb*NdotL;
+    \\    // RADIAL FALLOFF: torchlight pools at the carrier and starves toward the rim
+    \\    // instead of filling the disc edge-to-edge like a floodlight — the bright
+    \\    // island in oppressive dark is most of the Diablo look. Post-gamma this curve
+    \\    // still leaves the mid-disc readable (~0.6 of core).
+    \\    float lightDist = length(fragPosition.xz - lightPos.xz);
+    \\    float torchAtten = pow(max(1.0 - lightDist/max(lightRadius, 0.001), 0.0), 1.5);
+    \\    vec3 lightDot = lightColor.rgb*NdotL*torchAtten;
+    \\    // Unattenuated lit value, kept aside for the fog-of-war memory below: the
+    \\    // "seen" band must not inherit the torch falloff or explored ground past the
+    \\    // disc would black out with it.
+    \\    vec3 memBase = albedo*(lightColor.rgb*NdotL + 0.05);
     \\    // Purely diffuse (Lambert): the specular term is gone so the flat ground no
     \\    // longer flares a bright hot-spot under the overhead torch. Matte surfaces.
     \\    finalColor = vec4(albedo*lightDot, 1.0);
@@ -172,7 +244,6 @@ const sceneFS =
     \\    // at the carrier's feet and diffuse toward the rim of the light. Scaling the
     \\    // PCF footprint with distance from the light axis fakes PCSS at zero extra
     \\    // taps (the per-fragment kernel rotation above hides the undersampling).
-    \\    float lightDist = length(fragPosition.xz - lightPos.xz);
     \\    float torchSpread = mix(1.0, 7.0, smoothstep(0.0, lightRadius, lightDist));
     \\    float sTorch = shadowFrac(shadowMap, lightVP, float(shadowMapResolution), dot(normal, l), torchSpread);
     \\    finalColor = mix(finalColor, vec4(0, 0, 0, 1), sTorch);
@@ -186,7 +257,13 @@ const sceneFS =
     \\    // out, so the disc grades from golden center to blue-grey rim instead of one
     \\    // flat tone. Cheap, but it sells "torch" more than anything else here.
     \\    float core = 1.0 - smoothstep(0.0, lightRadius*0.95, lightDist);
-    \\    finalColor.rgb *= mix(vec3(0.74, 0.82, 1.10), vec3(1.10, 1.00, 0.86), core);
+    \\    // Rim leans sickly grey-green (not clean moonlight blue): the dark past the
+    \\    // flame should feel diseased, the core a touch more amber against it.
+    \\    finalColor.rgb *= mix(vec3(0.60, 0.72, 0.74), vec3(1.13, 0.99, 0.80), core);
+    \\    // MURK GRADE: drain saturation as the light thins — color lives near the
+    \\    // flame, the rim decays toward ashen monochrome before the fog takes over.
+    \\    float fLuma = dot(finalColor.rgb, vec3(0.299, 0.587, 0.114));
+    \\    finalColor.rgb = mix(finalColor.rgb, vec3(fLuma), 0.10 + 0.25*(1.0 - core));
     \\    // FOG OF WAR: persistent exploration at this ground point (0 unseen .. 1 seen).
     \\    // The arena spans [-fogHalf.x, fogHalf.x] on X and [-fogHalf.y, fogHalf.y]
     \\    // on Z; map that onto the [0,1] fog map (componentwise).
@@ -195,9 +272,9 @@ const sceneFS =
     \\    // SEEN: a dim, cool, desaturated memory of the lit terrain -- drained toward
     \\    // grey, tinted cool, and darkened -- clearly distinct from the warm active disc.
     \\    // Unseen ground (seen = 0) collapses to black, so the world genuinely hides.
-    \\    float luma = dot(finalColor.rgb, vec3(0.299, 0.587, 0.114));
-    \\    vec3 memory = mix(vec3(luma), finalColor.rgb, 0.25)*vec3(0.55, 0.70, 1.0);
-    \\    vec3 seenColor = memory*0.16*seen;
+    \\    float luma = dot(memBase, vec3(0.299, 0.587, 0.114));
+    \\    vec3 memory = mix(vec3(luma), memBase, 0.25)*vec3(0.50, 0.64, 0.62);
+    \\    vec3 seenColor = memory*0.14*seen;
     \\    finalColor.rgb = mix(seenColor, finalColor.rgb, litDisc);
     \\    // FIREBALL: a second moving light, added AFTER the fog blend so a fireball
     \\    // hurled into the dark still lights the walls + ground it flies past (even
@@ -279,6 +356,7 @@ pub const Torch = struct {
     loc_lightVP: i32,
     loc_lightRadius: i32,
     loc_lightColor: i32,
+    loc_floorMats: i32,
     loc_fogHalf: i32,
     loc_fireVP: i32,
     loc_firePos: i32,
@@ -301,7 +379,9 @@ pub const Torch = struct {
         const loc_lightColor = rl.getShaderLocation(scene, "lightColor");
         const lc = lightColorVec(DEFAULT_LIGHT);
         rl.setShaderValue(scene, loc_lightColor, &lc, .vec4);
-        const amb = [4]f32{ 0.6, 0.6, 0.7, 1.0 };
+        // Low, faintly sickly-green ambient: shadow pools stay near-black so the
+        // torch reads as the only honest light in a diseased night.
+        const amb = [4]f32{ 0.42, 0.50, 0.44, 1.0 };
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "ambient"), &amb, .vec4);
         const res: i32 = SHADOWMAP_RESOLUTION;
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "shadowMapResolution"), &res, .int);
@@ -310,6 +390,10 @@ pub const Torch = struct {
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "fireMapResolution"), &fres, .int);
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "fireMap"), &SLOT_FIRE, .int);
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "fogMap"), &SLOT_FOG, .int);
+        // Seed the floor set (dirt/grass/stone) so the shader is valid before the
+        // first area applies its own via setFloorSet.
+        const fm = [3]i32{ 0, 1, 2 };
+        rl.setShaderValue(scene, rl.getShaderLocation(scene, "floorMats"), &fm, .ivec3);
 
         return .{
             .shadowMap = shadowMap,
@@ -320,6 +404,7 @@ pub const Torch = struct {
             .loc_lightVP = rl.getShaderLocation(scene, "lightVP"),
             .loc_lightRadius = rl.getShaderLocation(scene, "lightRadius"),
             .loc_lightColor = loc_lightColor,
+            .loc_floorMats = rl.getShaderLocation(scene, "floorMats"),
             .loc_fogHalf = rl.getShaderLocation(scene, "fogHalf"),
             .loc_fireVP = rl.getShaderLocation(scene, "fireVP"),
             .loc_firePos = rl.getShaderLocation(scene, "firePos"),
@@ -430,6 +515,13 @@ pub const Torch = struct {
     pub fn setLightColor(self: *Torch, rgb: [3]f32) void {
         const lc = lightColorVec(rgb);
         rl.setShaderValue(self.scene, self.loc_lightColor, &lc, .vec4);
+    }
+
+    // The area's floor-material set (see world.FloorMat / the shader's matAlbedo).
+    // Once per area transition, like setLightColor.
+    pub fn setFloorSet(self: *Torch, fs: world.FloorSet) void {
+        const m = [3]i32{ @intFromEnum(fs[0]), @intFromEnum(fs[1]), @intFromEnum(fs[2]) };
+        rl.setShaderValue(self.scene, self.loc_floorMats, &m, .ivec3);
     }
 
     // Fog-of-war uniforms. Stash the map's GPU id for beginScene to bind on SLOT_FOG,

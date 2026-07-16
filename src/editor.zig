@@ -53,7 +53,7 @@ pub const Layer = enum(u8) {
 
 // Brush tables (last entry of every layer is its scoped eraser).
 const floorBrushes = [_][:0]const u8{ "Ledge", "Ramp", "Erase" };
-const decorBrushes = [_][:0]const u8{ "pebble", "tuft", "shroom", "bone", "Erase" };
+const decorBrushes = [_][:0]const u8{ "pebble", "tuft", "shroom", "bone", "bigshroom", "Erase" };
 const propBrushes = [_][:0]const u8{ "rock", "tree", "gravestone", "Erase" };
 const entityBrushes = [_][:0]const u8{ "pib pack", "zombie pack", "skeleton pack", "brute pack", "Boss", "Spawn", "Portal", "Erase" };
 
@@ -83,6 +83,7 @@ const decorTips = [_][:0]const u8{
     "Paint grass tufts (drag to sweep)",
     "Paint mushrooms (drag to sweep)",
     "Paint old bones (drag to sweep)",
+    "Paint oversized graveyard fungus (drag to sweep)",
     "Sweep-erase DECOR only ([ ] sets radius)",
 };
 const propTips = [_][:0]const u8{
@@ -264,14 +265,15 @@ var clipPackN: usize = 0;
 var clipHas = false;
 var selBankPending = false; // selection-move undo banks on first movement only
 
-// Palette presets applied in one click: ground, accent, and torch light together.
-const Preset = struct { name: [:0]const u8, ground: rl.Color, accent: rl.Color, light: [3]f32 };
+// Area-style presets applied in one click: the floor-material set and torch light
+// together (the ground look is materials now, not a color pair).
+const Preset = struct { name: [:0]const u8, floor: world.FloorSet, light: [3]f32 };
 const presets = [_]Preset{
-    .{ .name = "Moor", .ground = mapmod.DEFAULT_GROUND, .accent = mapmod.DEFAULT_ACCENT, .light = .{ 1.04, 0.94, 0.80 } },
-    .{ .name = "Plains", .ground = rgba(108, 120, 138, 255), .accent = rgba(86, 96, 112, 255), .light = .{ 0.90, 0.97, 1.08 } },
-    .{ .name = "Stony", .ground = rgba(96, 92, 80, 255), .accent = rgba(74, 70, 60, 255), .light = .{ 1.00, 0.96, 0.87 } },
-    .{ .name = "Wood", .ground = rgba(62, 58, 48, 255), .accent = rgba(48, 46, 38, 255), .light = .{ 0.88, 1.00, 0.88 } },
-    .{ .name = "Crypt", .ground = rgba(54, 46, 60, 255), .accent = rgba(40, 34, 46, 255), .light = .{ 0.93, 0.87, 1.08 } },
+    .{ .name = "Moor", .floor = mapmod.DEFAULT_FLOOR, .light = .{ 1.04, 0.94, 0.80 } },
+    .{ .name = "Plains", .floor = .{ .grass, .stone, .dirt }, .light = .{ 0.90, 0.97, 1.08 } },
+    .{ .name = "Stony", .floor = .{ .dirt, .stone, .cobble }, .light = .{ 1.00, 0.96, 0.87 } },
+    .{ .name = "Wood", .floor = .{ .mud, .grass, .dirt }, .light = .{ 0.88, 1.00, 0.88 } },
+    .{ .name = "Crypt", .floor = .{ .stone, .cobble, .bone }, .light = .{ 0.93, 0.87, 1.08 } },
 };
 
 // ---- Undo/redo: eager whole-map snapshots, cap 50 ----
@@ -498,6 +500,7 @@ pub fn apply(g: *Game) void {
     g.fog.revealAll(g.w.HalfW, g.w.HalfD);
     g.fog.sync();
     g.torch.setLightColor(g.map.light);
+    g.torch.setFloorSet(g.map.floor);
     g.monsterCount = 0;
     g.projs.count = 0;
     g.lootList.clearRetainingCapacity();
@@ -541,11 +544,18 @@ const BRUSH_R_STEP = 0.5;
 // map.sanitize's load tolerance on purpose: the loader accepts hand-edited maps the
 // UI won't author.
 const HALF_MIN = 18;
-const HALF_MAX = 48;
+const HALF_MAX = 120; // "epic map" ceiling, just under map.HALF_MAX's load tolerance
 const HALF_STEP = 4;
 // Members per pack (PACK panel stepper and pack-edit modal).
 const PACK_MIN = 1;
-const PACK_MAX = 8;
+const PACK_MAX = 32; // matches map.PACK_MEMBERS_MAX
+
+comptime {
+    // The invariant the two files share: the editor authors INSIDE what the loader
+    // tolerates, never past it.
+    std.debug.assert(HALF_MAX <= mapmod.HALF_MAX);
+    std.debug.assert(PACK_MAX <= mapmod.PACK_MEMBERS_MAX);
+}
 
 fn freePlace() bool {
     return rl.isKeyDown(.left_alt) or rl.isKeyDown(.right_alt);
@@ -624,6 +634,7 @@ fn decorSize(kind: world.DecorKind, h: f32) f32 {
         .tuft => 0.3 + h * 0.35,
         .shroom => 0.16 + h * 0.14,
         .bone => 0.25 + h * 0.25,
+        .bigshroom => 0.7 + h * 0.6, // oversized on purpose: reads at prop scale
     };
 }
 
@@ -985,8 +996,8 @@ fn scatterDecor(g: *Game) void {
         const roll = g.rng.float();
         // Tripwire: this weight chain names every DecorKind. A new variant would fold
         // silently into the `.bone` tail and never scatter, so force a revisit here.
-        comptime std.debug.assert(@typeInfo(world.DecorKind).@"enum".fields.len == 4);
-        const kind: world.DecorKind = if (roll < 0.36) .pebble else if (roll < 0.8) .tuft else if (roll < 0.92) .shroom else .bone;
+        comptime std.debug.assert(@typeInfo(world.DecorKind).@"enum".fields.len == 5);
+        const kind: world.DecorKind = if (roll < 0.34) .pebble else if (roll < 0.76) .tuft else if (roll < 0.88) .shroom else if (roll < 0.94) .bigshroom else .bone;
         m.decor[placed] = .{ .Kind = kind, .Pos = v3(x, 0, z), .Size = decorSize(kind, g.rng.float()) };
         placed += 1;
         m.decor_count = placed;
@@ -1931,18 +1942,18 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
         markDirty(g);
     }
     y += STEP_ROW_H;
-    hudx.text("palette", px + 10, y + 3, 15, withAlpha(theme.labelColor, 230));
+    hudx.text("floor", px + 10, y + 3, 15, withAlpha(theme.labelColor, 230));
     var sx = px + 76;
     for (presets) |p| {
         ui.tipFor(ctx, ui.rect(sx, y, 24, 22), p.name);
-        const active = g.map.ground.r == p.ground.r and g.map.ground.g == p.ground.g and g.map.ground.b == p.ground.b;
-        if (ui.swatch(ctx, sx, y, 24, 22, p.ground, p.accent, active)) {
+        const active = std.meta.eql(g.map.floor, p.floor);
+        // Swatch halves show the primary/secondary materials' base tones.
+        if (ui.swatch(ctx, sx, y, 24, 22, world.FloorMat.base(p.floor[0]), world.FloorMat.base(p.floor[1]), active)) {
             bankUndo(g);
-            g.map.ground = p.ground;
-            g.map.accent = p.accent;
+            g.map.floor = p.floor;
             g.map.light = p.light;
             markDirty(g);
-            ed.status("palette: {s}", .{p.name});
+            ed.status("floor: {s}", .{p.name});
         }
         sx += 28;
     }
@@ -2074,14 +2085,15 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     const ox = @as(f32, @floatFromInt(mx)) + (mmf - halfW * 2 * scale) / 2;
     const oy = @as(f32, @floatFromInt(my)) + (mmf - halfD * 2 * scale) / 2;
 
-    rl.drawRectangle(@intFromFloat(ox), @intFromFloat(oy), @intFromFloat(halfW * 2 * scale), @intFromFloat(halfD * 2 * scale), lerpColor(g.map.ground, rl.Color.black, 0.45));
+    const mmGround = world.FloorMat.base(g.map.floor[0]); // minimap keys off the primary floor material
+    rl.drawRectangle(@intFromFloat(ox), @intFromFloat(oy), @intFromFloat(halfW * 2 * scale), @intFromFloat(halfD * 2 * scale), lerpColor(mmGround, rl.Color.black, 0.45));
     for (g.map.ledges[0..g.map.ledge_count]) |l| {
         rl.drawRectangle(
             @intFromFloat(ox + (l.minX + halfW) * scale),
             @intFromFloat(oy + (l.minZ + halfD) * scale),
             @intFromFloat(@max((l.maxX - l.minX) * scale, 1)),
             @intFromFloat(@max((l.maxZ - l.minZ) * scale, 1)),
-            lerpColor(g.map.ground, rl.Color.white, 0.25),
+            lerpColor(mmGround, rl.Color.white, 0.25),
         );
     }
     for (g.map.ramps[0..g.map.ramp_count]) |r| {

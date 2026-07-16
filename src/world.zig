@@ -5,6 +5,38 @@ const mathx = @import("mathx.zig");
 const v3 = mathx.v3;
 const dist2XZ = mathx.dist2XZ;
 
+// FLOOR MATERIALS — the ground is real terrain, not a tinted plane. Each area names
+// three materials (primary, secondary patches, rare tertiary) and the scene shader
+// paints/blends them procedurally by world position (torchlight.zig matAlbedo — the
+// looks live THERE; base() below only mirrors each material's base tone for derived
+// tints and the editor minimap, so keep the two in sync).
+pub const FloorMat = enum(u8) {
+    dirt,
+    grass,
+    stone,
+    cobble,
+    mud,
+    bone,
+
+    pub fn base(m: FloorMat) rl.Color {
+        return switch (m) {
+            .dirt => rl.Color.init(60, 50, 37, 255),
+            .grass => rl.Color.init(41, 51, 28, 255),
+            .stone => rl.Color.init(61, 60, 56, 255),
+            .cobble => rl.Color.init(59, 56, 51, 255),
+            .mud => rl.Color.init(31, 25, 18, 255),
+            .bone => rl.Color.init(46, 42, 36, 255),
+        };
+    }
+};
+
+// primary / secondary / tertiary — repeat a name to narrow an area's variety.
+pub const FloorSet = [3]FloorMat;
+
+// Masonry tone for arena walls, ledge bodies, and ramp skirts — one stone for every
+// built structure now that the per-map accent palette is gone.
+pub const MASONRY = rl.Color.init(56, 54, 48, 255);
+
 // Blocking scenery; collision is circular in the XZ plane.
 pub const ObstacleKind = enum(u8) { rock, tree, gravestone };
 
@@ -16,12 +48,13 @@ pub const Obstacle = struct {
     Tint: rl.Color = rl.Color.white,
 };
 
-// Bounded scenery, so a fixed array (no allocator). Above any area's max.
-pub const MAX_OBSTACLES = 160;
+// Bounded scenery, so a fixed array (no allocator). Above any area's max — sized
+// for "epic" maps at the raised HALF_MAX playfield.
+pub const MAX_OBSTACLES = 512;
 
-// Decor is non-blocking ground dressing (pebbles/tufts/shrooms/bones): scale cues
-// only, no collision. Baked into the scene mesh with the obstacles.
-pub const DecorKind = enum(u8) { pebble, tuft, shroom, bone };
+// Decor is non-blocking ground dressing (pebbles/tufts/shrooms/bones/big fungus):
+// scale cues only, no collision. Baked into the scene mesh with the obstacles.
+pub const DecorKind = enum(u8) { pebble, tuft, shroom, bone, bigshroom };
 
 pub const Decor = struct {
     Pos: rl.Vector3 = mathx.zero3,
@@ -30,7 +63,7 @@ pub const Decor = struct {
     Tint: rl.Color = rl.Color.white,
 };
 
-pub const MAX_DECOR = 512;
+pub const MAX_DECOR = 2048;
 
 // TERRAIN — "ledge" verticality. World stays a SINGLE-VALUED heightfield (one
 // walkable height per XZ, nothing walkable underneath) — the constraint that keeps
@@ -94,15 +127,14 @@ pub const Ramp = struct {
     }
 };
 
-pub const MAX_LEDGES = 4;
-pub const MAX_RAMPS = 4;
+pub const MAX_LEDGES = 16;
+pub const MAX_RAMPS = 16;
 
 // Static level: extents, scenery, and the exit portal.
 pub const World = struct {
     HalfW: f32 = 0, // arena spans -HalfW..HalfW on X
     HalfD: f32 = 0, // ...and -HalfD..HalfD on Z (rectangular arenas welcome)
-    Ground: rl.Color = rl.Color.white,
-    Accent: rl.Color = rl.Color.white,
+    Floor: FloorSet = .{ .dirt, .grass, .stone },
     obstacles: [MAX_OBSTACLES]Obstacle = undefined,
     obstacle_count: usize = 0,
     decor: [MAX_DECOR]Decor = undefined,

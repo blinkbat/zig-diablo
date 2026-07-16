@@ -16,13 +16,15 @@ const lerpColor = mathx.lerpColor;
 // half a map). A line beginning with `#` is a comment (whole-line only — a `#` after
 // a payload is NOT stripped and will fail the trailing-data check).
 //
-//   version: 2
+//   version: 3
 //   name: The Blood Moor
 //   boss: Bishibosh
 //   size: 38 30                          (arena half-extents: width depth;
 //                                         legacy v1 "half: 38" loads as square)
-//   ground: 92 80 62
-//   accent: 72 62 50
+//   floor: grass dirt mud                (floor materials: primary secondary tertiary;
+//                                         see world.FloorMat. Replaces the old v1/v2
+//                                         ground/accent palette, which still parses
+//                                         but is discarded)
 //   light: 1.04 0.94 0.80
 //   spawn: 0 32
 //   portal: 0 -31
@@ -33,18 +35,19 @@ const lerpColor = mathx.lerpColor;
 //   decor: tuft 3.1 4.2 0.5              (kind x z size)
 //   pack: fallen 3 -10.5 12              (kind count x z)
 //
-// Tints are NOT stored: colors derive deterministically from the palette + a
-// position hash (same look every load).
+// Tints are NOT stored: colors derive deterministically from fixed environment tones
+// + a position hash (same look every load); the GROUND look is entirely the floor
+// materials, painted procedurally in the scene shader.
 
-pub const FORMAT_VERSION = 2; // v2: rectangular arenas (size: W D); v1 'half:' still loads
-pub const MAX_PACKS = 24;
-pub const MAX_MAPS = 16;
+pub const FORMAT_VERSION = 3; // v3: floor materials replace ground/accent; v1/v2 still load
+pub const MAX_PACKS = 64;
+pub const MAX_MAPS = 32;
 // Load-time clamps (see sanitize). Deliberately WIDER than the editor's steppers so
 // hand-edited/legacy maps stay welcome; the editor curates a tighter authoring range.
 pub const HALF_MIN = 12;
-pub const HALF_MAX = 60;
+pub const HALF_MAX = 128;
 pub const PACK_MEMBERS_MIN = 1;
-pub const PACK_MEMBERS_MAX = 16;
+pub const PACK_MEMBERS_MAX = 32;
 pub const ext = ".map";
 pub const bak_ext = ".bak"; // suffix of the pre-save backup copy
 pub const dir = "maps";
@@ -52,10 +55,9 @@ pub const dir = "maps";
 // editor's Ctrl+S target so none silently truncates.
 pub const PATH_CAP = 96;
 
-// Default moor palette, shared by Map field defaults and the editor's "Moor" preset
-// so a fresh map and the preset can't drift.
-pub const DEFAULT_GROUND = rgba(92, 80, 62, 255);
-pub const DEFAULT_ACCENT = rgba(72, 62, 50, 255);
+// Default moor floor set, shared by Map field defaults and the editor's "Moor"
+// preset so a fresh map and the preset can't drift.
+pub const DEFAULT_FLOOR: world.FloorSet = .{ .grass, .dirt, .mud };
 
 const alloc = std.heap.c_allocator;
 
@@ -81,8 +83,7 @@ pub const Map = struct {
     boss: StrBuf(monster.NAME_CAP) = .{}, // copied into Monster.name; caps must match
     halfW: f32 = 30,
     halfD: f32 = 30,
-    ground: rl.Color = DEFAULT_GROUND,
-    accent: rl.Color = DEFAULT_ACCENT,
+    floor: world.FloorSet = DEFAULT_FLOOR,
     light: [3]f32 = torchlight.DEFAULT_LIGHT,
     spawn: rl.Vector3 = v3(0, 0, 24),
     portal: rl.Vector3 = v3(0, 0, -23),
@@ -164,20 +165,32 @@ pub fn hashAt(x: f32, z: f32) f32 {
     return hash01(x, z, 7);
 }
 
+// Prop/decor tints: fixed creepy-moor tones hash-varied by position (the per-map
+// palette is gone; area identity comes from the floor materials + light color).
+// Organic decor keys off the PRIMARY floor material's base tone so grass reads as
+// part of its ground.
 fn obstacleTint(m: *const Map, kind: world.ObstacleKind, x: f32, z: f32) rl.Color {
+    _ = m;
     return switch (kind) {
-        .tree => lerpColor(m.accent, rgba(40, 70, 36, 255), 0.6),
-        .gravestone => lerpColor(rgba(86, 88, 98, 255), m.accent, 0.2 + hash01(x, z, 1) * 0.2),
-        .rock => lerpColor(m.accent, rgba(90, 90, 96, 255), 0.5),
+        .tree => lerpColor(rgba(56, 48, 38, 255), rgba(38, 52, 32, 255), hash01(x, z, 1)),
+        .gravestone => lerpColor(rgba(86, 88, 98, 255), rgba(52, 54, 48, 255), 0.2 + hash01(x, z, 1) * 0.3),
+        .rock => lerpColor(rgba(74, 72, 64, 255), rgba(52, 50, 46, 255), hash01(x, z, 1)),
     };
 }
 
 fn decorTint(m: *const Map, kind: world.DecorKind, x: f32, z: f32) rl.Color {
+    const groundTone = world.FloorMat.base(m.floor[0]);
     return switch (kind) {
-        .pebble => lerpColor(m.accent, rgba(140, 138, 132, 255), 0.3 + hash01(x, z, 2) * 0.4),
-        .tuft => lerpColor(m.ground, rgba(105, 140, 70, 255), 0.4 + hash01(x, z, 3) * 0.3),
+        .pebble => lerpColor(rgba(96, 92, 84, 255), rgba(66, 62, 56, 255), hash01(x, z, 2)),
+        .tuft => lerpColor(groundTone, rgba(105, 140, 70, 255), 0.4 + hash01(x, z, 3) * 0.3),
         .shroom => if (hash01(x, z, 4) < 0.5) rgba(214, 168, 96, 255) else rgba(190, 120, 130, 255),
-        .bone => lerpColor(rgba(212, 205, 185, 255), m.ground, 0.15 + hash01(x, z, 5) * 0.15),
+        .bone => lerpColor(rgba(212, 205, 185, 255), groundTone, 0.15 + hash01(x, z, 5) * 0.15),
+        // Rot tones for the oversized fungus: corpse-pale, gangrene-green, liver-brown.
+        .bigshroom => switch (@as(u8, @intFromFloat(hash01(x, z, 6) * 2.999))) {
+            0 => rgba(150, 140, 118, 255),
+            1 => rgba(112, 120, 86, 255),
+            else => rgba(96, 74, 56, 255),
+        },
     };
 }
 
@@ -188,8 +201,7 @@ pub fn toWorld(m: *const Map, isLast: bool) world.World {
     var w = world.World{
         .HalfW = m.halfW,
         .HalfD = m.halfD,
-        .Ground = m.ground,
-        .Accent = m.accent,
+        .Floor = m.floor,
         .PortalPos = v3(m.portal.x, 0, m.portal.z),
         .IsLast = isLast,
     };
@@ -224,8 +236,9 @@ const K = struct {
     const boss = "boss";
     const size = "size";
     const half = "half"; // legacy v1 square arena, read-only
-    const ground = "ground";
-    const accent = "accent";
+    const floor = "floor";
+    const ground = "ground"; // legacy v1/v2 palette, read-and-discarded
+    const accent = "accent"; // legacy v1/v2 palette, read-and-discarded
     const light = "light";
     const spawn = "spawn";
     const portal = "portal";
@@ -253,8 +266,7 @@ pub fn save(m: *const Map, path: []const u8) !void {
     try w.print(K.name ++ ": {s}\n", .{m.name.slice()});
     try w.print(K.boss ++ ": {s}\n", .{m.boss.slice()});
     try w.print(K.size ++ ": {d:.1} {d:.1}\n", .{ m.halfW, m.halfD });
-    try w.print(K.ground ++ ": {d} {d} {d}\n", .{ m.ground.r, m.ground.g, m.ground.b });
-    try w.print(K.accent ++ ": {d} {d} {d}\n", .{ m.accent.r, m.accent.g, m.accent.b });
+    try w.print(K.floor ++ ": {s} {s} {s}\n", .{ @tagName(m.floor[0]), @tagName(m.floor[1]), @tagName(m.floor[2]) });
     try w.print(K.light ++ ": {d:.2} {d:.2} {d:.2}\n", .{ m.light[0], m.light[1], m.light[2] });
     try w.print(K.spawn ++ ": {d:.1} {d:.1}\n", .{ m.spawn.x, m.spawn.z });
     try w.print(K.portal ++ ": {d:.1} {d:.1}\n", .{ m.portal.x, m.portal.z });
@@ -365,10 +377,12 @@ pub fn load(path: []const u8) LoadError!Map {
             // Legacy v1 square arena: one extent for both axes.
             m.halfW = nextF32(&it) catch return fail(lineNo, line, "bad half");
             m.halfD = m.halfW;
-        } else if (std.mem.eql(u8, key, K.ground)) {
-            m.ground = nextColor(&it) catch return fail(lineNo, line, "bad ground");
-        } else if (std.mem.eql(u8, key, K.accent)) {
-            m.accent = nextColor(&it) catch return fail(lineNo, line, "bad accent");
+        } else if (std.mem.eql(u8, key, K.floor)) {
+            for (&m.floor) |*fm| fm.* = nextEnum(world.FloorMat, &it) catch return fail(lineNo, line, "bad floor material");
+        } else if (std.mem.eql(u8, key, K.ground) or std.mem.eql(u8, key, K.accent)) {
+            // Legacy v1/v2 palette: parse (so trailing-data checks still bite) and
+            // discard — the floor materials own the ground look now.
+            _ = nextColor(&it) catch return fail(lineNo, line, "bad legacy palette");
         } else if (std.mem.eql(u8, key, K.light)) {
             for (0..3) |i| m.light[i] = nextF32(&it) catch return fail(lineNo, line, "bad light");
         } else if (std.mem.eql(u8, key, K.spawn)) {

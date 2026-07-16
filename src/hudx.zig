@@ -490,68 +490,175 @@ fn drawCharTabs(g: *Game, cy: i32) void {
     padBumper(xStart + total + 34, cyMid, "R1");
 }
 
-// The Skills page: each controller button is a slot you fill with a skill. The button
-// glyph over each well is its in-play button; the focused slot cycles its skill on the
-// d-pad (or A). Mouse mirrors it (hover focuses; click/scroll cycles; right-click clears).
-// Bindings persist on close.
+// The Skills page: a row of six button-slots (your loadout) over a pool of every skill —
+// a glanceable spellbook. Pick a button (left/right), drop into the pool (down), and A
+// binds the focused skill onto that button (A on the skill already there clears it). Each
+// placed skill wears the badge of its button, so at a glance you see what's bound where.
+// Mouse mirrors it (hover focuses; left-click binds/toggles; right-click clears). Persists
+// on close.
 fn drawSkillsTab(g: *Game, px: i32, py: i32, pw: i32, ph: i32) void {
-    _ = px;
-    _ = pw;
     const p = &g.p;
-    const W = sw();
-    centered("Skill Loadout", py + 56, 26, sheetGold);
-    centered("Choose what each button does. Changes save automatically.", py + 92, 15, withAlpha(sheetDim, 220));
+    centered("Skill Loadout", py + 56, 24, sheetGold);
+    centered("Pick a button, then choose its skill from the pool. Changes save automatically.", py + 90, 14, withAlpha(sheetDim, 220));
 
     const mouse = rl.getMousePosition();
     const md = rl.getMouseDelta();
     const mouseMoving = (md.x != 0 or md.y != 0);
-    const wheel = rl.getMouseWheelMove();
 
-    const size: i32 = 66;
-    const gap: i32 = 26;
-    const total: i32 = playermod.SKILL_SLOTS * size + (playermod.SKILL_SLOTS - 1) * gap;
-    const x0 = @divTrunc(W, 2) - @divTrunc(total, 2);
-    var x = x0;
-    const sy = py + 176;
-    const glyphY = sy - 22; // button glyph rides above each well
+    // ── Button-slot row (the loadout) ──
+    const slots: i32 = playermod.SKILL_SLOTS;
+    const ssize: i32 = 62;
+    const sgap: i32 = 26;
+    const srowW: i32 = slots * ssize + (slots - 1) * sgap;
+    const sx0 = px + @divTrunc(pw - srowW, 2);
+    const sy = py + 152;
+    const glyphY = sy - 20; // button glyph rides above each well
+    var sx = sx0;
     var i: usize = 0;
     while (i < playermod.SKILL_SLOTS) : (i += 1) {
-        const r = rl.Rectangle{ .x = fi(x), .y = fi(sy), .width = fi(size), .height = fi(size) };
+        const r = rl.Rectangle{ .x = fi(sx), .y = fi(sy), .width = fi(ssize), .height = fi(ssize) };
         const hot = rl.checkCollisionPointRec(mouse, r);
-        if (hot and mouseMoving) g.skillSel = @intCast(i); // mouse moves the focus too
-        const focused = g.skillSel == @as(i32, @intCast(i));
-        if (hot) {
-            if (rl.isMouseButtonPressed(.left)) p.bar.cycle(i, 1);
-            if (rl.isMouseButtonPressed(.right)) p.bar.assign(i, null);
-            if (wheel != 0) p.bar.cycle(i, if (wheel > 0) 1 else -1);
+        if (hot and mouseMoving) {
+            g.skillZone = .slots;
+            g.skillSel = @intCast(i);
         }
-        // Prominent button glyph above the well; a warm disc marks the focused one.
-        const gcx = x + @divTrunc(size, 2);
-        if (focused) rl.drawCircleV(.{ .x = fi(gcx), .y = fi(glyphY) }, 19, withAlpha(theme.highlightColor, 90));
+        if (hot) {
+            if (rl.isMouseButtonPressed(.left)) {
+                g.skillZone = .slots;
+                g.skillSel = @intCast(i); // click just focuses the button; pick its skill below
+            }
+            if (rl.isMouseButtonPressed(.right)) p.bar.assign(i, null); // clear it
+        }
+        const chosen = g.skillSel == @as(i32, @intCast(i));
+        const focused = chosen and g.skillZone == .slots;
+        // Button glyph above the well; a warm disc marks the chosen button — bright while the
+        // cursor is up here, faint while you're browsing the pool (so you still see the target).
+        const gcx = sx + @divTrunc(ssize, 2);
+        if (chosen) rl.drawCircleV(.{ .x = fi(gcx), .y = fi(glyphY) }, 18, withAlpha(theme.highlightColor, if (focused) 110 else 50));
         slotGlyph(i, gcx, glyphY, 13);
-        drawSkillSlot(x, sy, size, null, p.bar.slots[i], null);
+        drawSkillSlot(sx, sy, ssize, null, p.bar.slots[i], null, 1.65);
         if (focused) {
             rl.drawRectangleRoundedLinesEx(r, SLOT_ROUND, SLOT_SEG, 3, withAlpha(theme.highlightColor, 235));
+        } else if (chosen) {
+            rl.drawRectangleRoundedLinesEx(r, SLOT_ROUND, SLOT_SEG, 2, withAlpha(theme.highlightColor, 130));
         } else if (hot) {
-            rl.drawRectangleRoundedLinesEx(r, SLOT_ROUND, SLOT_SEG, 2, withAlpha(theme.highlightColor, 150));
+            rl.drawRectangleRoundedLinesEx(r, SLOT_ROUND, SLOT_SEG, 2, withAlpha(theme.highlightColor, 120));
         }
         const nm: [:0]const u8 = if (p.bar.slots[i]) |s| s.label() else "empty";
-        textCenteredIn(nm, x, size, sy + size + 8, 15, if (p.bar.slots[i] != null) sheetInk else rgba(150, 140, 128, 200));
-        x += size + gap;
+        textCenteredIn(nm, sx, ssize, sy + ssize + 6, 13, if (p.bar.slots[i] != null) sheetInk else rgba(150, 140, 128, 200));
+        sx += ssize + sgap;
     }
 
-    // What the focused button does, in one friendly line.
-    const focusedSkill = p.bar.slots[@intCast(g.skillSel)];
-    const blurb: [:0]const u8 = if (focusedSkill) |s| s.blurb() else "This button is unused. Give it a skill to fill it.";
-    centered(blurb, sy + size + 44, 16, rgba(214, 202, 180, 235));
+    // ── "Available Skills" heading, with flanking rules ──
+    const hdrY = sy + ssize + 34;
+    const hdr = "Available Skills";
+    const hw = textW(hdr, 15);
+    centered(hdr, hdrY, 15, withAlpha(sheetGold, 230));
+    const hcy = hdrY + @as(i32, @intFromFloat(fsize(15) * 0.5));
+    const ruleHalf = @divTrunc(pw - 96, 2);
+    const gapToText = @divTrunc(hw, 2) + 14;
+    rl.drawRectangle(px + 48, hcy, ruleHalf - gapToText, 1, withAlpha(theme.trimColor, 90));
+    rl.drawRectangle(@divTrunc(sw(), 2) + gapToText, hcy, ruleHalf - gapToText, 1, withAlpha(theme.trimColor, 90));
 
-    // Footer — controller prompts only (the pad is the primary path; keyboard/mouse still work).
-    const hints = [_]Hint{
-        .{ .glyph = .{ .dpad = .leftright }, .label = "choose button" },
-        .{ .glyph = .{ .dpad = .updown }, .label = "change skill" },
-        .{ .glyph = .{ .face = .b }, .label = "back" },
+    // ── Skill pool grid ──
+    const cols: i32 = gamemod.SKILL_POOL_COLS;
+    const pmargin: i32 = 40;
+    const innerW = pw - pmargin * 2;
+    const cellGap: i32 = 12;
+    const cellW = @divTrunc(innerW - (cols - 1) * cellGap, cols);
+    const cellH: i32 = 70;
+    const rowGap: i32 = 12;
+    const poolX0 = px + pmargin;
+    const poolY0 = hdrY + 32;
+    var j: usize = 0;
+    while (j < playermod.Skill.count) : (j += 1) {
+        const s = playermod.Skill.all[j];
+        const ji: i32 = @intCast(j);
+        const cx = poolX0 + @mod(ji, cols) * (cellW + cellGap);
+        const cy = poolY0 + @divTrunc(ji, cols) * (cellH + rowGap);
+        const cell = rl.Rectangle{ .x = fi(cx), .y = fi(cy), .width = fi(cellW), .height = fi(cellH) };
+        const hot = rl.checkCollisionPointRec(mouse, cell);
+        if (hot and mouseMoving) {
+            g.skillZone = .pool;
+            g.skillPoolSel = ji;
+        }
+        const boundSlot = p.bar.slotOf(s);
+        if (hot) {
+            if (rl.isMouseButtonPressed(.left)) {
+                g.skillZone = .pool;
+                g.skillPoolSel = ji;
+                const slot: usize = @intCast(g.skillSel);
+                p.bar.assign(slot, if (p.bar.slots[slot] == s) null else s); // toggle onto chosen button
+            }
+            if (rl.isMouseButtonPressed(.right)) {
+                if (boundSlot) |bs| p.bar.assign(bs, null); // unbind from wherever it sits
+            }
+        }
+        const focused = g.skillZone == .pool and g.skillPoolSel == ji;
+        drawPoolChip(cell, s, boundSlot, focused);
+    }
+
+    // ── Blurb: what the focused thing does, in one friendly line ──
+    const focusedSkill: ?playermod.Skill = switch (g.skillZone) {
+        .slots => p.bar.slots[@intCast(g.skillSel)],
+        .pool => playermod.Skill.all[@intCast(g.skillPoolSel)],
     };
-    hintRow(&hints, py + ph - 34, 15, withAlpha(sheetDim, 235));
+    const blurbY = poolY0 + 2 * (cellH + rowGap) + 4;
+    const blurb: [:0]const u8 = if (focusedSkill) |s| s.blurb() else "This button is unused. Drop a skill onto it from the pool below.";
+    centered(blurb, blurbY, 15, rgba(214, 202, 180, 235));
+
+    // ── Footer — controller prompts (pad is primary; KBM mirrors). Prompts change with the
+    // zone so the current gesture is always shown.
+    if (g.skillZone == .slots) {
+        const hints = [_]Hint{
+            .{ .glyph = .{ .dpad = .leftright }, .label = "choose button" },
+            .{ .glyph = .{ .dpad = .down }, .label = "to skill pool" },
+            .{ .glyph = .{ .face = .b }, .label = "back" },
+        };
+        hintRow(&hints, py + ph - 30, 14, withAlpha(sheetDim, 235));
+    } else {
+        const hints = [_]Hint{
+            .{ .glyph = .{ .dpad = .updown }, .label = "browse skills" },
+            .{ .glyph = .{ .face = .a }, .label = "bind to button" },
+            .{ .glyph = .{ .face = .b }, .label = "back to buttons" },
+        };
+        hintRow(&hints, py + ph - 30, 14, withAlpha(sheetDim, 235));
+    }
+}
+
+// One pool chip: a rounded cell with the skill's emblem in a mini well, its name below,
+// and — when the skill is bound — the badge of the button it lives on (top-right) over a
+// warmer seat, so "already on the bar" and "which button" both read at a glance. The
+// focused chip gets a gold frame.
+fn drawPoolChip(cell: rl.Rectangle, s: playermod.Skill, boundSlot: ?usize, focused: bool) void {
+    const bound = boundSlot != null;
+    rl.drawRectangleRounded(cell, 0.16, 6, if (bound) rgba(30, 24, 18, 222) else rgba(15, 12, 12, 200));
+
+    const cellX: i32 = @intFromFloat(cell.x);
+    const cellY: i32 = @intFromFloat(cell.y);
+    const cellW: i32 = @intFromFloat(cell.width);
+    const wellSize: i32 = 40;
+    const wellX = cellX + @divTrunc(cellW - wellSize, 2);
+    drawSkillSlot(wellX, cellY + 8, wellSize, null, s, null, 1.3);
+
+    // Name under the well; the long names drop a size so they don't clip the cell.
+    const nm = s.label();
+    const nsize: i32 = if (textW(nm, 13) > cellW - 8) 12 else 13;
+    textCenteredIn(nm, cellX, cellW, cellY + 50, nsize, if (bound) sheetInk else withAlpha(sheetInk, 205));
+
+    // Button badge (top-right) for a bound skill — the same glyph the slot row + HUD use.
+    if (boundSlot) |bs| {
+        const bcx = cellX + cellW - 15;
+        const bcy = cellY + 14;
+        rl.drawCircleV(.{ .x = fi(bcx), .y = fi(bcy) }, 12, rgba(10, 8, 7, 210)); // seat under the badge
+        slotGlyph(bs, bcx, bcy, 9);
+    }
+
+    if (focused) {
+        rl.drawRectangleRoundedLinesEx(cell, 0.16, 6, 3, withAlpha(theme.highlightColor, 235));
+    } else {
+        rl.drawRectangleRoundedLinesEx(cell, 0.16, 6, 1, withAlpha(theme.trimColor, if (bound) 150 else 80));
+    }
 }
 
 // The Stats page (attributes/skills allocation + derived readout) — the former sheet.
@@ -923,6 +1030,23 @@ fn skillEmblem(cx: i32, cy: i32, s: playermod.Skill, col: rl.Color) void {
     }
 }
 
+// Draw a skill emblem magnified by `k` about its center. The emblems are authored at a
+// fixed ~24px extent, so a big well (the loadout slots, the pool chips) would otherwise
+// leave them tiny and lost. Scaling through the GL matrix keeps the vector shapes crisp
+// instead of upscaling a bitmap. k == 1 is the authored size (the live HUD bar).
+fn skillEmblemScaled(cx: i32, cy: i32, s: playermod.Skill, col: rl.Color, k: f32) void {
+    if (k == 1.0) {
+        skillEmblem(cx, cy, s, col);
+        return;
+    }
+    rl.gl.rlPushMatrix();
+    defer rl.gl.rlPopMatrix();
+    rl.gl.rlTranslatef(fi(cx), fi(cy), 0);
+    rl.gl.rlScalef(k, k, 1);
+    rl.gl.rlTranslatef(-fi(cx), -fi(cy), 0);
+    skillEmblem(cx, cy, s, col);
+}
+
 // Is the skill usable right now? Combat skills gate on cooldown (and Firebolt on mana);
 // potions on whether any are left in the belt.
 fn skillReady(p: *const Player, s: playermod.Skill) bool {
@@ -977,14 +1101,14 @@ const SLOT_SEG: i32 = 6;
 // `p` is non-null (the live HUD bar) it also shows the cooldown wipe and an out-of-mana
 // veil; null draws it statically. `slot` null omits the badge (the assignment screen
 // draws its own larger glyph above the slot).
-fn drawSkillSlot(x: i32, y: i32, size: i32, slot: ?usize, skill: ?playermod.Skill, p: ?*const Player) void {
+fn drawSkillSlot(x: i32, y: i32, size: i32, slot: ?usize, skill: ?playermod.Skill, p: ?*const Player, emScale: f32) void {
     const rect = rl.Rectangle{ .x = fi(x), .y = fi(y), .width = fi(size), .height = fi(size) };
     rl.drawRectangleRounded(rect, SLOT_ROUND, SLOT_SEG, rgba(12, 9, 8, 225));
     if (skill) |s| {
         const ready = if (p) |pp| skillReady(pp, s) else true;
         const base = skillColor(s);
         const col = if (ready) base else lerpColor(base, rgba(40, 40, 44, 255), 0.55);
-        skillEmblem(x + @divTrunc(size, 2), y + @divTrunc(size, 2), s, col);
+        skillEmblemScaled(x + @divTrunc(size, 2), y + @divTrunc(size, 2), s, col, emScale);
         if (p) |pp| {
             cooldownSweep(x, y, size, skillCooldownFrac(pp, s));
             const cost = s.manaCost();
@@ -1035,7 +1159,7 @@ fn drawSkillBar(g: *const Game, cx: i32, y: i32) void {
     var x = x0;
     var i: usize = 0;
     while (i < playermod.SKILL_SLOTS) : (i += 1) {
-        drawSkillSlot(x, y, size, i, g.p.bar.slots[i], &g.p);
+        drawSkillSlot(x, y, size, i, g.p.bar.slots[i], &g.p, 1.0);
         x += size + gap;
     }
 }

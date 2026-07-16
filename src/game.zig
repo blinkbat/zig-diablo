@@ -39,7 +39,7 @@ const maxF = mathx.maxF;
 
 const alloc = std.heap.c_allocator;
 
-const MAX_MONSTERS = 128;
+const MAX_MONSTERS = 512; // sized for "epic" maps (64 packs x up to 32 members, capped)
 // Firebolt cooldown/crit come from the RPG layer: p.castRate, p.derived.critChance,
 // stats.CRIT_MULT. See stats.zig / player.zig.
 
@@ -90,7 +90,7 @@ const LEVELUP_BANNER_DUR = 2.2;
 
 // Fixed-capacity projectile pool (arrows + firebolts); no allocator needed.
 const ProjList = struct {
-    buf: [256]Projectile = undefined,
+    buf: [1024]Projectile = undefined,
     count: usize = 0,
     fn add(self: *ProjList, p: Projectile) void {
         if (self.count < self.buf.len) {
@@ -104,8 +104,8 @@ const ProjList = struct {
 };
 
 // A slain zombie's miasma: stationary poison cloud that ticks damage inside it.
-// Fixed capacity; overflow drops the NEW cloud (needs 24 corpses gassing at once).
-const MAX_GAS = 24;
+// Fixed capacity; overflow drops the NEW cloud (needs 64 corpses gassing at once).
+const MAX_GAS = 64;
 const GAS_RADIUS = 2.2; // the DoT footprint — the drawn blobs must visually fill it
 const GAS_LIFE = 7.0;
 const GAS_GROW = 0.5; // seconds to billow to full size
@@ -189,6 +189,9 @@ pub const SHEET_ROW_COUNT: i32 = SHEET_ATTR_COUNT + @as(i32, @intCast(sheetSkill
 // Character screen pages. Stats = attributes/skills/derived (as before); Skills = the
 // reassignable bar. Both keyboard and gamepad drive every page (see updateCharScreen).
 pub const CharTab = enum { stats, skills };
+// The Skills-loadout cursor lives in one of two zones: the button-slot row (choose which
+// button you're setting) or the skill pool below it (choose the skill to bind there).
+pub const SkillZone = enum { slots, pool };
 
 // Where the persisted loadout lives (CWD, like lightlog.txt). A small `version:`-headed
 // config; see playermod.SkillBar.save/load.
@@ -200,7 +203,13 @@ pub const SKILLBAR_PATH = "skillbar.cfg";
 fn updateCharScreen(g: *Game, altHeld: bool) void {
     if (input.charTabTogglePressed()) g.charTab = if (g.charTab == .stats) .skills else .stats;
     if (input.cancel()) {
-        g.closeCharScreen();
+        // On the Skills pool, B is "back one level" — return to the button row; a second B
+        // (from the row) closes the screen. Everywhere else B closes.
+        if (g.charTab == .skills and g.skillZone == .pool) {
+            g.skillZone = .slots;
+        } else {
+            g.closeCharScreen();
+        }
         return;
     }
     switch (g.charTab) {
@@ -228,14 +237,54 @@ fn updateStatsTab(g: *Game, altHeld: bool) void {
     }
 }
 
-// Skills page: the d-pad's left/right move the focused button; up/down (or A) cycle the
-// skill on it. The mouse mirrors this in hudx, but the pad is the primary path.
+// Skills page: pick a button in the top slot row (left/right), drop into the pool below
+// (down), browse every skill (d-pad), and A binds the focused skill onto the chosen
+// button — pressing A on the skill already there clears the button (toggle). Up from the
+// pool's top row returns to the slots. The mouse mirrors this in hudx (secondary path).
+pub const SKILL_POOL_COLS = 5;
 fn updateSkillsTab(g: *Game, altHeld: bool) void {
-    const n: i32 = playermod.SKILL_SLOTS;
-    if (input.navLeft()) g.skillSel = navWrap(g.skillSel, -1, n);
-    if (input.navRight()) g.skillSel = navWrap(g.skillSel, 1, n);
-    if (input.navDown() or input.confirm(altHeld)) g.p.bar.cycle(@intCast(g.skillSel), 1);
-    if (input.navUp()) g.p.bar.cycle(@intCast(g.skillSel), -1);
+    const slots: i32 = playermod.SKILL_SLOTS;
+    const count: i32 = playermod.Skill.count;
+    const cols: i32 = SKILL_POOL_COLS;
+    switch (g.skillZone) {
+        .slots => {
+            if (input.navLeft()) g.skillSel = navWrap(g.skillSel, -1, slots);
+            if (input.navRight()) g.skillSel = navWrap(g.skillSel, 1, slots);
+            // Drop into the pool; land the cursor on the button's current skill (if any)
+            // so A immediately toggles it, else on the first chip.
+            if (input.navDown() or input.confirm(altHeld)) {
+                g.skillZone = .pool;
+                // Land on the button's current skill (so A toggles it off), else chip 0.
+                g.skillPoolSel = if (g.p.bar.slots[@intCast(g.skillSel)]) |s| poolIndexOf(s) else 0;
+            }
+        },
+        .pool => {
+            if (input.navLeft()) g.skillPoolSel = navWrap(g.skillPoolSel, -1, count);
+            if (input.navRight()) g.skillPoolSel = navWrap(g.skillPoolSel, 1, count);
+            if (input.navUp()) {
+                if (g.skillPoolSel < cols) g.skillZone = .slots // back up to the button row
+                else g.skillPoolSel -= cols;
+            }
+            if (input.navDown()) {
+                if (g.skillPoolSel + cols < count) g.skillPoolSel += cols;
+            }
+            if (input.confirm(altHeld)) {
+                const s = playermod.Skill.all[@intCast(g.skillPoolSel)];
+                const slot: usize = @intCast(g.skillSel);
+                // Toggle: the skill already on this button clears it; anything else binds
+                // (assign pulls it off its old button, keeping each skill unique).
+                g.p.bar.assign(slot, if (g.p.bar.slots[slot] == s) null else s);
+            }
+        },
+    }
+}
+
+// The pool draws player.Skill.all in order, so a skill's pool index is its position there.
+fn poolIndexOf(s: playermod.Skill) i32 {
+    for (playermod.Skill.all, 0..) |e, i| {
+        if (e == s) return @intCast(i);
+    }
+    return 0;
 }
 
 // Switch display mode, unwinding the active mode first (raylib toggles are on/off latches).
@@ -405,7 +454,11 @@ pub const Game = struct {
     // Character-screen page + skill-tab focus. The screen is `sheetOpen`; charTab picks
     // the page; skillSel is the focused bar slot on the Skills tab.
     charTab: CharTab = .stats,
-    skillSel: i32 = 0,
+    skillSel: i32 = 0, // focused button slot (0..SKILL_SLOTS) on the Skills tab
+    // Skills tab, pool model: which zone the cursor is in and the focused pool chip
+    // (index into player.Skill.all). Bind = drop the focused pool skill into skillSel.
+    skillZone: SkillZone = .slots,
+    skillPoolSel: i32 = 0,
     // Persisted loadout: loaded once at init, applied to each fresh hero, saved on every
     // change. Survives runs and app restarts.
     loadout: playermod.SkillBar = playermod.SkillBar.default(),
@@ -480,6 +533,7 @@ pub const Game = struct {
         g.p.bar = g.loadout;
         g.areaIndex = 0;
         g.torch.setLightColor(g.map.light);
+        g.torch.setFloorSet(g.map.floor);
         g.spawnPacks();
         teleportHero(&g, g.p.Pos);
         g.setBanner(AREA_BANNER_DUR, "{s}", .{g.map.name.slice()});
@@ -536,6 +590,7 @@ pub const Game = struct {
         g.map = g.loadMapAt(g.areaIndex);
         g.w = mapmod.toWorld(&g.map, g.areaIndex == g.lastArea);
         g.torch.setLightColor(g.map.light); // each floor gets its own night
+        g.torch.setFloorSet(g.map.floor); // ...and its own ground materials
         g.sceneMesh.rebuild(&g.w);
         resetArena(g); // dynamic bodies, FX pools, fog, presentation timers, packs
         g.p.resetCombatState(); // no roll/stun/swing carries across the portal
@@ -550,7 +605,7 @@ pub const Game = struct {
     fn spawnPacks(g: *Game) void {
         const tier: i32 = @intCast(g.areaIndex);
         // Boss FIRST so the champion always claims a slot: an editor/hand-authored map
-        // whose packs exceed MAX_MONSTERS (24 packs x up to 16 = 384) must drop
+        // whose packs exceed MAX_MONSTERS (64 packs x up to 32 = 2048) must drop
         // rank-and-file, never the boss — else the area "clears" with no champion.
         g.spawn(monster.makeBoss(tier, g.map.boss.slice(), &g.rng, g.randomOpenTileNear(g.map.bossPos, 3)));
         for (g.map.packList()) |pk| {
@@ -630,6 +685,8 @@ pub const Game = struct {
         g.sheetOpen = false;
         g.charTab = .stats;
         g.skillSel = 0;
+        g.skillZone = .slots;
+        g.skillPoolSel = 0;
     }
 
     /// Close the character screen, persisting the loadout if the bindings changed. The
@@ -2133,7 +2190,7 @@ pub fn drawWalls(w: *const world.World) void {
     const hd = w.HalfD;
     const wallH = 4.0;
     const t = 1.2;
-    const col = w.Accent;
+    const col = world.MASONRY; // one stone for all built structure (palette is gone)
     // North/south walls run the WIDTH; east/west run the DEPTH (rect arenas).
     const segs = [_]rl.Vector3{
         v3(0, wallH / 2, -hd), v3(0, wallH / 2, hd),
@@ -3109,8 +3166,7 @@ pub fn beginSceneFrame(g: *Game, cam: rl.Camera3D, lp: tl.LightParams, fp: tl.Fi
     g.torch.beginScene();
     // beginScene left the shadow map active on slot 10; reset to 0 so immediate-mode binds land on slot 0.
     rl.gl.rlActiveTextureSlot(0);
-    g.sceneMesh.drawScene();
-    rl.drawPlane(v3(0, 0, 0), rl.Vector2.init(g.w.HalfW * 2, g.w.HalfD * 2), g.w.Ground);
+    g.sceneMesh.drawScene(); // includes the floor quad (material field; no drawPlane)
     drawWalls(&g.w);
 }
 
@@ -3316,12 +3372,27 @@ pub fn run(shot: bool) void {
                         g.p.attrPoints = 5;
                         g.p.skillPoints = 1;
                         g.sheetOpen = true;
+                        g.charTab = .stats;
+                        continue;
+                    }
+                    // Skills loadout — the button row + skill pool, focus on the button row…
+                    if (ei == 1) {
+                        g.charTab = .skills;
+                        g.skillZone = .slots;
+                        g.skillSel = 0;
+                        continue;
+                    }
+                    // …then with the cursor down in the pool, so the pool-focus styling shows.
+                    if (ei == 2) {
+                        g.charTab = .skills;
+                        g.skillZone = .pool;
+                        g.skillPoolSel = 3; // Firebolt — a bound chip, so its badge shows
                         continue;
                     }
                     g.sheetOpen = false; // close it before the full-screen scene shots
                     // Then each full-screen scene (editor last, entered properly so it loads + applies).
                     const extraScenes = [_]Scene{ .menu, .dead, .victory, .editor };
-                    const si = ei - 1;
+                    const si = ei - 3;
                     if (si >= extraScenes.len) break;
                     if (extraScenes[si] == .editor) {
                         g.areaIndex = 0;

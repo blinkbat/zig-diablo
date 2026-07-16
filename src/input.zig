@@ -100,19 +100,101 @@ pub fn charTabTogglePressed() bool {
 }
 
 // ── Menu / UI navigation (keyboard + gamepad) ──
-// Edge-triggered via the d-pad (raylib debounces it) + arrows/WASD. The left stick
-// is reserved for gameplay movement, so menus use the d-pad (no repeat-state to track).
+// Edge-triggered via the d-pad (raylib debounces it) + arrows/WASD, PLUS the left stick.
+// The stick is the movement control in play, but menus freeze the world and never run the
+// gameplay branch, so borrowing it here can't clash with steering. Because the stick is
+// analog it has no built-in press edge, so `stickNavEdge` synthesizes one (with hold-to-
+// repeat); the d-pad and keys keep their own native edges.
 pub fn navUp() bool {
-    return rl.isKeyPressed(.up) or rl.isKeyPressed(.w) or padPressed(.left_face_up);
+    return rl.isKeyPressed(.up) or rl.isKeyPressed(.w) or padPressed(.left_face_up) or stickNavEdge(.up);
 }
 pub fn navDown() bool {
-    return rl.isKeyPressed(.down) or rl.isKeyPressed(.s) or padPressed(.left_face_down);
+    return rl.isKeyPressed(.down) or rl.isKeyPressed(.s) or padPressed(.left_face_down) or stickNavEdge(.down);
 }
 pub fn navLeft() bool {
-    return rl.isKeyPressed(.left) or rl.isKeyPressed(.a) or padPressed(.left_face_left);
+    return rl.isKeyPressed(.left) or rl.isKeyPressed(.a) or padPressed(.left_face_left) or stickNavEdge(.left);
 }
 pub fn navRight() bool {
-    return rl.isKeyPressed(.right) or rl.isKeyPressed(.d) or padPressed(.left_face_right);
+    return rl.isKeyPressed(.right) or rl.isKeyPressed(.d) or padPressed(.left_face_right) or stickNavEdge(.right);
+}
+
+// Discrete menu steps from the analog left stick. It fires once when the stick crosses
+// past NAV_ENGAGE, then hold-to-repeat kicks in (a slow first repeat, then faster) so a
+// long list scrolls without a wall of flicks; it must fall back under NAV_RELEASE to
+// re-arm, and the gap between the two thresholds (hysteresis) swallows jitter at the edge.
+// Each direction latches independently, so a diagonal can't cross-fire. State is module
+// scope because these predicates are the only per-frame stick reads on a menu surface.
+const NAV_ENGAGE = 0.5; // tilt past this to register a step
+const NAV_RELEASE = 0.35; // must fall back under this to arm the next step
+const NAV_REPEAT_DELAY = 0.40; // held this long before the first auto-repeat
+const NAV_REPEAT_RATE = 0.11; // then one step every this many seconds
+
+const NavDir = enum(usize) { up, down, left, right };
+var navArmed = [_]bool{true} ** 4; // ready to fire (stick is below the release threshold)
+var navNextRepeat = [_]f64{0} ** 4;
+
+// Signed tilt toward `dir` (matches stickXZ: up = -Y, left = -X). 0 without a controller.
+fn stickAmount(dir: NavDir) f32 {
+    if (!padAvail()) return 0;
+    const x = rl.getGamepadAxisMovement(PAD, .left_x);
+    const y = rl.getGamepadAxisMovement(PAD, .left_y);
+    return switch (dir) {
+        .up => -y,
+        .down => y,
+        .left => -x,
+        .right => x,
+    };
+}
+
+fn stickNavEdge(dir: NavDir) bool {
+    const i = @intFromEnum(dir);
+    return navTick(stickAmount(dir), rl.getTime(), &navArmed[i], &navNextRepeat[i]);
+}
+
+// The edge/repeat state machine, kept raylib-free so the timing logic is testable in
+// isolation (the rl axis/time reads are the only untested part — trivial pass-throughs).
+// `amt` = signed tilt toward the direction, `now` = seconds; mutates the caller's latch.
+fn navTick(amt: f32, now: f64, armed: *bool, nextRepeat: *f64) bool {
+    if (amt < NAV_RELEASE) {
+        armed.* = true; // fell back toward center — arm the next step
+        return false;
+    }
+    if (amt < NAV_ENGAGE) return false; // hysteresis band: neither fire nor re-arm
+    if (armed.*) {
+        armed.* = false;
+        nextRepeat.* = now + NAV_REPEAT_DELAY;
+        return true; // initial engage edge
+    }
+    if (now >= nextRepeat.*) {
+        nextRepeat.* = now + NAV_REPEAT_RATE;
+        return true; // auto-repeat while held
+    }
+    return false;
+}
+
+test "navTick: engage edge, hysteresis, hold-to-repeat, re-arm" {
+    const t = std.testing;
+    var armed = true;
+    var next: f64 = 0;
+    // Below release: no fire, stays armed.
+    try t.expect(!navTick(0.1, 0.0, &armed, &next));
+    try t.expect(armed);
+    // Hysteresis band (release <= amt < engage): no fire, no re-arm change.
+    try t.expect(!navTick(0.4, 0.0, &armed, &next));
+    try t.expect(armed);
+    // Cross engage: single fire, disarms, schedules first repeat after the delay.
+    try t.expect(navTick(0.9, 1.0, &armed, &next));
+    try t.expect(!armed);
+    // Held past engage but before the repeat delay: no fire.
+    try t.expect(!navTick(0.9, 1.2, &armed, &next));
+    // Still held, delay elapsed: auto-repeat fires and reschedules at the faster rate.
+    try t.expect(navTick(0.9, 1.0 + NAV_REPEAT_DELAY, &armed, &next));
+    try t.expect(!navTick(0.9, 1.0 + NAV_REPEAT_DELAY + 0.05, &armed, &next));
+    try t.expect(navTick(0.9, 1.0 + NAV_REPEAT_DELAY + NAV_REPEAT_RATE, &armed, &next));
+    // Fall back under release: re-arms, so the next engage is a fresh single edge.
+    try t.expect(!navTick(0.2, 5.0, &armed, &next));
+    try t.expect(armed);
+    try t.expect(navTick(0.9, 6.0, &armed, &next));
 }
 
 /// Confirm/activate. `altHeld` guards Alt+Enter (fullscreen) from doubling as confirm.

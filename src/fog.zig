@@ -13,9 +13,10 @@ const mathx = @import("mathx.zig");
 // re-uploaded when changed, and sampled by the scene shader per fragment for
 // unseen/seen/active. Per-area: reset() clears the grid on area entry.
 
-// Grid resolution over the arena square. 128 => ~0.94 world-units/texel at the
-// largest area (half-extent clamps to map.HALF_MAX in map.sanitize); bilinear softens the edge.
-pub const RES = 128;
+// Grid resolution over the arena square. 256 => 1 world-unit/texel at the largest
+// area (half-extent clamps to map.HALF_MAX = 128 in map.sanitize); bilinear softens
+// the edge. The 64 KB cell grid still uploads in one updateTexture.
+pub const RES = 256;
 
 pub const Fog = struct {
     // Explored per cell, 0 (unseen)..255 (seen), row-major [z*RES + x]. Only

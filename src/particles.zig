@@ -12,7 +12,7 @@ const cosf = mathx.cosf;
 // with the default shader, so they glow in the dark and bypass the lighting pipeline.
 // When full, the pool overwrites its oldest slot (a dropped old spark is invisible).
 
-pub const MAX_PARTICLES = 768;
+pub const MAX_PARTICLES = 2048;
 
 pub const Particle = struct {
     Pos: rl.Vector3 = mathx.zero3,

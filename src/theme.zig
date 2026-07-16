@@ -37,5 +37,6 @@ pub const valueColor = rgba(255, 240, 205, 255);
 // Panel/modal title text (small-caps captions, topbar map name).
 pub const titleColor = rgba(255, 230, 190, 255);
 
-// The void behind the arena: main-pass clear color in game and editor.
-pub const voidColor = rgba(16, 16, 22, 255);
+// The void behind the arena: main-pass clear color in game and editor. Kept a hair
+// above black (and faintly cold) so the arena's true blacks still read darker than it.
+pub const voidColor = rgba(9, 9, 13, 255);
