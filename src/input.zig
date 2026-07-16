@@ -42,31 +42,27 @@ pub fn stickXZ(axisX: rl.GamepadAxis, axisY: rl.GamepadAxis) rl.Vector3 {
     return dirXZ(mathx.zero3, v); // normalize to a unit heading
 }
 
-// ── Gameplay predicates (buttons; kbm movement stays in game.zig) ──
-pub fn padDodgePressed() bool {
-    return padPressed(.right_face_right); // Circle / B
-}
-
 // ── Skill bar ──
-// Controller is the primary input, so every slot has a REAL pad button. Slots 0/1 are
-// the two right-hand face buttons (X attack, Y cast); the extra slots live on the d-pad
-// — the left stick moves and the right stick aims, so the d-pad is free during play.
-// This is the ONE source for the mapping: game.zig fires slots through slotPadDown and
-// the HUD draws each slot's glyph from slotPad, so the drawn button can't lie about
-// what fires it. Enum order is slot order; the assert pins it to the slot count.
-pub const SlotPad = enum { face_x, face_y, dpad_up, dpad_left, dpad_right };
-pub const slotPad = [playermod.SKILL_SLOTS]SlotPad{ .face_x, .face_y, .dpad_up, .dpad_left, .dpad_right };
+// Controller is the primary input, so every slot has a REAL pad button. The bar is the
+// six action buttons: the four right-hand face buttons (A/X/Y/B) plus both shoulders
+// (L1/R1) — the left stick moves and the right stick aims, so nothing here clashes with
+// steering. This is the ONE source for the mapping: game.zig fires slots through
+// slotPadDown and the HUD draws each slot's glyph from slotPad, so the drawn button
+// can't lie about what fires it. Enum order is slot order; the assert pins the count.
+pub const SlotPad = enum { face_a, face_x, face_y, face_b, l1, r1 };
+pub const slotPad = [playermod.SKILL_SLOTS]SlotPad{ .face_a, .face_x, .face_y, .face_b, .l1, .r1 };
 comptime {
     std.debug.assert(slotPad.len == playermod.SKILL_SLOTS);
 }
 
 fn slotPadButton(sp: SlotPad) rl.GamepadButton {
     return switch (sp) {
-        .face_x => .right_face_left, // Square / X → attack
-        .face_y => .right_face_up, // Triangle / Y → cast
-        .dpad_up => .left_face_up,
-        .dpad_left => .left_face_left,
-        .dpad_right => .left_face_right,
+        .face_a => .right_face_down, // Cross / A
+        .face_x => .right_face_left, // Square / X
+        .face_y => .right_face_up, // Triangle / Y
+        .face_b => .right_face_right, // Circle / B
+        .l1 => .left_trigger_1, // L1
+        .r1 => .right_trigger_1, // R1
     };
 }
 
@@ -81,9 +77,9 @@ pub fn slotPadPressed(slot: usize) bool {
 
 // Keyboard mirror of the slots (secondary to the pad), parallel to `slotPad` and pinned
 // to the same slot count. null = no key (slots 0/1 are the mouse buttons in game.zig).
-// Keys avoid WASD/arrows (movement): slots 2/3/4 = Q/E/R. (1/2 are free now that potions
-// ride their own slot.) `slotKeyDown` is held; `slotKeyPressed` is the edge, for potions.
-pub const slotKey = [playermod.SKILL_SLOTS]?rl.KeyboardKey{ null, null, .q, .e, .r };
+// Keys avoid WASD/arrows (movement): slots 2-5 = Q/E/R/F. `slotKeyDown` is held;
+// `slotKeyPressed` is the edge, for potions.
+pub const slotKey = [playermod.SKILL_SLOTS]?rl.KeyboardKey{ null, null, .q, .e, .r, .f };
 pub fn slotKeyDown(slot: usize) bool {
     return if (slotKey[slot]) |k| rl.isKeyDown(k) else false;
 }

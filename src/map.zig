@@ -46,6 +46,7 @@ pub const HALF_MAX = 60;
 pub const PACK_MEMBERS_MIN = 1;
 pub const PACK_MEMBERS_MAX = 16;
 pub const ext = ".map";
+pub const bak_ext = ".bak"; // suffix of the pre-save backup copy
 pub const dir = "maps";
 // Stored map-file path capacity, shared by the campaign list, cached paths, and the
 // editor's Ctrl+S target so none silently truncates.
@@ -240,8 +241,8 @@ pub fn save(m: *const Map, path: []const u8) !void {
     std.fs.cwd().makePath(dir) catch {};
     // Keep a .bak of whatever was there before, so we never clobber the only copy.
     // Sized off PATH_CAP so raising the path cap can't silently outgrow this buffer.
-    var bakBuf: [PATH_CAP + ".bak".len]u8 = undefined;
-    if (std.fmt.bufPrint(&bakBuf, "{s}.bak", .{path})) |bak| {
+    var bakBuf: [PATH_CAP + bak_ext.len]u8 = undefined;
+    if (std.fmt.bufPrint(&bakBuf, "{s}" ++ bak_ext, .{path})) |bak| {
         std.fs.cwd().copyFile(path, std.fs.cwd(), bak, .{}) catch {};
     } else |_| {}
 
@@ -305,6 +306,29 @@ fn nextEnum(comptime T: type, it: *std.mem.TokenIterator(u8, .scalar)) !T {
     return std.meta.stringToEnum(T, tok) orelse LoadError.BadLine;
 }
 
+// Three u8 channels → an opaque color: `ground`/`accent` share one reader so their
+// parse can't drift. Caller adds the field name via its `catch return fail(...)`.
+fn nextColor(it: *std.mem.TokenIterator(u8, .scalar)) !rl.Color {
+    const r = try nextU8(it);
+    const g = try nextU8(it);
+    const b = try nextU8(it);
+    return rgba(r, g, b, 255);
+}
+
+// Two floats → a ground-plane point (y=0): spawn/portal/bossat share one reader.
+fn nextXZ(it: *std.mem.TokenIterator(u8, .scalar)) !rl.Vector3 {
+    const x = try nextF32(it);
+    const z = try nextF32(it);
+    return v3(x, 0, z);
+}
+
+// Keys whose payload is arbitrary free text: they consume the whole `rest` and must
+// NOT be tokenized or trailing-checked. One predicate so the load arm and the
+// trailing-data guard agree on the set.
+fn isFreeText(key: []const u8) bool {
+    return std.mem.eql(u8, key, K.name) or std.mem.eql(u8, key, K.boss);
+}
+
 pub fn load(path: []const u8) LoadError!Map {
     const data = std.fs.cwd().readFileAlloc(alloc, path, 1 << 20) catch return LoadError.ReadFailed;
     defer alloc.free(data);
@@ -342,17 +366,17 @@ pub fn load(path: []const u8) LoadError!Map {
             m.halfW = nextF32(&it) catch return fail(lineNo, line, "bad half");
             m.halfD = m.halfW;
         } else if (std.mem.eql(u8, key, K.ground)) {
-            m.ground = rgba(nextU8(&it) catch return fail(lineNo, line, "bad ground"), nextU8(&it) catch return fail(lineNo, line, "bad ground"), nextU8(&it) catch return fail(lineNo, line, "bad ground"), 255);
+            m.ground = nextColor(&it) catch return fail(lineNo, line, "bad ground");
         } else if (std.mem.eql(u8, key, K.accent)) {
-            m.accent = rgba(nextU8(&it) catch return fail(lineNo, line, "bad accent"), nextU8(&it) catch return fail(lineNo, line, "bad accent"), nextU8(&it) catch return fail(lineNo, line, "bad accent"), 255);
+            m.accent = nextColor(&it) catch return fail(lineNo, line, "bad accent");
         } else if (std.mem.eql(u8, key, K.light)) {
             for (0..3) |i| m.light[i] = nextF32(&it) catch return fail(lineNo, line, "bad light");
         } else if (std.mem.eql(u8, key, K.spawn)) {
-            m.spawn = v3(nextF32(&it) catch return fail(lineNo, line, "bad spawn"), 0, nextF32(&it) catch return fail(lineNo, line, "bad spawn"));
+            m.spawn = nextXZ(&it) catch return fail(lineNo, line, "bad spawn");
         } else if (std.mem.eql(u8, key, K.portal)) {
-            m.portal = v3(nextF32(&it) catch return fail(lineNo, line, "bad portal"), 0, nextF32(&it) catch return fail(lineNo, line, "bad portal"));
+            m.portal = nextXZ(&it) catch return fail(lineNo, line, "bad portal");
         } else if (std.mem.eql(u8, key, K.bossat)) {
-            m.bossPos = v3(nextF32(&it) catch return fail(lineNo, line, "bad bossat"), 0, nextF32(&it) catch return fail(lineNo, line, "bad bossat"));
+            m.bossPos = nextXZ(&it) catch return fail(lineNo, line, "bad bossat");
         } else if (std.mem.eql(u8, key, K.ledge)) {
             if (m.ledge_count >= world.MAX_LEDGES) return fail(lineNo, line, "too many ledges");
             m.ledges[m.ledge_count] = .{
@@ -408,8 +432,8 @@ pub fn load(path: []const u8) LoadError!Map {
             return fail(lineNo, line, "unknown key");
         }
         // Leftover tokens mean a typo'd/merge-mangled line — reject loudly, as with
-        // unknown keys. `name`/`boss` hold free text and never consume their tokens.
-        if (!std.mem.eql(u8, key, K.name) and !std.mem.eql(u8, key, K.boss) and it.next() != null) {
+        // unknown keys. Free-text keys hold arbitrary words and never tokenize.
+        if (!isFreeText(key) and it.next() != null) {
             return fail(lineNo, line, "trailing data");
         }
     }
@@ -446,9 +470,10 @@ fn sanitize(m: *Map) void {
     // in the editor minimap and place content in the void. No-op for in-arena maps.
     const hw = m.halfW;
     const hd = m.halfD;
-    m.spawn = v3(std.math.clamp(m.spawn.x, -hw, hw), 0, std.math.clamp(m.spawn.z, -hd, hd));
-    m.portal = v3(std.math.clamp(m.portal.x, -hw, hw), 0, std.math.clamp(m.portal.z, -hd, hd));
-    m.bossPos = v3(std.math.clamp(m.bossPos.x, -hw, hw), 0, std.math.clamp(m.bossPos.z, -hd, hd));
+    for ([_]*rl.Vector3{ &m.spawn, &m.portal, &m.bossPos }) |a| {
+        a.x = std.math.clamp(a.x, -hw, hw);
+        a.z = std.math.clamp(a.z, -hd, hd);
+    }
     // Sizes/heights/light clamped like coordinates: wider than the editor authors
     // (hand edits stay welcome), but a finite-but-HUGE value can't reach the renderer
     // (a 1e18 ledge height would put the hero/camera/shadow rig in orbit).

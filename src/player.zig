@@ -53,18 +53,51 @@ pub const BASE_ARMOR: f32 = 20;
 pub const ATTR_POINTS_PER_LEVEL: i32 = 5;
 pub const SKILL_POINTS_PER_LEVEL: i32 = 1;
 
-// Per-rank skill bumps (no full tree yet — points rank up the three skills).
+// Per-rank skill bumps (no full tree yet — points rank up the three rankable skills).
 pub const MELEE_RANK_INC: f32 = 0.08; // +8% melee damage per rank over 1
 pub const FIREBOLT_RANK_INC: f32 = 0.12; // +12% firebolt damage per rank over 1
 pub const DODGE_RANK_IFRAME: f32 = 0.04; // +0.04s i-frames per rank over 1
 pub const DODGE_RANK_CD: f32 = 0.06; // -0.06s roll cooldown per rank over 1
 pub const DODGE_CD_FLOOR: f32 = 0.55; // roll cooldown never shrinks below this
 
+// ── Extra-skill kit ──────────────────────────────────────────────────────────
+// The five reassignable skills beyond the core three. Combat numbers are level-1
+// anchors; damage scales at cast time by the matching derived mult (spell / ranged /
+// melee), so allocating Int/Dex/Str powers them without a rank system of their own.
+// These are NOT rankable (like the potions) — spatial reach/radius lives in game.zig.
+pub const ICE_DMG: f32 = 16; // cold, single target
+pub const ICE_COST: f32 = 6;
+pub const ICE_CD: f32 = 0.55;
+pub const CHILL_DUR: f32 = 2.0; // seconds a struck foe is slowed
+pub const CHILL_FACTOR: f32 = 0.55; // chilled foes move at 55% speed
+
+pub const NOVA_DMG: f32 = 26; // lightning, AoE burst around the hero
+pub const NOVA_COST: f32 = 15;
+pub const NOVA_CD: f32 = 2.2;
+
+pub const FLASK_DPS: f32 = 16; // chaos poison cloud, damage-over-time AoE
+pub const FLASK_COST: f32 = 12;
+pub const FLASK_CD: f32 = 3.4;
+
+pub const KNIFE_MIN: f32 = 7; // physical ranged, cheap and quick (no mana)
+pub const KNIFE_MAX: f32 = 12;
+pub const KNIFE_CD: f32 = 0.34;
+
+pub const CLEAVE_CD: f32 = 0.85; // physical melee, hits every foe in a frontal arc
+
 // The three skills; skill points rank these up. Label lives with the enum (like
 // stats.Attribs) so the sheet iterates one source, not a parallel list.
 pub const Skill = enum {
+    // Physical
     melee,
-    firebolt,
+    cleave, // frontal-arc AoE swing
+    throwing_knife, // physical ranged
+    // Elemental spells
+    firebolt, // fire, single target
+    ice_shard, // cold, single target — chills
+    lightning_nova, // lightning, AoE burst
+    toxic_flask, // chaos, lingering DoT cloud
+    // Movement
     dodge,
     // Consumables — potion use is a reassignable action too, so it lives on the bar
     // alongside the combat skills. Not rankable; draws from the belt counts.
@@ -75,7 +108,7 @@ pub const Skill = enum {
     // Canonical variant list — the single source for "iterate every skill" (skill-bar
     // palette, sheet). Hand-listed, so the assert pins it: a new Skill without a matching
     // entry here is a compile error rather than a silently-missing palette chip.
-    pub const all = [_]Skill{ .melee, .firebolt, .dodge, .health_potion, .mana_potion };
+    pub const all = [_]Skill{ .melee, .cleave, .throwing_knife, .firebolt, .ice_shard, .lightning_nova, .toxic_flask, .dodge, .health_potion, .mana_potion };
     comptime {
         std.debug.assert(all.len == count);
     }
@@ -86,10 +119,51 @@ pub const Skill = enum {
         return s == .health_potion or s == .mana_potion;
     }
 
+    // Rankable by skill points (the original three). The rest — potions and the five
+    // extra skills — scale off attributes instead, so they get no allocation row.
+    pub fn rankable(s: Skill) bool {
+        return s == .melee or s == .firebolt or s == .dodge;
+    }
+
+    // Aimed skills fire toward the selected foe / cursor point (projectiles). Melee-family
+    // and self-centered bursts key off the chase target or the hero, not an aim point.
+    pub fn wantsAim(s: Skill) bool {
+        return switch (s) {
+            .firebolt, .ice_shard, .throwing_knife, .toxic_flask => true,
+            else => false,
+        };
+    }
+
+    // Offensive skills make the gamepad acquire a target + project an aim point before
+    // firing (mirrors the old X-attack acquire). Movement/consumables don't.
+    pub fn offensive(s: Skill) bool {
+        return switch (s) {
+            .melee, .cleave, .throwing_knife, .firebolt, .ice_shard, .toxic_flask => true,
+            .lightning_nova, .dodge, .health_potion, .mana_potion => false,
+        };
+    }
+
+    // Mana this skill draws per use (0 = free). One source so the HUD readiness veil and
+    // the cast gate can't disagree.
+    pub fn manaCost(s: Skill) f32 {
+        return switch (s) {
+            .firebolt => BASE_SPELL_COST,
+            .ice_shard => ICE_COST,
+            .lightning_nova => NOVA_COST,
+            .toxic_flask => FLASK_COST,
+            else => 0,
+        };
+    }
+
     pub fn label(s: Skill) [:0]const u8 {
         return switch (s) {
             .melee => "Melee",
+            .cleave => "Cleave",
+            .throwing_knife => "Throwing Knife",
             .firebolt => "Firebolt",
+            .ice_shard => "Ice Shard",
+            .lightning_nova => "Lightning Nova",
+            .toxic_flask => "Toxic Flask",
             .dodge => "Dodge",
             .health_potion => "Health Potion",
             .mana_potion => "Mana Potion",
@@ -100,7 +174,12 @@ pub const Skill = enum {
     pub fn blurb(s: Skill) [:0]const u8 {
         return switch (s) {
             .melee => "Strike the selected foe up close.",
+            .cleave => "Sweep your blade through every foe in front of you.",
+            .throwing_knife => "Fling a knife at your target. Quick and free.",
             .firebolt => "Hurl a bolt of fire at your target. Costs mana.",
+            .ice_shard => "Loose a freezing shard that chills what it hits. Costs mana.",
+            .lightning_nova => "Discharge lightning through every nearby foe. Costs mana.",
+            .toxic_flask => "Lob a flask that bursts into a lingering poison cloud. Costs mana.",
             .dodge => "Roll a quick dash with a moment of invulnerability.",
             .health_potion => "Drink to restore health. Uses one from your belt.",
             .mana_potion => "Drink to restore mana. Uses one from your belt.",
@@ -110,26 +189,28 @@ pub const Skill = enum {
 
 // ── Reassignable skill bar ────────────────────────────────────────────────────
 // The hero's loadout: one skill (or none) per input slot. Slots map to controller
-// buttons by index (see input.slotPad): 0=X, 1=Y, 2/3/4=d-pad; keyboard mirrors on the
-// mouse buttons + Q/E/R (input.slotKeyDown). A skill lives in AT MOST ONE slot —
-// `assign` enforces uniqueness so the palette↔bar mapping can't double-bind.
-// Reassignment is the Skills loadout screen (hudx); combat fires through these slots
-// (game.zig).
-pub const SKILL_SLOTS = 5;
+// buttons by index (see input.slotPad): 0=A, 1=X, 2=Y, 3=B, 4=L1, 5=R1; keyboard
+// mirrors on the mouse buttons + Q/E/R/F (input.slotKeyDown). A skill lives in AT MOST
+// ONE slot — `assign` enforces uniqueness so the palette↔bar mapping can't double-bind.
+// EVERY skill (dodge and potions included) is usable ONLY through a bound slot — there
+// are no hardcoded shortcuts. Reassignment is the Skills loadout screen (hudx); combat
+// fires through these slots (game.zig).
+pub const SKILL_SLOTS = 6;
 
 pub const SkillBar = struct {
     slots: [SKILL_SLOTS]?Skill = [_]?Skill{null} ** SKILL_SLOTS,
 
-    /// The out-of-the-box loadout: fills all five slots — melee, firebolt, dodge, then
-    /// the two potions. Used by a fresh hero and as the fallback when no saved bindings
-    /// exist (or when a pre-potion save is migrated).
+    /// The out-of-the-box loadout, mapped to the pad's six action buttons:
+    /// A empty, X melee, Y firebolt, B dodge, L1 health potion, R1 mana potion. The five
+    /// extra skills start unbound — you assign them on the loadout screen. Used by a fresh
+    /// hero and as the fallback when no saved bindings exist (or a stale format migrates).
     pub fn default() SkillBar {
         var b = SkillBar{};
-        b.assign(0, .melee);
-        b.assign(1, .firebolt);
-        b.assign(2, .dodge);
-        b.assign(3, .health_potion);
-        b.assign(4, .mana_potion);
+        b.assign(1, .melee);
+        b.assign(2, .firebolt);
+        b.assign(3, .dodge);
+        b.assign(4, .health_potion);
+        b.assign(5, .mana_potion);
         return b;
     }
 
@@ -188,10 +269,11 @@ pub const SkillBar = struct {
     // corrupt file falls back to default() rather than erroring, since a bad binding
     // file must never keep the player out of the game.
     //
-    // FORMAT 2 added the potions to the bar. A file from an older format is migrated by
-    // resetting to default() — otherwise a pre-potion save (potions in no slot) would
-    // leave the player unable to quaff, since potions now fire ONLY from their slot.
-    pub const FORMAT = 2;
+    // FORMAT 2 added the potions to the bar. FORMAT 3 remapped the slots to the six pad
+    // action buttons (A/X/Y/B/L1/R1) — a FORMAT-2 file's five slots meant different
+    // buttons, so it migrates to default() rather than binding skills to the wrong keys.
+    // A file from any older format is likewise reset.
+    pub const FORMAT = 3;
 
     pub fn save(b: *const SkillBar, path: []const u8) !void {
         const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
@@ -304,6 +386,13 @@ pub const Player = struct {
     castCD: f32 = 0,
     castRate: f32 = 0,
 
+    // Per-skill recharge for the five extra skills (indexed by @intFromEnum(Skill)). The
+    // core three keep their own timers (atkCD/castCD/rollCD); these entries stay 0 for
+    // them. `skillCDMax` is the window each was last set to, so the HUD wipe reads a true
+    // fraction even as cast-speed/CDR shrink the live window.
+    skillCD: [Skill.count]f32 = [_]f32{0} ** Skill.count,
+    skillCDMax: [Skill.count]f32 = [_]f32{0} ** Skill.count,
+
     // Dodge roll.
     rollTimer: f32 = 0,
     rollCD: f32 = 0,
@@ -412,7 +501,8 @@ pub const Player = struct {
             .melee => p.meleeRank,
             .firebolt => p.fireboltRank,
             .dodge => p.dodgeRank,
-            .health_potion, .mana_potion => 1, // consumables have no rank
+            // Consumables and the attribute-scaled extra skills have no rank.
+            else => 1,
         };
     }
 
@@ -424,11 +514,33 @@ pub const Player = struct {
             .melee => p.meleeRank += 1,
             .firebolt => p.fireboltRank += 1,
             .dodge => p.dodgeRank += 1,
-            .health_potion, .mana_potion => return false, // not rankable
+            else => return false, // consumables + extra skills aren't rankable
         }
         p.skillPoints -= 1;
         p.recompute();
         return true;
+    }
+
+    /// Has the extra skill `s` finished recharging? (Core skills use atkCD/castCD/rollCD.)
+    pub fn auxReady(p: *const Player, s: Skill) bool {
+        return p.skillCD[@intFromEnum(s)] <= 0;
+    }
+    /// Fraction of `s`'s recharge still to run (1 = just used → 0 = ready), for the HUD wipe.
+    pub fn auxFrac(p: *const Player, s: Skill) f32 {
+        const i = @intFromEnum(s);
+        return if (p.skillCDMax[i] > 0) clampF(p.skillCD[i] / p.skillCDMax[i], 0, 1) else 0;
+    }
+    /// Put `s` on a `dur`-second recharge (recording the window for the HUD fraction).
+    pub fn startAuxCD(p: *Player, s: Skill, dur: f32) void {
+        const i = @intFromEnum(s);
+        p.skillCD[i] = dur;
+        p.skillCDMax[i] = dur;
+    }
+    /// Advance every extra-skill recharge one frame.
+    pub fn tickSkillCDs(p: *Player, dt: f32) void {
+        for (&p.skillCD) |*c| {
+            if (c.* > 0) c.* -= dt;
+        }
     }
 
     /// Begin a dodge in dir (falling back to facing). False if on cooldown/underway.
@@ -456,11 +568,15 @@ pub const Player = struct {
         p.HP -= landed;
         if (p.HP < 0) p.HP = 0;
         p.hitFlash = hitflash;
-        if (p.alive() and stats.isLightStun(landed, p.MaxHP)) {
-            p.stunTimer = maxF(p.stunTimer, stats.LIGHT_STUN_DUR);
-            p.swing = 0; // interrupt an in-progress melee swing
-        }
+        if (p.alive() and stats.isLightStun(landed, p.MaxHP)) p.applyStun(stats.LIGHT_STUN_DUR);
         return landed;
+    }
+
+    /// Briefly freeze the hero for `dur` (max with any current stun) and cancel an
+    /// in-progress swing so the stun genuinely interrupts. Mirrors Monster.applyStun.
+    pub fn applyStun(p: *Player, dur: f32) void {
+        p.stunTimer = maxF(p.stunTimer, dur);
+        p.swing = 0;
     }
 
     /// Clear transient combat/roll/stun state. Called on an area transition so a
@@ -486,19 +602,22 @@ pub const Player = struct {
     }
 
     pub fn drinkHealth(p: *Player) bool {
-        if (p.HealthPots <= 0 or p.HP >= p.MaxHP) return false;
-        p.HealthPots -= 1;
-        p.HP = minF(p.MaxHP, p.HP + p.MaxHP * POTION_HEAL_FRAC + POTION_HEAL_FLAT);
-        return true;
+        return drink(&p.HP, p.MaxHP, &p.HealthPots, POTION_HEAL_FRAC, POTION_HEAL_FLAT);
     }
 
     pub fn drinkMana(p: *Player) bool {
-        if (p.ManaPots <= 0 or p.Mana >= p.MaxMana) return false;
-        p.ManaPots -= 1;
-        p.Mana = minF(p.MaxMana, p.Mana + p.MaxMana * POTION_MANA_FRAC + POTION_MANA_FLAT);
-        return true;
+        return drink(&p.Mana, p.MaxMana, &p.ManaPots, POTION_MANA_FRAC, POTION_MANA_FLAT);
     }
 };
+
+// Consume one potion to refill a resource by `max*frac + flat` (capped at max). No-op
+// (returns false) with no pots or already full — the shared health/mana restore rule.
+fn drink(cur: *f32, max: f32, pots: *i32, frac: f32, flat: f32) bool {
+    if (pots.* <= 0 or cur.* >= max) return false;
+    pots.* -= 1;
+    cur.* = minF(max, cur.* + max * frac + flat);
+    return true;
+}
 
 pub fn newPlayer(pos: rl.Vector3) Player {
     var p = Player{

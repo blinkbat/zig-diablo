@@ -150,12 +150,63 @@ const SPAWN_COL = rgba(140, 200, 255, 255);
 const PORTAL_COL = rgba(190, 140, 255, 255);
 const BOSS_COL = rgba(255, 80, 80, 255);
 
+// Erase-brush reds: a ring on each victim the brush would take, a wire box on a floor
+// feature it would remove, and the sweep circle showing its reach. One family so the
+// "about to be deleted" red reads the same everywhere it's drawn.
+const ERASE_RING = rgba(255, 60, 40, 255);
+const ERASE_FEATURE = rgba(255, 80, 60, 230);
+const ERASE_SWEEP = rgba(255, 90, 70, 200);
+
+// Map-name / filename field capacity: the typed-name buffer and every slug buffer it
+// feeds share this, so a longer name can't silently truncate when slugged to a path.
+const NAME_CAP = 40;
+
 // Anchor ring radii, shared by the drawn ring AND its hover-pick zone so a resized
 // ring never lies about what's clickable. Hover zone = ring + MARKER_HOVER_PAD.
 const SPAWN_R = 1.0;
 const PORTAL_R = 1.4;
 const BOSS_R = 1.2;
 const MARKER_HOVER_PAD = 0.2;
+
+// The three fixed map anchors (hero entry, area exit, boss post). One table binds each
+// anchor's Map field, color, ring radius, and context-menu label, so the 3D marker,
+// minimap glyph, hover tip, and "Move X here" row can't drift on any of them.
+const Anchor = enum {
+    spawn,
+    portal,
+    boss,
+
+    const order = [_]Anchor{ .spawn, .portal, .boss };
+
+    fn posPtr(a: Anchor, m: *mapmod.Map) *rl.Vector3 {
+        return switch (a) {
+            .spawn => &m.spawn,
+            .portal => &m.portal,
+            .boss => &m.bossPos,
+        };
+    }
+    fn col(a: Anchor) rl.Color {
+        return switch (a) {
+            .spawn => SPAWN_COL,
+            .portal => PORTAL_COL,
+            .boss => BOSS_COL,
+        };
+    }
+    fn radius(a: Anchor) f32 {
+        return switch (a) {
+            .spawn => SPAWN_R,
+            .portal => PORTAL_R,
+            .boss => BOSS_R,
+        };
+    }
+    fn moveLabel(a: Anchor) [:0]const u8 {
+        return switch (a) {
+            .spawn => "Move spawn here",
+            .portal => "Move portal here",
+            .boss => "Move boss here",
+        };
+    }
+};
 
 // Pack ring radius doubles as the grab pickup radius (clickable == visible).
 const PACK_GRAB_R = 1.6;
@@ -336,7 +387,7 @@ pub const Editor = struct {
     modal: Modal = .none,
     pending: Pending = .none, // what the confirm modal resumes on Save/Discard
     pendingOpen: usize = 0,
-    field_buf: [40]u8 = [_]u8{0} ** 40, // modal text input
+    field_buf: [NAME_CAP]u8 = [_]u8{0} ** NAME_CAP, // modal text input
     field_len: usize = 0,
     newHalfW: f32 = 30,
     newHalfD: f32 = 30,
@@ -1056,7 +1107,7 @@ fn doSaveAs(g: *Game) void {
     const ed = &g.ed;
     if (ed.field_len == 0) return ed.status("give it a file name", .{});
     var buf: [mapmod.PATH_CAP]u8 = undefined;
-    var slug: [40]u8 = undefined;
+    var slug: [NAME_CAP]u8 = undefined;
     const s = slugTo(&slug, ed.field_buf[0..ed.field_len]);
     if (s.len == 0) return ed.status("give it a usable file name", .{});
     const p = std.fmt.bufPrint(&buf, "{s}/{s}{s}", .{ mapmod.dir, s, mapmod.ext }) catch return;
@@ -1555,9 +1606,7 @@ fn drawMarkers(g: *Game) void {
 
     if (ed.grid) drawRectGrid(m);
 
-    marker(g, m.spawn, SPAWN_COL, SPAWN_R);
-    marker(g, m.portal, PORTAL_COL, PORTAL_R);
-    marker(g, m.bossPos, BOSS_COL, BOSS_R);
+    for (Anchor.order) |a| marker(g, a.posPtr(m).*, a.col(), a.radius());
 
     // Packs: silhouettes show the encounter; here just the grab ring in the kind's
     // color over a dark puck.
@@ -1611,33 +1660,33 @@ fn drawCursorAids(g: *Game) void {
             // Highlight the feature rect the click would remove.
             for (g.map.ramps[0..g.map.ramp_count]) |r| {
                 if (r.contains(raw.x, raw.z)) {
-                    rl.drawCubeWiresV(v3((r.minX + r.maxX) / 2, r.h / 2, (r.minZ + r.maxZ) / 2), v3(r.maxX - r.minX, r.h, r.maxZ - r.minZ), rgba(255, 80, 60, 230));
+                    rl.drawCubeWiresV(v3((r.minX + r.maxX) / 2, r.h / 2, (r.minZ + r.maxZ) / 2), v3(r.maxX - r.minX, r.h, r.maxZ - r.minZ), ERASE_FEATURE);
                 }
             }
             for (g.map.ledges[0..g.map.ledge_count]) |l| {
                 if (l.contains(raw.x, raw.z)) {
-                    rl.drawCubeWiresV(v3((l.minX + l.maxX) / 2, l.h / 2, (l.minZ + l.maxZ) / 2), v3(l.maxX - l.minX, l.h, l.maxZ - l.minZ), rgba(255, 80, 60, 230));
+                    rl.drawCubeWiresV(v3((l.minX + l.maxX) / 2, l.h / 2, (l.minZ + l.maxZ) / 2), v3(l.maxX - l.minX, l.h, l.maxZ - l.minZ), ERASE_FEATURE);
                 }
             }
         } else {
             // Sweep circle, plus a ring on everything it would take.
-            gamemod.groundRing(v3(raw.x, raw.y + 0.06, raw.z), ed.brushR, rgba(255, 90, 70, 200));
+            gamemod.groundRing(v3(raw.x, raw.y + 0.06, raw.z), ed.brushR, ERASE_SWEEP);
             const m = &g.map;
             switch (ed.layer) {
                 .props => for (m.obstacles[0..m.obstacle_count]) |o| {
                     if (distXZ(o.Pos, raw) < ed.brushR) {
-                        gamemod.groundRing(v3(o.Pos.x, g.w.groundY(o.Pos.x, o.Pos.z) + 0.08, o.Pos.z), o.Radius + 0.15, rgba(255, 60, 40, 255));
+                        gamemod.groundRing(v3(o.Pos.x, g.w.groundY(o.Pos.x, o.Pos.z) + 0.08, o.Pos.z), o.Radius + 0.15, ERASE_RING);
                     }
                 },
                 .decor => for (m.decor[0..m.decor_count]) |d| {
                     if (distXZ(d.Pos, raw) < ed.brushR) {
-                        gamemod.groundRing(v3(d.Pos.x, g.w.groundY(d.Pos.x, d.Pos.z) + 0.08, d.Pos.z), d.Size + 0.2, rgba(255, 60, 40, 255));
+                        gamemod.groundRing(v3(d.Pos.x, g.w.groundY(d.Pos.x, d.Pos.z) + 0.08, d.Pos.z), d.Size + 0.2, ERASE_RING);
                     }
                 },
                 .entities => for (m.packList()) |pk| {
                     if (distXZ(pk.pos(), raw) < ed.brushR) {
                         const c = g.w.snapY(pk.pos());
-                        gamemod.groundRing(v3(c.x, c.y + 0.1, c.z), PACK_GRAB_R + 0.2, rgba(255, 60, 40, 255));
+                        gamemod.groundRing(v3(c.x, c.y + 0.1, c.z), PACK_GRAB_R + 0.2, ERASE_RING);
                     }
                 },
                 .floor => {},
@@ -1739,13 +1788,18 @@ fn hoverWorldTip(g: *Game, ctx: *ui.Ctx) void {
             return;
         }
     }
-    if (distXZ(m.bossPos, p) < BOSS_R + MARKER_HOVER_PAD) {
-        const s = std.fmt.bufPrint(&buf, "Boss post: {s}", .{m.boss.slice()}) catch return;
-        ctx.setTip(s);
+    for (Anchor.order) |a| {
+        if (distXZ(a.posPtr(m).*, p) >= a.radius() + MARKER_HOVER_PAD) continue;
+        switch (a) {
+            .spawn => ctx.setTip("Spawn - where the hero enters"),
+            .portal => ctx.setTip("Portal - the area exit"),
+            .boss => {
+                const s = std.fmt.bufPrint(&buf, "Boss post: {s}", .{m.boss.slice()}) catch return;
+                ctx.setTip(s);
+            },
+        }
         return;
     }
-    if (distXZ(m.spawn, p) < SPAWN_R + MARKER_HOVER_PAD) return ctx.setTip("Spawn - where the hero enters");
-    if (distXZ(m.portal, p) < PORTAL_R + MARKER_HOVER_PAD) return ctx.setTip("Portal - the area exit");
     for (m.obstacles[0..m.obstacle_count]) |o| {
         if (distXZ(o.Pos, p) < o.Radius + 0.3) {
             const s = std.fmt.bufPrint(&buf, "{s} (Props layer)", .{@tagName(o.Kind)}) catch return;
@@ -2050,9 +2104,10 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     for (g.map.packList()) |pk| {
         rl.drawRectangle(@intFromFloat(ox + (pk.x + halfW) * scale - 1), @intFromFloat(oy + (pk.z + halfD) * scale - 1), 3, 3, packColor(pk.kind));
     }
-    rl.drawRectangle(@intFromFloat(ox + (g.map.bossPos.x + halfW) * scale - 2), @intFromFloat(oy + (g.map.bossPos.z + halfD) * scale - 2), 4, 4, BOSS_COL);
-    rl.drawRectangle(@intFromFloat(ox + (g.map.spawn.x + halfW) * scale - 2), @intFromFloat(oy + (g.map.spawn.z + halfD) * scale - 2), 4, 4, SPAWN_COL);
-    rl.drawRectangle(@intFromFloat(ox + (g.map.portal.x + halfW) * scale - 2), @intFromFloat(oy + (g.map.portal.z + halfD) * scale - 2), 4, 4, PORTAL_COL);
+    for (Anchor.order) |a| {
+        const ap = a.posPtr(&g.map).*;
+        rl.drawRectangle(@intFromFloat(ox + (ap.x + halfW) * scale - 2), @intFromFloat(oy + (ap.z + halfD) * scale - 2), 4, 4, a.col());
+    }
 
     // Approximate view square, and click/drag-to-travel.
     const viewHalf = 24.0 / g.rig.zoom;
@@ -2229,21 +2284,13 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
     // Clamp to the arena inset like the LMB placement path (#L1409); a raw ctxWorld
     // point can land in the void past the wall → unreachable hero/exit + save != authored.
     const ap = clampAnchor(m, p);
-    if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Move spawn here", 16, false)) {
-        setAnchorIfMoved(g, &m.spawn, ap);
-        ed.ctxOpen = false;
+    for (Anchor.order) |a| {
+        if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), a.moveLabel(), 16, false)) {
+            setAnchorIfMoved(g, a.posPtr(m), ap);
+            ed.ctxOpen = false;
+        }
+        y += rowH;
     }
-    y += rowH;
-    if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Move portal here", 16, false)) {
-        setAnchorIfMoved(g, &m.portal, ap);
-        ed.ctxOpen = false;
-    }
-    y += rowH;
-    if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Move boss here", 16, false)) {
-        setAnchorIfMoved(g, &m.bossPos, ap);
-        ed.ctxOpen = false;
-    }
-    y += rowH;
     if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), "Cancel", 16, false)) ed.ctxOpen = false;
 
     // A click off the menu dismisses it.
@@ -2265,7 +2312,7 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
             ui.textField(ctx, ui.rect(mb.x + 24, mb.y + 68, 372, 30), &ed.field_buf, &ed.field_len, true, g.elapsed);
             // Live path preview: exactly what doSaveAs will write, so sanitizing
             // never surprises.
-            var slug: [40]u8 = undefined;
+            var slug: [NAME_CAP]u8 = undefined;
             var pv: [ui.MSG_CAP]u8 = undefined;
             const s = slugTo(&slug, ed.field_buf[0..ed.field_len]);
             const preview = if (s.len > 0)

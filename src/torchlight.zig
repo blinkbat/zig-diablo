@@ -264,6 +264,12 @@ pub const FogParams = struct {
     halfD: f32,
 };
 
+// The scene's `lightColor` uniform as an rgb + opaque-alpha vec4 — one construction
+// shared by the init default and every per-area re-tint.
+fn lightColorVec(rgb: [3]f32) [4]f32 {
+    return .{ rgb[0], rgb[1], rgb[2], 1.0 };
+}
+
 pub const Torch = struct {
     shadowMap: rl.RenderTexture2D,
     fireMap: rl.RenderTexture2D,
@@ -272,6 +278,7 @@ pub const Torch = struct {
     loc_lightPos: i32,
     loc_lightVP: i32,
     loc_lightRadius: i32,
+    loc_lightColor: i32,
     loc_fogHalf: i32,
     loc_fireVP: i32,
     loc_firePos: i32,
@@ -291,8 +298,9 @@ pub const Torch = struct {
         const scene = try rl.loadShaderFromMemory(sceneVS, sceneFS);
 
         // Constant uniforms.
-        const lc = [4]f32{ DEFAULT_LIGHT[0], DEFAULT_LIGHT[1], DEFAULT_LIGHT[2], 1.0 };
-        rl.setShaderValue(scene, rl.getShaderLocation(scene, "lightColor"), &lc, .vec4);
+        const loc_lightColor = rl.getShaderLocation(scene, "lightColor");
+        const lc = lightColorVec(DEFAULT_LIGHT);
+        rl.setShaderValue(scene, loc_lightColor, &lc, .vec4);
         const amb = [4]f32{ 0.6, 0.6, 0.7, 1.0 };
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "ambient"), &amb, .vec4);
         const res: i32 = SHADOWMAP_RESOLUTION;
@@ -311,6 +319,7 @@ pub const Torch = struct {
             .loc_lightPos = rl.getShaderLocation(scene, "lightPos"),
             .loc_lightVP = rl.getShaderLocation(scene, "lightVP"),
             .loc_lightRadius = rl.getShaderLocation(scene, "lightRadius"),
+            .loc_lightColor = loc_lightColor,
             .loc_fogHalf = rl.getShaderLocation(scene, "fogHalf"),
             .loc_fireVP = rl.getShaderLocation(scene, "fireVP"),
             .loc_firePos = rl.getShaderLocation(scene, "firePos"),
@@ -419,8 +428,8 @@ pub const Torch = struct {
     // so one pipeline gives every floor its own night. Once per area transition, not
     // per frame.
     pub fn setLightColor(self: *Torch, rgb: [3]f32) void {
-        const lc = [4]f32{ rgb[0], rgb[1], rgb[2], 1.0 };
-        rl.setShaderValue(self.scene, rl.getShaderLocation(self.scene, "lightColor"), &lc, .vec4);
+        const lc = lightColorVec(rgb);
+        rl.setShaderValue(self.scene, self.loc_lightColor, &lc, .vec4);
     }
 
     // Fog-of-war uniforms. Stash the map's GPU id for beginScene to bind on SLOT_FOG,

@@ -3,7 +3,6 @@ const rl = @import("raylib");
 const mathx = @import("mathx.zig");
 
 const v3 = mathx.v3;
-const ground = mathx.ground;
 const dist2XZ = mathx.dist2XZ;
 
 // Blocking scenery; collision is circular in the XZ plane.

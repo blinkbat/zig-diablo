@@ -117,6 +117,9 @@ const GasCloud = struct {
     life: f32 = 0,
     dps: f32 = 0,
     seed: f32 = 0, // per-cloud churn phase so neighbouring clouds don't boil in sync
+    // Whose cloud: a zombie's miasma hurts the HERO; the hero's Toxic Flask hurts
+    // MONSTERS. Same rendering + lifecycle, opposite victims.
+    fromPlayer: bool = false,
 };
 
 // Fixed-capacity transient text field: format into an inline buffer with a countdown.
@@ -175,10 +178,10 @@ pub const sheetSkills = [_]playermod.Skill{ .melee, .firebolt, .dodge };
 comptime {
     var rankable = 0;
     for (playermod.Skill.all) |s| {
-        if (!s.consumable()) rankable += 1;
+        if (s.rankable()) rankable += 1;
     }
     std.debug.assert(sheetSkills.len == rankable); // every rankable skill has a row...
-    for (sheetSkills) |s| std.debug.assert(!s.consumable()); // ...and no consumable does
+    for (sheetSkills) |s| std.debug.assert(s.rankable()); // ...and only rankable skills do
 }
 pub const SHEET_ATTR_COUNT: i32 = @intCast(stats.Attribs.order.len);
 pub const SHEET_ROW_COUNT: i32 = SHEET_ATTR_COUNT + @as(i32, @intCast(sheetSkills.len));
@@ -206,10 +209,16 @@ fn updateCharScreen(g: *Game, altHeld: bool) void {
     }
 }
 
+// Step a d-pad menu cursor by `delta` (±1), wrapping within [0, n). One source so the
+// off-by-one "+ n" before the modulo can't be fumbled per menu.
+fn navWrap(sel: i32, delta: i32, n: i32) i32 {
+    return @mod(sel + delta + n, n);
+}
+
 // Stats page: up/down move the row, A / right spends a point on it.
 fn updateStatsTab(g: *Game, altHeld: bool) void {
-    if (input.navDown()) g.sheetSel = @mod(g.sheetSel + 1, SHEET_ROW_COUNT);
-    if (input.navUp()) g.sheetSel = @mod(g.sheetSel - 1 + SHEET_ROW_COUNT, SHEET_ROW_COUNT);
+    if (input.navDown()) g.sheetSel = navWrap(g.sheetSel, 1, SHEET_ROW_COUNT);
+    if (input.navUp()) g.sheetSel = navWrap(g.sheetSel, -1, SHEET_ROW_COUNT);
     if (input.confirm(altHeld) or input.navRight()) {
         if (g.sheetSel < SHEET_ATTR_COUNT) {
             _ = g.p.allocAttr(stats.Attribs.order[@intCast(g.sheetSel)]);
@@ -223,8 +232,8 @@ fn updateStatsTab(g: *Game, altHeld: bool) void {
 // skill on it. The mouse mirrors this in hudx, but the pad is the primary path.
 fn updateSkillsTab(g: *Game, altHeld: bool) void {
     const n: i32 = playermod.SKILL_SLOTS;
-    if (input.navLeft()) g.skillSel = @mod(g.skillSel - 1 + n, n);
-    if (input.navRight()) g.skillSel = @mod(g.skillSel + 1, n);
+    if (input.navLeft()) g.skillSel = navWrap(g.skillSel, -1, n);
+    if (input.navRight()) g.skillSel = navWrap(g.skillSel, 1, n);
     if (input.navDown() or input.confirm(altHeld)) g.p.bar.cycle(@intCast(g.skillSel), 1);
     if (input.navUp()) g.p.bar.cycle(@intCast(g.skillSel), -1);
 }
@@ -306,6 +315,12 @@ const ZOMBIE_SLAM_FWD = 0.7;
 fn playerReach(atkRange: f32, targetRadius: f32) f32 {
     return atkRange + targetRadius;
 }
+
+// Extra-skill footprints. Nova is a burst around the hero; Cleave sweeps a frontal arc
+// out to the melee reach. CLEAVE_ARC_DOT is the cosine cutoff between facing and the
+// direction to a foe — -0.15 ≈ a ~190° fan, so it catches flanking foes but not your back.
+const NOVA_RADIUS: f32 = 5.0;
+const CLEAVE_ARC_DOT: f32 = -0.15;
 
 // Max vertical gap counting as "comparable ground" for melee: strikes (both ways) and
 // windup decisions all read this, so nobody swings across a cliff edge. Above
@@ -409,7 +424,8 @@ pub const Game = struct {
     lootList: std.ArrayList(LootDrop),
     gas: [MAX_GAS]GasCloud = undefined,
     gasCount: usize = 0,
-    gasHurtCD: f32 = 0, // countdown to the next DoT pulse in miasma
+    gasHurtCD: f32 = 0, // countdown to the next DoT pulse hurting the HERO (miasma)
+    gasFoeCD: f32 = 0, // countdown to the next DoT pulse hurting MONSTERS (toxic flask)
 
     rig: CamRig,
 
@@ -680,6 +696,7 @@ fn updateTimers(g: *Game, dt: f32) void {
     const p = &g.p;
     if (p.atkCD > 0) p.atkCD -= dt;
     if (p.castCD > 0) p.castCD -= dt;
+    p.tickSkillCDs(dt);
     if (p.rollTimer > 0) p.rollTimer -= dt;
     if (p.rollCD > 0) p.rollCD -= dt;
     if (p.iframe > 0) p.iframe -= dt;
@@ -719,13 +736,6 @@ fn handleInput(g: *Game) void {
         p.chaseMonster = -1; // manual movement cancels the chase (still faces the selection)
     } else {
         g.kbMove = mathx.zero3;
-    }
-
-    // Dodge roll: roll in the movement direction, else toward the cursor.
-    if (rl.isKeyPressed(.space)) {
-        var dir = g.kbMove;
-        if (lenXZ(dir) < 1e-3) dir = dirXZ(p.Pos, g.mouseGround);
-        doDodge(g, dir);
     }
 
     const mouse = rl.getMousePosition();
@@ -769,7 +779,12 @@ fn fireSlot(g: *Game, slot: usize, isLMB: bool) void {
     };
     switch (skill) {
         .melee => meleeAction(g, isLMB),
+        .cleave => doCleave(g),
+        .throwing_knife => throwKnife(g),
         .firebolt => castFirebolt(g),
+        .ice_shard => castIceShard(g),
+        .lightning_nova => castNova(g),
+        .toxic_flask => throwFlask(g),
         .dodge => fireDodge(g),
         .health_potion => useHealthPotion(g),
         .mana_potion => useManaPotion(g),
@@ -817,37 +832,160 @@ fn fireDodge(g: *Game) void {
     doDodge(g, dir);
 }
 
+// Where an aimed skill is thrown: the selected foe if there is one (you're already
+// facing it, terrain height and all), otherwise the cursor / stick aim point. `y` is the
+// hitbox-center height so a shot rains onto a raised or sunken mark. Shared by every
+// aimed skill so they all lead the same target.
+const Aim = struct { pt: rl.Vector3, y: f32, dir: rl.Vector3 };
+fn resolveAim(g: *Game) Aim {
+    const p = &g.p;
+    var pt = g.mouseGround;
+    var y = g.mouseGround.y + 0.9;
+    if (g.monsterByID(p.targetMonster)) |m| {
+        if (m.alive()) {
+            pt = m.Pos;
+            // Hitbox center — deliberately NOT the drawn chest (+MONSTER_TORSO_BASE): the
+            // shot collides against the body volume, not the sprite.
+            y = m.Pos.y + m.Height * 0.5;
+        }
+    }
+    var dir = dirXZ(p.Pos, pt);
+    if (lenXZ(dir) < 1e-4) dir = p.Facing;
+    return .{ .pt = pt, .y = y, .dir = dir };
+}
+
+// A spell's live cooldown window: base recharge shortened by cast speed + CDR, exactly
+// like Firebolt's castRate. One helper so every extra spell recharges on the same curve.
+fn spellCooldown(g: *const Game, base: f32) f32 {
+    const d = g.p.derived;
+    return base * (1 - d.cdrFrac) / d.castSpeedMult;
+}
+
+const MSG_NO_MANA = "Not enough mana";
+
+// Try to pay a spell's mana cost. Toasts + returns false when short (caller aborts);
+// deducts + returns true otherwise. THE mana gate, so the wording lives once.
+fn spendMana(g: *Game, cost: f32) bool {
+    if (g.p.Mana < cost) {
+        g.setToast(MSG_NO_MANA, .{});
+        return false;
+    }
+    g.p.Mana -= cost;
+    return true;
+}
+
+// One crit roll against luck's global crit chance: returns the (possibly x CRIT_MULT)
+// damage plus whether it critted, so damage, FX, and rumble all read the SAME roll.
+fn rollCrit(g: *Game, base: f32) struct { dmg: f32, crit: bool } {
+    const crit = g.rng.float() < g.p.derived.critChance;
+    return .{ .dmg = if (crit) base * stats.CRIT_MULT else base, .crit = crit };
+}
+
 fn castFirebolt(g: *Game) void {
     const p = &g.p;
     if (p.stunned()) return;
     if (p.castCD > 0 or p.Mana < p.spellCost) {
-        if (p.Mana < p.spellCost) g.setToast("Not enough mana", .{});
+        if (p.Mana < p.spellCost) g.setToast(MSG_NO_MANA, .{});
         return;
     }
-    // Fire at the selected target when there is one (you're already facing it, terrain
-    // height and all); otherwise at the cursor / aim point.
-    var aimPt = g.mouseGround;
-    var aimY = g.mouseGround.y + 0.9;
-    if (g.monsterByID(p.targetMonster)) |m| {
-        if (m.alive()) {
-            aimPt = m.Pos;
-            // Hitbox center — deliberately NOT the drawn chest (+MONSTER_TORSO_BASE): the
-            // bolt collides against the body volume, not the sprite.
-            aimY = m.Pos.y + m.Height * 0.5;
-        }
-    }
-    var dir = dirXZ(p.Pos, aimPt);
-    if (lenXZ(dir) < 1e-4) dir = p.Facing;
-    p.Facing = dir;
+    const aim = resolveAim(g);
+    p.Facing = aim.dir;
     p.Mana -= p.spellCost;
     p.castCD = p.castRate;
     // Firebolt is pure fire; resists (not armor) mitigate it. Crit applies here too
     // (luck's crit chance is global, as the stat sheet advertises — not melee-only).
-    var roll = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(8)));
-    if (g.rng.float() < p.derived.critChance) roll *= stats.CRIT_MULT;
-    const dmg = stats.Damage.one(.fire, roll);
-    g.projs.add(projectile.newFirebolt(p.Pos, dir, dmg, aimYVel(p.Pos.y + projectile.fireboltMuzzleDY, aimY, distXZ(p.Pos, aimPt), projectile.fireboltSpeed)));
+    const roll = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(8)));
+    const dmg = stats.Damage.one(.fire, rollCrit(g, roll).dmg);
+    g.projs.add(projectile.newFirebolt(p.Pos, aim.dir, dmg, aimYVel(p.Pos.y + projectile.fireboltMuzzleDY, aim.y, distXZ(p.Pos, aim.pt), projectile.fireboltSpeed)));
     g.rumble.play(rumble.cast);
+}
+
+// Ice Shard: a cold bolt scaling with spell damage; chills what it strikes (applied in
+// keepProjectile on contact). Same aim/gate shape as Firebolt.
+fn castIceShard(g: *Game) void {
+    const p = &g.p;
+    if (p.stunned() or !p.auxReady(.ice_shard)) return;
+    if (!spendMana(g, playermod.ICE_COST)) return;
+    const aim = resolveAim(g);
+    p.Facing = aim.dir;
+    p.startAuxCD(.ice_shard, spellCooldown(g, playermod.ICE_CD));
+    const roll = playermod.ICE_DMG * p.derived.spellMult + @as(f32, @floatFromInt(g.rng.intn(6)));
+    g.projs.add(projectile.newIceShard(p.Pos, aim.dir, stats.Damage.one(.cold, rollCrit(g, roll).dmg), aimYVel(p.Pos.y + projectile.handMuzzleDY, aim.y, distXZ(p.Pos, aim.pt), projectile.iceShardSpeed)));
+    g.rumble.play(rumble.cast);
+}
+
+// Throwing Knife: fast, free physical dart scaling with ranged (dexterity) damage —
+// the hero's only bow-less ranged attack. No mana; gated purely by its short cooldown.
+fn throwKnife(g: *Game) void {
+    const p = &g.p;
+    if (p.stunned() or !p.auxReady(.throwing_knife)) return;
+    const aim = resolveAim(g);
+    p.Facing = aim.dir;
+    p.startAuxCD(.throwing_knife, spellCooldown(g, playermod.KNIFE_CD));
+    const roll = g.rng.range(playermod.KNIFE_MIN, playermod.KNIFE_MAX) * p.derived.rangedMult;
+    g.projs.add(projectile.newKnife(p.Pos, aim.dir, stats.Damage.phys(rollCrit(g, roll).dmg), aimYVel(p.Pos.y + projectile.handMuzzleDY, aim.y, distXZ(p.Pos, aim.pt), projectile.knifeSpeed)));
+    g.rumble.play(rumble.attack_hit);
+}
+
+// Toxic Flask: lob a vial that bursts (impactBurst) into a lingering poison cloud that
+// ticks chaos damage to any foe inside. AoE + DoT; scales with spell damage.
+fn throwFlask(g: *Game) void {
+    const p = &g.p;
+    if (p.stunned() or !p.auxReady(.toxic_flask)) return;
+    if (!spendMana(g, playermod.FLASK_COST)) return;
+    const aim = resolveAim(g);
+    p.Facing = aim.dir;
+    p.startAuxCD(.toxic_flask, spellCooldown(g, playermod.FLASK_CD));
+    const dps = playermod.FLASK_DPS * p.derived.spellMult;
+    g.projs.add(projectile.newFlask(p.Pos, aim.dir, dps, aimYVel(p.Pos.y + projectile.handMuzzleDY, aim.y, distXZ(p.Pos, aim.pt), projectile.flaskSpeed)));
+    g.rumble.play(rumble.cast);
+}
+
+// Lightning Nova: an instant burst that forks lightning through every live foe within
+// NOVA_RADIUS. Self-centered AoE — no aim needed. Scales with spell damage.
+fn castNova(g: *Game) void {
+    const p = &g.p;
+    if (p.stunned() or !p.auxReady(.lightning_nova)) return;
+    if (!spendMana(g, playermod.NOVA_COST)) return;
+    p.startAuxCD(.lightning_nova, spellCooldown(g, playermod.NOVA_CD));
+    for (g.liveMonsters()) |*m| {
+        if (!m.alive()) continue;
+        if (distXZ(p.Pos, m.Pos) > NOVA_RADIUS + m.Radius or @abs(m.Pos.y - p.Pos.y) >= SAME_GROUND_DY) continue;
+        const roll = playermod.NOVA_DMG * p.derived.spellMult + @as(f32, @floatFromInt(g.rng.intn(6)));
+        const rc = rollCrit(g, roll);
+        damageMonster(g, m, stats.Damage.one(.lightning, rc.dmg), rc.crit);
+        // A jagged arc from the hero to each struck foe.
+        g.parts.burst(&g.rng, v3(m.Pos.x, monsterChestY(m, 0.5), m.Pos.z), 8, 5.0, 0.09, 0.35, rgba(190, 215, 255, 255), 6);
+    }
+    // The discharge ring + a flash off the hero.
+    g.parts.burst(&g.rng, v3(p.Pos.x, p.Pos.y + 0.4, p.Pos.z), 26, 7.5, 0.1, 0.5, rgba(150, 195, 255, 255), 3);
+    g.parts.burst(&g.rng, v3(p.Pos.x, p.Pos.y + 1.0, p.Pos.z), 12, 3.0, 0.12, 0.6, rgba(225, 240, 255, 255), 1);
+    g.shake = maxF(g.shake, 0.18);
+    g.rumble.play(rumble.cast);
+}
+
+// Cleave: a sweeping physical strike that hits every live foe in a frontal arc within
+// melee reach. Uses the melee swing animation + cooldown feel; scales with melee damage.
+fn doCleave(g: *Game) void {
+    const p = &g.p;
+    if (p.stunned() or p.rolling() or !p.auxReady(.cleave)) return;
+    // Aim the sweep at the selected foe if there is one, else keep facing.
+    if (g.monsterByID(p.targetMonster)) |m| {
+        if (m.alive()) p.Facing = dirXZ(p.Pos, m.Pos);
+    }
+    p.startAuxCD(.cleave, playermod.CLEAVE_CD);
+    p.swing = playermod.swingDur;
+    var hit = false;
+    for (g.liveMonsters()) |*m| {
+        if (!m.alive()) continue;
+        if (distXZ(p.Pos, m.Pos) > playerReach(p.atkRange, m.Radius) or @abs(m.Pos.y - p.Pos.y) >= SAME_GROUND_DY) continue;
+        const to = dirXZ(p.Pos, m.Pos);
+        if (to.x * p.Facing.x + to.z * p.Facing.z < CLEAVE_ARC_DOT) continue; // behind the swing
+        const rc = rollCrit(g, g.rng.range(p.MinDmg, p.MaxDmg));
+        damageMonster(g, m, stats.Damage.phys(rc.dmg), rc.crit);
+        hit = true;
+    }
+    g.rumble.play(if (hit) rumble.attack_hit else rumble.dodge);
 }
 
 // Vertical velocity carrying a shot from muzzle to target height over its flight (a
@@ -931,16 +1069,16 @@ fn handleGamepad(g: *Game) void {
         if (aimTarget) |id| p.targetMonster = id; // sticky manual pick via the right stick
     }
 
-    // Fire every slot whose controller button is held (X=0, Y=1, d-pad=2/3/4). A slot
-    // holding an offensive skill needs a selected target + a projected aim point first,
-    // so scan once if any firing slot is offensive (mirroring the old X-acquires-nearest).
+    // Fire every slot whose controller button is held. A slot holding an OFFENSIVE skill
+    // (melee/cleave/any aimed projectile) needs a selected target + a projected aim point
+    // first, so scan once if any firing slot is offensive (mirroring the old X-acquire).
     var offensiveFiring = false;
     {
         var s: usize = 0;
         while (s < playermod.SKILL_SLOTS) : (s += 1) {
             if (input.slotPadDown(s)) {
                 if (p.bar.slots[s]) |sk| {
-                    if (sk == .melee or sk == .firebolt) offensiveFiring = true;
+                    if (sk.offensive()) offensiveFiring = true;
                 }
             }
         }
@@ -959,14 +1097,6 @@ fn handleGamepad(g: *Game) void {
             if (fires) fireSlot(g, s, false);
         }
     }
-
-    // B: dodge roll (movement direction, else aim direction, else facing).
-    if (input.padDodgePressed()) {
-        var dir = g.kbMove;
-        if (lenXZ(dir) < 1e-3) dir = aimDir;
-        doDodge(g, dir);
-    }
-
 }
 
 // updateAim refreshes the ground point under the cursor and the hovered monster.
@@ -1113,15 +1243,13 @@ fn updatePlayerAttack(g: *Game) void {
         return;
     }
     if (distXZ(p.Pos, m.Pos) <= playerReach(p.atkRange, m.Radius) and @abs(m.Pos.y - p.Pos.y) < SAME_GROUND_DY) {
-        var dmg = g.rng.range(p.MinDmg, p.MaxDmg);
-        const crit = g.rng.float() < p.derived.critChance;
-        if (crit) dmg *= stats.CRIT_MULT;
+        const rc = rollCrit(g, g.rng.range(p.MinDmg, p.MaxDmg));
         p.Facing = dirXZ(p.Pos, m.Pos);
         p.swing = playermod.swingDur;
         p.atkCD = p.atkRate;
-        g.rumble.play(if (crit) rumble.crit_hit else rumble.attack_hit);
+        g.rumble.play(if (rc.crit) rumble.crit_hit else rumble.attack_hit);
         // Melee is untyped physical — armor (not resists) mitigates it.
-        damageMonster(g, m, stats.Damage.phys(dmg), crit);
+        damageMonster(g, m, stats.Damage.phys(rc.dmg), rc.crit);
     }
 }
 
@@ -1196,13 +1324,15 @@ fn onLevelUp(g: *Game) void {
 
 fn moveMonster(g: *Game, m: *Monster, dir: rl.Vector3, dt: f32) void {
     if (lenXZ(dir) < 1e-4) return;
-    m.Pos = g.w.moveWithCollision(m.Pos, v3(dir.x * m.Speed * dt, 0, dir.z * m.Speed * dt), m.Radius);
+    const spd = m.Speed * m.moveMult(); // chill slows every step (wander, chase, lunge, dodge)
+    m.Pos = g.w.moveWithCollision(m.Pos, v3(dir.x * spd * dt, 0, dir.z * spd * dt), m.Radius);
 }
 
 fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
     m.Pos.y = g.w.groundY(m.Pos.x, m.Pos.z); // feet on the ground (spawns, ramps)
     if (m.hitFlash > 0) m.hitFlash -= dt;
     if (m.atkCD > 0) m.atkCD -= dt;
+    m.tickStatus(dt); // fade chill (and any future status)
     m.bob += dt * (m.Speed + 2);
 
     // Stunned: frozen (no steering/windup/attacks). tickStun decays the meter; applyStun
@@ -1483,9 +1613,10 @@ fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
     pr.Pos.y += pr.Vel.y * c.dt;
     pr.Pos.z += pr.Vel.z * c.dt;
     pr.Life -= c.dt;
-    // The firebolt sheds a spark trail as it flies (arrows fly clean).
-    if (pr.FromPlayer) {
-        g.parts.spawn(.{
+    // Trail: the firebolt sheds fire sparks; the ice shard a cold mist. Knife/flask/arrow
+    // fly clean so they stay legible in the dark.
+    switch (pr.Kind) {
+        .firebolt => g.parts.spawn(.{
             .Pos = v3(pr.Pos.x + (g.rng.float() - 0.5) * 0.25, pr.Pos.y + (g.rng.float() - 0.5) * 0.25, pr.Pos.z + (g.rng.float() - 0.5) * 0.25),
             .Vel = v3(-pr.Vel.x * 0.06, 0.6 + g.rng.float(), -pr.Vel.z * 0.06),
             .Life = 0.28 + g.rng.float() * 0.22,
@@ -1494,7 +1625,18 @@ fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
             .Color = if (g.rng.float() < 0.6) projectile.fireboltColor else rgba(255, 220, 120, 255),
             .grav = -1.5,
             .drag = 1.5,
-        });
+        }),
+        .ice_shard => g.parts.spawn(.{
+            .Pos = v3(pr.Pos.x + (g.rng.float() - 0.5) * 0.2, pr.Pos.y + (g.rng.float() - 0.5) * 0.2, pr.Pos.z + (g.rng.float() - 0.5) * 0.2),
+            .Vel = v3(-pr.Vel.x * 0.04, -0.3 - g.rng.float() * 0.4, -pr.Vel.z * 0.04),
+            .Life = 0.22 + g.rng.float() * 0.18,
+            .maxLife = 0.4,
+            .Size = 0.07,
+            .Color = if (g.rng.float() < 0.5) projectile.iceShardColor else rgba(225, 245, 255, 255),
+            .grav = 0.6, // frost motes sink
+            .drag = 2.0,
+        }),
+        else => {},
     }
     if (pr.Life <= 0 or g.w.rayHitsObstacle(pr.Pos, pr.Radius)) {
         impactBurst(g, pr);
@@ -1505,7 +1647,11 @@ fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
     if (pr.FromPlayer) {
         for (g.liveMonsters()) |*m| {
             if (m.alive() and dist2XZ(m.Pos, pr.Pos) < (m.Radius + pr.Radius) * (m.Radius + pr.Radius) and @abs(pr.Pos.y - (m.Pos.y + m.Height * 0.55)) < m.Height * 0.55 + 0.7) {
-                damageMonster(g, m, pr.Damage, false);
+                // A flask carries no direct hit — it bursts into a cloud (impactBurst).
+                if (pr.Kind != .flask) {
+                    damageMonster(g, m, pr.Damage, false);
+                    if (pr.Kind == .ice_shard) m.applyChill(playermod.CHILL_DUR, playermod.CHILL_FACTOR);
+                }
                 impactBurst(g, pr);
                 return false;
             }
@@ -1518,14 +1664,26 @@ fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
     return true;
 }
 
-// A projectile ends its flight: the firebolt detonates into a two-tone flash; an
+// A projectile ends its flight, its burst keyed to what it is: fire detonation, frost
+// shatter, metallic spark, or a flask cracking open into a poison cloud; the monster's
 // arrow just splinters faintly.
 fn impactBurst(g: *Game, pr: *const Projectile) void {
-    if (pr.FromPlayer) {
-        g.parts.burst(&g.rng, pr.Pos, 16, 6.5, 0.13, 0.45, rgba(255, 170, 60, 255), 8);
-        g.parts.burst(&g.rng, pr.Pos, 8, 3.0, 0.1, 0.6, rgba(255, 235, 160, 255), 4);
-    } else {
-        g.parts.burst(&g.rng, pr.Pos, 5, 3.0, 0.07, 0.3, rgba(210, 205, 180, 200), 10);
+    switch (pr.Kind) {
+        .firebolt => {
+            g.parts.burst(&g.rng, pr.Pos, 16, 6.5, 0.13, 0.45, rgba(255, 170, 60, 255), 8);
+            g.parts.burst(&g.rng, pr.Pos, 8, 3.0, 0.1, 0.6, rgba(255, 235, 160, 255), 4);
+        },
+        .ice_shard => {
+            g.parts.burst(&g.rng, pr.Pos, 14, 5.5, 0.1, 0.4, projectile.iceShardColor, 10);
+            g.parts.burst(&g.rng, pr.Pos, 6, 2.5, 0.08, 0.5, rgba(230, 248, 255, 255), 12);
+        },
+        .knife => g.parts.burst(&g.rng, pr.Pos, 6, 4.0, 0.06, 0.3, rgba(210, 216, 226, 235), 14),
+        .flask => {
+            // Crack open into a lingering poison cloud that ticks chaos damage to foes.
+            spawnPoisonCloud(g, g.w.snapY(pr.Pos), pr.Payload);
+            g.parts.burst(&g.rng, pr.Pos, 12, 4.5, 0.12, 0.5, projectile.toxicColor, 6);
+        },
+        .arrow => g.parts.burst(&g.rng, pr.Pos, 5, 3.0, 0.07, 0.3, rgba(210, 205, 180, 200), 10),
     }
 }
 fn updateProjectiles(g: *Game, dt: f32) void {
@@ -1586,11 +1744,19 @@ fn updateDeaths(g: *Game, dt: f32) void {
     g.monsterCount = retain(Monster, g.liveMonsters(), SweepCtx{ .g = g, .dt = dt }, keepMonster);
 }
 
+// A zombie's death miasma: hurts the HERO who lingers in it.
 fn spawnGasCloud(g: *Game, pos: rl.Vector3, dps: f32) void {
+    addGasCloud(g, pos, dps, false);
+}
+// The hero's Toxic Flask cloud: hurts MONSTERS caught in it.
+fn spawnPoisonCloud(g: *Game, pos: rl.Vector3, dps: f32) void {
+    addGasCloud(g, pos, dps, true);
+}
+fn addGasCloud(g: *Game, pos: rl.Vector3, dps: f32, fromPlayer: bool) void {
     if (g.gasCount >= g.gas.len) return;
-    g.gas[g.gasCount] = .{ .Pos = pos, .life = GAS_LIFE, .dps = dps, .seed = g.rng.angle() };
+    g.gas[g.gasCount] = .{ .Pos = pos, .life = GAS_LIFE, .dps = dps, .seed = g.rng.angle(), .fromPlayer = fromPlayer };
     g.gasCount += 1;
-    // The body's rot boiling OUT — buoyant, sickly.
+    // The rot boiling OUT — buoyant, sickly.
     g.parts.burst(&g.rng, v3(pos.x, pos.y + 0.7, pos.z), 18, 2.4, 0.15, 1.2, rgba(188, 228, 112, 230), -2);
 }
 
@@ -1621,11 +1787,29 @@ fn keepGas(c: SweepCtx, gc: *GasCloud) bool {
 fn updateGasClouds(g: *Game, dt: f32) void {
     g.gasCount = retain(GasCloud, g.gas[0..g.gasCount], SweepCtx{ .g = g, .dt = dt }, keepGas);
     if (g.gasHurtCD > 0) g.gasHurtCD -= dt;
+    if (g.gasFoeCD > 0) g.gasFoeCD -= dt;
+
+    // Toxic-flask clouds (fromPlayer) choke MONSTERS standing in them. Independent of the
+    // hero's state — a poison cloud keeps working even while you roll or lie dead.
+    const foeTick = g.gasFoeCD <= 0;
+    if (foeTick) g.gasFoeCD = GAS_TICK;
+    for (g.liveMonsters()) |*m| {
+        if (!m.alive()) continue;
+        var dps: f32 = 0;
+        for (g.gas[0..g.gasCount]) |*gc| {
+            if (gc.fromPlayer and dist2XZ(m.Pos, gc.Pos) <= GAS_RADIUS * GAS_RADIUS and @abs(m.Pos.y - gc.Pos.y) < SAME_GROUND_DY) dps += gc.dps;
+        }
+        if (dps > 0 and foeTick) {
+            damageMonster(g, m, stats.Damage.one(.chaos, dps * GAS_TICK), false);
+        }
+    }
+
     if (!g.p.alive() or g.p.invulnerable()) return; // a roll carries you clean through the fumes
-    // Overlapping clouds stack: standing in a zombie pile's remains is its own mistake.
+    // Zombie miasma (not fromPlayer) hurts the hero. Overlapping clouds stack: standing in
+    // a zombie pile's remains is its own mistake.
     var dps: f32 = 0;
     for (g.gas[0..g.gasCount]) |*gc| {
-        if (dist2XZ(g.p.Pos, gc.Pos) <= GAS_RADIUS * GAS_RADIUS and @abs(g.p.Pos.y - gc.Pos.y) < SAME_GROUND_DY) dps += gc.dps;
+        if (!gc.fromPlayer and dist2XZ(g.p.Pos, gc.Pos) <= GAS_RADIUS * GAS_RADIUS and @abs(g.p.Pos.y - gc.Pos.y) < SAME_GROUND_DY) dps += gc.dps;
     }
     if (dps > 0 and g.gasHurtCD <= 0) {
         g.gasHurtCD = GAS_TICK;
@@ -1757,6 +1941,7 @@ fn resetArena(g: *Game) void {
     g.lootList.clearRetainingCapacity();
     g.gasCount = 0; // miasma stays with its corpse — it never rides the portal
     g.gasHurtCD = 0; // don't carry a mid-countdown tick into the new area
+    g.gasFoeCD = 0;
     g.parts.clear(); // stray sparks must not carry across the portal
     g.damageFlash = 0; // timers only decay in .playing, so a killing blow's
     g.shake = 0; // flash/shake would otherwise replay over the fresh area
@@ -2566,26 +2751,49 @@ fn fireLight(g: *Game, t: f32) tl.FireParams {
 
 fn drawProjectiles(projs: *ProjList, t: f32) void {
     for (projs.items()) |*pr| {
-        if (pr.FromPlayer) {
-            // Firebolt: a white-hot heart in a flickering orange corona, a flame tongue trailing. Sparks are particles.
-            const flick = 1 + 0.16 * sinf(t * 31 + pr.Pos.x * 5 + pr.Pos.z * 3);
-            const tail = v3(pr.Pos.x - pr.Vel.x * 0.055, pr.Pos.y + 0.1, pr.Pos.z - pr.Vel.z * 0.055);
-            rl.drawCylinderEx(tail, pr.Pos, 0.04, pr.Radius * 0.75, 6, rgba(255, 120, 30, 120));
-            sphere(pr.Pos, pr.Radius * 0.95 * flick, rgba(255, 110, 25, 95));
-            sphere(pr.Pos, pr.Radius * 0.6 * flick, rgba(255, 180, 60, 210));
-            sphere(pr.Pos, pr.Radius * 0.32, projectile.flameHeartColor);
-        } else {
-            // Arrow: a real shaft (dark wood, bone head, grey fletch) laid along its flight, not a floating ball.
-            const inv = 1.0 / maxF(lenXZ(pr.Vel), 1e-4);
-            const dx = pr.Vel.x * inv;
-            const dz = pr.Vel.z * inv;
-            const nock = v3(pr.Pos.x - dx * 0.5, pr.Pos.y, pr.Pos.z - dz * 0.5);
-            const tip = v3(pr.Pos.x + dx * 0.28, pr.Pos.y, pr.Pos.z + dz * 0.28);
-            // A faint slipstream behind the shaft: the arrow itself is the warning, so it stays legible in the dark.
-            rl.drawCylinderEx(v3(pr.Pos.x - dx * 1.5, pr.Pos.y, pr.Pos.z - dz * 1.5), nock, 0.008, 0.05, 4, rgba(220, 226, 238, 70));
-            rl.drawCylinderEx(nock, tip, 0.035, 0.035, 5, rgba(120, 90, 60, 255));
-            rl.drawCylinderEx(tip, v3(tip.x + dx * 0.16, tip.y, tip.z + dz * 0.16), 0.07, 0.0, 5, rgba(225, 220, 200, 255));
-            rl.drawCylinderEx(nock, v3(nock.x + dx * 0.16, nock.y, nock.z + dz * 0.16), 0.09, 0.02, 4, rgba(200, 200, 210, 220));
+        switch (pr.Kind) {
+            .firebolt => {
+                // A white-hot heart in a flickering orange corona, a flame tongue trailing. Sparks are particles.
+                const flick = 1 + 0.16 * sinf(t * 31 + pr.Pos.x * 5 + pr.Pos.z * 3);
+                const tail = v3(pr.Pos.x - pr.Vel.x * 0.055, pr.Pos.y + 0.1, pr.Pos.z - pr.Vel.z * 0.055);
+                rl.drawCylinderEx(tail, pr.Pos, 0.04, pr.Radius * 0.75, 6, rgba(255, 120, 30, 120));
+                sphere(pr.Pos, pr.Radius * 0.95 * flick, rgba(255, 110, 25, 95));
+                sphere(pr.Pos, pr.Radius * 0.6 * flick, rgba(255, 180, 60, 210));
+                sphere(pr.Pos, pr.Radius * 0.32, projectile.flameHeartColor);
+            },
+            .ice_shard => {
+                // A cold blue splinter: a faceted core in a pale halo, a short frost wake.
+                const tail = v3(pr.Pos.x - pr.Vel.x * 0.05, pr.Pos.y, pr.Pos.z - pr.Vel.z * 0.05);
+                rl.drawCylinderEx(tail, pr.Pos, 0.02, pr.Radius * 0.6, 5, mathx.withAlpha(projectile.iceShardColor, 110));
+                sphere(pr.Pos, pr.Radius * 0.85, mathx.withAlpha(projectile.iceShardColor, 150));
+                sphere(pr.Pos, pr.Radius * 0.42, rgba(235, 250, 255, 255));
+            },
+            .flask => {
+                // A tumbling vial of green venom with a faint glow.
+                sphere(pr.Pos, pr.Radius * 0.9, mathx.withAlpha(projectile.toxicColor, 150));
+                sphere(pr.Pos, pr.Radius * 0.5, rgba(210, 245, 150, 235));
+            },
+            .knife, .arrow => {
+                // A real shaft laid along its flight, not a floating ball. The knife is a
+                // stubby steel blade; the arrow a fletched wooden shaft.
+                const inv = 1.0 / maxF(lenXZ(pr.Vel), 1e-4);
+                const dx = pr.Vel.x * inv;
+                const dz = pr.Vel.z * inv;
+                if (pr.Kind == .knife) {
+                    const back = v3(pr.Pos.x - dx * 0.22, pr.Pos.y, pr.Pos.z - dz * 0.22);
+                    const tip = v3(pr.Pos.x + dx * 0.26, pr.Pos.y, pr.Pos.z + dz * 0.26);
+                    rl.drawCylinderEx(v3(pr.Pos.x - dx * 0.9, pr.Pos.y, pr.Pos.z - dz * 0.9), back, 0.006, 0.03, 4, rgba(220, 226, 238, 70));
+                    rl.drawCylinderEx(back, tip, 0.045, 0.0, 5, rgba(226, 230, 240, 255)); // blade
+                    rl.drawCylinderEx(v3(back.x - dx * 0.07, back.y, back.z - dz * 0.07), back, 0.06, 0.03, 4, rgba(120, 96, 66, 255)); // grip
+                } else {
+                    const nock = v3(pr.Pos.x - dx * 0.5, pr.Pos.y, pr.Pos.z - dz * 0.5);
+                    const tip = v3(pr.Pos.x + dx * 0.28, pr.Pos.y, pr.Pos.z + dz * 0.28);
+                    rl.drawCylinderEx(v3(pr.Pos.x - dx * 1.5, pr.Pos.y, pr.Pos.z - dz * 1.5), nock, 0.008, 0.05, 4, rgba(220, 226, 238, 70));
+                    rl.drawCylinderEx(nock, tip, 0.035, 0.035, 5, rgba(120, 90, 60, 255));
+                    rl.drawCylinderEx(tip, v3(tip.x + dx * 0.16, tip.y, tip.z + dz * 0.16), 0.07, 0.0, 5, rgba(225, 220, 200, 255));
+                    rl.drawCylinderEx(nock, v3(nock.x + dx * 0.16, nock.y, nock.z + dz * 0.16), 0.09, 0.02, 4, rgba(200, 200, 210, 220));
+                }
+            },
         }
     }
 }
@@ -3022,8 +3230,8 @@ pub fn run(shot: bool) void {
         switch (g.scene) {
             .menu => {
                 const n: i32 = if (g.menuMode == .root) menuRootItems.len else MENU_OPTIONS_COUNT;
-                if (input.navDown()) g.menuSel = @mod(g.menuSel + 1, n);
-                if (input.navUp()) g.menuSel = @mod(g.menuSel - 1 + n, n);
+                if (input.navDown()) g.menuSel = navWrap(g.menuSel, 1, n);
+                if (input.navUp()) g.menuSel = navWrap(g.menuSel, -1, n);
                 if (input.confirm(altHeld)) menuActivate(&g, g.menuSel);
                 if (g.menuMode == .options) {
                     if (input.cancel()) {
@@ -3176,14 +3384,11 @@ pub fn run(shot: bool) void {
                     g.rig.snap(g.p.Pos);
                     g.w.PortalOpen = true; // show the vortex...
                     // ...and clear the stage: anything camped on the portal hides it.
-                    var wkeep: usize = 0;
-                    for (g.liveMonsters()) |m2| {
-                        if (distXZ(m2.Pos, g.w.PortalPos) > 12) {
-                            g.monsters[wkeep] = m2;
-                            wkeep += 1;
+                    g.monsterCount = retain(Monster, g.liveMonsters(), g.w.PortalPos, struct {
+                        fn keep(portal: rl.Vector3, m2: *Monster) bool {
+                            return distXZ(m2.Pos, portal) > 12;
                         }
-                    }
-                    g.monsterCount = wkeep;
+                    }.keep);
                 }
             }
         }

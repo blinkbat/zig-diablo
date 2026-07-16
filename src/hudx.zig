@@ -160,6 +160,16 @@ fn barTicksFrame(x: i32, y: i32, w: i32, h: i32, ticks: i32, frameAlpha: u8) voi
     rl.drawRectangleLines(x - 2, y - 2, w + 4, h + 4, withAlpha(theme.trimColor, frameAlpha));
 }
 
+// `frac` of the width as a dark→`col` gradient with an optional bright top sheen
+// (sheenA=0 omits it). Shared by the enemy HP and heavy-stun channels so the fill's
+// guard + gradient live once. (XP keeps its own brass palette, not a color-lerp.)
+fn barFill(x: i32, y: i32, w: i32, h: i32, frac: f32, col: rl.Color, darken: f32, sheenA: u8) void {
+    const fw: i32 = @intFromFloat(fi(w) * clampF(frac, 0, 1));
+    if (fw <= 0) return;
+    rl.drawRectangleGradientH(x, y, fw, h, lerpColor(col, rl.Color.black, darken), col);
+    if (sheenA > 0) rl.drawRectangle(x, y, fw, 2, withAlpha(lerpColor(col, rl.Color.white, 0.5), sheenA));
+}
+
 // ---- Gamepad glyphs ----
 // Little controller-button graphics. The pad is the primary input, so the HUD names
 // every action with the button that performs it — not a keyboard key. Xbox lettering
@@ -246,11 +256,12 @@ fn padBumper(cx: i32, cy: i32, label: [:0]const u8) void {
 // input.slotPad so the badge on a slot always matches the button that triggers it.
 fn slotGlyph(i: usize, cx: i32, cy: i32, r: i32) void {
     switch (input.slotPad[i]) {
+        .face_a => padFace(cx, cy, r, .a),
         .face_x => padFace(cx, cy, r, .x),
         .face_y => padFace(cx, cy, r, .y),
-        .dpad_up => padDpad(cx, cy, r, .up),
-        .dpad_left => padDpad(cx, cy, r, .left),
-        .dpad_right => padDpad(cx, cy, r, .right),
+        .face_b => padFace(cx, cy, r, .b),
+        .l1 => padBumper(cx, cy, "L1"),
+        .r1 => padBumper(cx, cy, "R1"),
     }
 }
 
@@ -361,12 +372,7 @@ fn drawEnemyPlate(g: *Game) void {
     centered(name, 14, size, if (boss) rgba(255, 185, 205, 255) else rgba(240, 225, 205, 255));
     barBacking(bx, by, bw, bh);
     const fillCol = if (boss) rgba(225, 45, 105, 255) else rgba(200, 48, 40, 255);
-    const frac = clampF(m.HP / m.MaxHP, 0, 1);
-    const fw: i32 = @intFromFloat(fi(bw) * frac);
-    if (fw > 0) {
-        rl.drawRectangleGradientH(bx, by, fw, bh, lerpColor(fillCol, rl.Color.black, 0.3), fillCol);
-        rl.drawRectangle(bx, by, fw, 2, withAlpha(lerpColor(fillCol, rl.Color.white, 0.5), 210));
-    }
+    barFill(bx, by, bw, bh, m.HP / m.MaxHP, fillCol, 0.3, 210);
     // Quarter ticks + thin brass frame: the PoE "measured bar" signature.
     barTicksFrame(bx, by, bw, bh, 4, 140);
 
@@ -379,10 +385,7 @@ fn drawEnemyPlate(g: *Game) void {
             const pulse = 0.6 + 0.4 * sinf(g.elapsed * 12);
             rl.drawRectangle(bx, sy, bw, sbh, withAlpha(rgba(255, 250, 220, 255), mathx.u8f(clampF(pulse * 255, 0, 255))));
         } else {
-            const sfrac = clampF(m.stunFill, 0, 1);
-            const sfw: i32 = @intFromFloat(fi(bw) * sfrac);
-            const stunCol = rgba(240, 205, 90, 255);
-            if (sfw > 0) rl.drawRectangleGradientH(bx, sy, sfw, sbh, lerpColor(stunCol, rl.Color.black, 0.35), stunCol);
+            barFill(bx, sy, bw, sbh, m.stunFill, rgba(240, 205, 90, 255), 0.35, 0);
         }
         rl.drawRectangleLines(bx - 2, sy - 2, bw + 4, sbh + 4, withAlpha(theme.trimColor, 110));
     }
@@ -401,6 +404,11 @@ const SHEET_DR_REF: f32 = 40; // "% vs a 40-damage physical hit"
 const sheetGold = rgba(224, 190, 120, 255);
 const sheetInk = rgba(232, 222, 202, 255);
 const sheetDim = rgba(206, 194, 172, 255); // dimmer parchment for subtitles / hints / notes
+
+// Bright selection gold: the active tab label and the highlighted menu row share it.
+const selectedGold = rgba(255, 228, 160, 255);
+// Pulsing prompt gold on the death / victory screens (alpha animates per-frame).
+const hintPulseGold = rgba(255, 230, 160, 255);
 
 // Allocatable row: label left, value right, green "+" when a point can be spent,
 // warm highlight box when it's the cursor.
@@ -422,6 +430,14 @@ fn sheetStatRow(x: i32, y: i32, w: i32, label: [:0]const u8, val: [:0]const u8) 
     text(label, x, y, 18, rgba(196, 186, 168, 255));
     const vw = textW(val, 18);
     text(val, x + w - vw, y, 18, sheetInk);
+}
+
+// A derived-stat row whose value is formatted inline, then advances the running `yy`.
+// One scratch buffer here instead of a fresh named buffer per row at the call site.
+fn sheetStatF(x: i32, yy: *i32, w: i32, rowH: i32, label: [:0]const u8, comptime fmt: []const u8, args: anytype) void {
+    var buf: [48]u8 = undefined;
+    sheetStatRow(x, yy.*, w, label, std.fmt.bufPrintZ(&buf, fmt, args) catch "");
+    yy.* += rowH;
 }
 
 // The character screen: shared chrome + a Stats/Skills tab strip, then the active page.
@@ -465,7 +481,7 @@ fn drawCharTabs(g: *Game, cy: i32) void {
         const active = g.charTab == tb.t;
         const r = rl.Rectangle{ .x = fi(x - 10), .y = fi(cy - 4), .width = fi(tw + 20), .height = 42 };
         if (rl.checkCollisionPointRec(mouse, r) and rl.isMouseButtonPressed(.left)) g.charTab = tb.t;
-        text(tb.label, x, cy, size, if (active) rgba(255, 228, 160, 255) else rgba(178, 166, 146, 200));
+        text(tb.label, x, cy, size, if (active) selectedGold else rgba(178, 166, 146, 200));
         if (active) rl.drawRectangle(x, cy + 36, tw, 3, withAlpha(theme.goldColor, 220));
         x += tw + gap;
     }
@@ -583,40 +599,25 @@ fn drawStatsTab(g: *Game, px: i32, py: i32, pw: i32, ph: i32) void {
 
     // ── Right: derived stats (read-only totals) ──
     text("Defense", rightX, colY, 22, sheetGold);
-    var b: [40]u8 = undefined;
     var yy = colY + 32;
-    sheetStatRow(rightX, yy, colW, "Life", std.fmt.bufPrintZ(&b, "{d:.0}", .{p.MaxHP}) catch "");
-    yy += rowH;
-    var b2: [40]u8 = undefined;
-    sheetStatRow(rightX, yy, colW, "Mana", std.fmt.bufPrintZ(&b2, "{d:.0}", .{p.MaxMana}) catch "");
-    yy += rowH;
-    var b3: [48]u8 = undefined;
+    sheetStatF(rightX, &yy, colW, rowH, "Life", "{d:.0}", .{p.MaxHP});
+    sheetStatF(rightX, &yy, colW, rowH, "Mana", "{d:.0}", .{p.MaxMana});
     const drPct = stats.physReduction(p.def.armor, SHEET_DR_REF) * 100;
-    sheetStatRow(rightX, yy, colW, "Armor", std.fmt.bufPrintZ(&b3, "{d:.0}  ({d:.0}% vs {d:.0})", .{ p.def.armor, drPct, SHEET_DR_REF }) catch "");
-    yy += rowH;
+    sheetStatF(rightX, &yy, colW, rowH, "Armor", "{d:.0}  ({d:.0}% vs {d:.0})", .{ p.def.armor, drPct, SHEET_DR_REF });
     // Four resists, driven by the one canonical elemental list + its label.
     for (stats.DamageType.elementals) |rk| {
         var lb: [24]u8 = undefined;
-        var pb: [16]u8 = undefined;
         const ll = std.fmt.bufPrintZ(&lb, "{s} Res", .{rk.label()}) catch rk.label();
-        sheetStatRow(rightX, yy, colW, ll, std.fmt.bufPrintZ(&pb, "{d:.0}%", .{p.def.resFor(rk) * 100}) catch "");
-        yy += rowH;
+        sheetStatF(rightX, &yy, colW, rowH, ll, "{d:.0}%", .{p.def.resFor(rk) * 100});
     }
 
     yy += 12;
     text("Offense", rightX, yy, 22, sheetGold);
     yy += 32;
-    var o1: [40]u8 = undefined;
-    sheetStatRow(rightX, yy, colW, "Melee", std.fmt.bufPrintZ(&o1, "{d:.0}-{d:.0}", .{ p.MinDmg, p.MaxDmg }) catch "");
-    yy += rowH;
-    var o2: [40]u8 = undefined;
-    sheetStatRow(rightX, yy, colW, "Spell", std.fmt.bufPrintZ(&o2, "{d:.0}", .{p.spellDmg}) catch "");
-    yy += rowH;
-    var o3: [40]u8 = undefined;
-    sheetStatRow(rightX, yy, colW, "Crit", std.fmt.bufPrintZ(&o3, "{d:.0}%", .{p.derived.critChance * 100}) catch "");
-    yy += rowH;
-    var o4: [40]u8 = undefined;
-    sheetStatRow(rightX, yy, colW, "Cooldown Red.", std.fmt.bufPrintZ(&o4, "{d:.0}%", .{p.derived.cdrFrac * 100}) catch "");
+    sheetStatF(rightX, &yy, colW, rowH, "Melee", "{d:.0}-{d:.0}", .{ p.MinDmg, p.MaxDmg });
+    sheetStatF(rightX, &yy, colW, rowH, "Spell", "{d:.0}", .{p.spellDmg});
+    sheetStatF(rightX, &yy, colW, rowH, "Crit", "{d:.0}%", .{p.derived.critChance * 100});
+    sheetStatF(rightX, &yy, colW, rowH, "Cooldown Red.", "{d:.0}%", .{p.derived.cdrFrac * 100});
 
     // Footer — controller prompts only (the pad is the primary path).
     const hints = [_]Hint{
@@ -849,13 +850,27 @@ fn drawOrb(cx: i32, cy: i32, radius: i32, frac_in: f32, full: rl.Color, empty: r
     rl.drawRing(cv, rf - 1, rf + 1, 0, 360, 48, rgba(15, 12, 10, 255));
 }
 
+// A HUD resource orb with its "cur/max" readout centered above it. One helper so the
+// health and mana orbs can't drift on fill fraction, label format, or placement.
+fn drawResourceOrb(cx: i32, orbY: i32, orbR: i32, cur: f32, max: f32, fill: rl.Color, socket: rl.Color, t: f32) void {
+    drawOrb(cx, orbY, orbR, cur / max, fill, socket, t);
+    var buf: [64]u8 = undefined;
+    const s = std.fmt.bufPrintZ(&buf, "{d}/{d}", .{ @as(i32, @intFromFloat(cur)), @as(i32, @intFromFloat(max)) }) catch "";
+    text(s, cx - @divTrunc(textW(s, 16), 2), orbY - 8, 16, rl.Color.white);
+}
+
 // ---- Skill bar + panel ----
 // One vector emblem per skill (no gem art): steel dagger, orange flame, motion arc.
 // Color lives here so the HUD bar and the loadout panel read alike.
 fn skillColor(s: playermod.Skill) rl.Color {
     return switch (s) {
         .melee => rgba(200, 205, 215, 255), // steel
+        .cleave => rgba(226, 232, 240, 255), // bright swept steel
+        .throwing_knife => rgba(178, 188, 202, 255), // cool steel
         .firebolt => projectile.fireboltColor, // flame orange
+        .ice_shard => projectile.iceShardColor, // glacial blue
+        .lightning_nova => rgba(160, 200, 255, 255), // electric blue-white
+        .toxic_flask => projectile.toxicColor, // poison green
         .dodge => rgba(120, 175, 235, 255), // dodge blue
         .health_potion => theme.healthColor, // crimson flask
         .mana_potion => theme.manaColor, // sapphire flask
@@ -874,6 +889,30 @@ fn skillEmblem(cx: i32, cy: i32, s: playermod.Skill, col: rl.Color) void {
             rl.drawPoly(.{ .x = fi(cx), .y = fi(cy - 5) }, 3, 6, 90, col); // tongue
             rl.drawCircle(cx, cy + 3, 2.5, projectile.flameHeartColor); // white-hot core
         },
+        .cleave => {
+            // A wide arc sweep with a blade riding its leading edge.
+            rl.drawRing(rl.Vector2.init(fi(cx), fi(cy + 2)), 7, 9, -70, 70, 24, col);
+            rl.drawRectangle(cx + 5, cy - 8, 2, 10, col); // blade on the arc's tip
+        },
+        .throwing_knife => {
+            // A dagger canted along the diagonal: blade, then a stubby grip.
+            rl.drawRectangle(cx - 1, cy - 9, 3, 12, col); // blade
+            rl.drawPoly(.{ .x = fi(cx), .y = fi(cy - 9) }, 3, 4, 0, col); // point
+            rl.drawRectangle(cx - 4, cy + 3, 9, 2, lerpColor(col, rl.Color.black, 0.25)); // guard
+        },
+        .ice_shard => {
+            // A six-point frost star.
+            rl.drawPoly(.{ .x = fi(cx), .y = fi(cy) }, 6, 8, 0, col);
+            rl.drawPoly(.{ .x = fi(cx), .y = fi(cy) }, 6, 4, 30, lerpColor(col, rl.Color.white, 0.5));
+        },
+        .lightning_nova => {
+            // A burst ring with a jagged bolt through it.
+            rl.drawRing(rl.Vector2.init(fi(cx), fi(cy)), 7, 8, 0, 360, 24, lerpColor(col, rl.Color.black, 0.1));
+            rl.drawRectangle(cx - 1, cy - 8, 2, 7, lerpColor(col, rl.Color.white, 0.4));
+            rl.drawRectangle(cx, cy - 1, 2, 8, lerpColor(col, rl.Color.white, 0.4));
+        },
+        // The flask uses the belt's corked-flask icon, tinted its poison green.
+        .toxic_flask => flaskIcon(cx - 7, cy - 9, col),
         .dodge => {
             rl.drawRing(rl.Vector2.init(fi(cx), fi(cy)), 6, 8, -20, 210, 20, col); // roll arc
             rl.drawCircle(cx + 6, cy - 3, 2, col); // leading chevron
@@ -893,6 +932,8 @@ fn skillReady(p: *const Player, s: playermod.Skill) bool {
         .dodge => p.rollCD <= 0,
         .health_potion => p.HealthPots > 0,
         .mana_potion => p.ManaPots > 0,
+        // The extra skills gate on their own recharge plus (for spells) mana.
+        .cleave, .throwing_knife, .ice_shard, .lightning_nova, .toxic_flask => p.auxReady(s) and p.Mana >= s.manaCost(),
     };
 }
 
@@ -905,6 +946,7 @@ fn skillCooldownFrac(p: *const Player, s: playermod.Skill) f32 {
         .firebolt => if (p.castRate > 0) clampF(p.castCD / p.castRate, 0, 1) else 0,
         .dodge => clampF(p.rollCD / p.rollCooldown(), 0, 1),
         .health_potion, .mana_potion => 0,
+        .cleave, .throwing_knife, .ice_shard, .lightning_nova, .toxic_flask => p.auxFrac(s),
     };
 }
 
@@ -922,7 +964,7 @@ fn cooldownSweep(x: i32, y: i32, size: i32, cd: f32) void {
     rl.beginScissorMode(x, y, size, size);
     rl.drawCircleSector(c, R, -90, end, 48, withAlpha(rgba(6, 6, 10, 255), 180));
     const er = end * std.math.pi / 180.0;
-    rl.drawLineEx(c, .{ .x = cx + @cos(er) * R, .y = cy + @sin(er) * R }, 1.5, withAlpha(rgba(220, 210, 190, 255), 95));
+    rl.drawLineEx(c, .{ .x = cx + mathx.cosf(er) * R, .y = cy + mathx.sinf(er) * R }, 1.5, withAlpha(rgba(220, 210, 190, 255), 95));
     rl.endScissorMode();
 }
 
@@ -945,7 +987,8 @@ fn drawSkillSlot(x: i32, y: i32, size: i32, slot: ?usize, skill: ?playermod.Skil
         skillEmblem(x + @divTrunc(size, 2), y + @divTrunc(size, 2), s, col);
         if (p) |pp| {
             cooldownSweep(x, y, size, skillCooldownFrac(pp, s));
-            if (s == .firebolt and pp.Mana < pp.spellCost) {
+            const cost = s.manaCost();
+            if (cost > 0 and pp.Mana < cost) {
                 rl.drawRectangleRounded(rect, SLOT_ROUND, SLOT_SEG, withAlpha(theme.manaColor, 60)); // no-mana veil
             }
             // Consumable charge count, bottom-left (the button glyph owns bottom-right).
@@ -1027,15 +1070,8 @@ fn drawHUD(g: *Game) void {
     const healthCX = hudX + orbR + 4;
     const manaCX = hudX + hudW - orbR - 4;
 
-    drawOrb(healthCX, orbY, orbR, p.HP / p.MaxHP, theme.healthColor, theme.healthSocket, t);
-    var b1: [64]u8 = undefined;
-    const hp = std.fmt.bufPrintZ(&b1, "{d}/{d}", .{ @as(i32, @intFromFloat(p.HP)), @as(i32, @intFromFloat(p.MaxHP)) }) catch "";
-    text(hp, healthCX - @divTrunc(textW(hp, 16), 2), orbY - 8, 16, rl.Color.white);
-
-    drawOrb(manaCX, orbY, orbR, p.Mana / p.MaxMana, theme.manaColor, theme.manaSocket, t);
-    var b2: [64]u8 = undefined;
-    const mp = std.fmt.bufPrintZ(&b2, "{d}/{d}", .{ @as(i32, @intFromFloat(p.Mana)), @as(i32, @intFromFloat(p.MaxMana)) }) catch "";
-    text(mp, manaCX - @divTrunc(textW(mp, 16), 2), orbY - 8, 16, rl.Color.white);
+    drawResourceOrb(healthCX, orbY, orbR, p.HP, p.MaxHP, theme.healthColor, theme.healthSocket, t);
+    drawResourceOrb(manaCX, orbY, orbR, p.Mana, p.MaxMana, theme.manaColor, theme.manaSocket, t);
 
     // XP: burnished-gold channel orb to orb, notched at each tenth, with a slow
     // light sweep over the fill.
@@ -1216,7 +1252,7 @@ fn drawMenu(g: *Game) void {
             const gap = @divTrunc(w, 2) + 34;
             text("-", @divTrunc(W, 2) - gap - 14, y + 6, 28, withAlpha(theme.goldColor, flare));
             text("-", @divTrunc(W, 2) + gap, y + 6, 28, withAlpha(theme.goldColor, flare));
-            centered(label, y, size, rgba(255, 228, 160, 255));
+            centered(label, y, size, selectedGold);
         } else {
             centered(label, y + 3, size, rgba(205, 188, 165, 215));
         }
@@ -1239,7 +1275,7 @@ fn drawDeath(g: *Game) void {
     centered(s, cy + 10, 22, rgba(230, 210, 200, 255));
     const pulse = mathx.u8f(200 + 55 * sinf(g.elapsed * 2.5));
     const hints = [_]Hint{.{ .glyph = .{ .face = .a }, .label = "Start a new game" }};
-    hintRow(&hints, cy + 66, 22, withAlpha(rgba(255, 230, 160, 255), pulse));
+    hintRow(&hints, cy + 66, 22, withAlpha(hintPulseGold, pulse));
 }
 
 fn drawVictory(g: *Game) void {
@@ -1254,5 +1290,5 @@ fn drawVictory(g: *Game) void {
     centered(s, cy + 44, 22, rgba(255, 235, 170, 255));
     const pulse = mathx.u8f(200 + 55 * sinf(g.elapsed * 2.5));
     const hints = [_]Hint{.{ .glyph = .{ .face = .a }, .label = "Play again" }};
-    hintRow(&hints, cy + 100, 22, withAlpha(rgba(255, 230, 160, 255), pulse));
+    hintRow(&hints, cy + 100, 22, withAlpha(hintPulseGold, pulse));
 }

@@ -116,8 +116,35 @@ pub const Monster = struct {
     heavyStunMax: f32 = 0, // damage to fill the meter (per-kind, scales with HP)
     heavyStunDur: f32 = 0, // heavy-stun seconds when the meter tops out
 
+    // Chill (Ice Shard): while chillTimer > 0 the monster moves at chillFactor of its
+    // Speed. Refreshed by each cold hit, keeping the STRONGER slow.
+    chillTimer: f32 = 0,
+    chillFactor: f32 = 1,
+
     pub fn alive(m: *const Monster) bool {
         return m.HP > 0 and !m.dying;
+    }
+
+    /// Movement speed multiplier from status (chill). 1 when unaffected.
+    pub fn moveMult(m: *const Monster) f32 {
+        return if (m.chillTimer > 0) m.chillFactor else 1;
+    }
+
+    /// Slow the monster to `factor` of its speed for `dur` seconds (keeping the stronger
+    /// of any overlapping chills). Advanced/expired in `tickStatus`.
+    pub fn applyChill(m: *Monster, dur: f32, factor: f32) void {
+        // A fresh chill on an unchilled foe (factor reset to 1 by tickStatus) takes the
+        // new factor; overlapping chills keep whichever slows more.
+        m.chillFactor = if (m.chillTimer > 0) @min(m.chillFactor, factor) else factor;
+        m.chillTimer = maxF(m.chillTimer, dur);
+    }
+
+    /// Advance status timers one frame (chill fades, resetting its factor when it ends).
+    pub fn tickStatus(m: *Monster, dt: f32) void {
+        if (m.chillTimer > 0) {
+            m.chillTimer -= dt;
+            if (m.chillTimer <= 0) m.chillFactor = 1;
+        }
     }
 
     /// Frozen by a light or heavy stun: skip AI/attacks this frame.
