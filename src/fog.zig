@@ -51,13 +51,18 @@ pub const Fog = struct {
         rl.unloadTexture(self.tex);
     }
 
-    // New area: forget everything and store the extents to map against.
-    pub fn reset(self: *Fog, halfW: f32, halfD: f32) void {
-        @memset(&self.cells, 0);
+    // Store the extents to map against and force the next reveal to re-scan.
+    fn setExtents(self: *Fog, halfW: f32, halfD: f32) void {
         self.halfW = if (halfW > 0) halfW else 1;
         self.halfD = if (halfD > 0) halfD else 1;
         self.dirty = true;
-        self.lastR = -1; // grid cleared — force the next reveal to re-scan
+        self.lastR = -1;
+    }
+
+    // New area: forget everything and store the extents to map against.
+    pub fn reset(self: *Fog, halfW: f32, halfD: f32) void {
+        @memset(&self.cells, 0);
+        self.setExtents(halfW, halfD);
     }
 
     // Paint the disc of `radius` around ground `pos` into the grid. Cells fade from
@@ -99,10 +104,7 @@ pub const Fog = struct {
     // Editor mode: whole arena reads as fully seen.
     pub fn revealAll(self: *Fog, halfW: f32, halfD: f32) void {
         @memset(&self.cells, 255);
-        self.halfW = if (halfW > 0) halfW else 1;
-        self.halfD = if (halfD > 0) halfD else 1;
-        self.dirty = true;
-        self.lastR = -1; // grid changed — force the next reveal to re-scan
+        self.setExtents(halfW, halfD);
     }
 
     // Upload the grid to the GPU if it changed since the last sync.

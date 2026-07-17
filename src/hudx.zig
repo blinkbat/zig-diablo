@@ -353,15 +353,6 @@ fn fleuron(cx: i32, cy: i32, r: f32, col: rl.Color) void {
     diamond(cx, cy, r * 0.4, withAlpha(theme.highlightColor, col.a));
 }
 
-// Stamped coin: gold disc on an iron seat, mint ring, catchlight.
-fn coin(cx: i32, cy: i32, r: f32) void {
-    const c = rl.Vector2.init(fi(cx), fi(cy));
-    rl.drawCircleV(c, r + 1.2, withAlpha(theme.ink, 200));
-    rl.drawCircleV(c, r, theme.goldColor);
-    rl.drawRing(c, r * 0.55, r * 0.72, 0, 360, 20, lerpColor(theme.goldColor, rl.Color.black, 0.35));
-    rl.drawCircleV(.{ .x = fi(cx) - r * 0.3, .y = fi(cy) - r * 0.35 }, r * 0.28, withAlpha(rl.Color.white, 170));
-}
-
 // Illuminated divider: rules fading outward from a quatrefoil boss flanked by
 // gold diamonds — the ornament row under titles (menu, pause, death, victory).
 fn ornamentDivider(cx: i32, y: i32, halfW: i32, a: u8) void {
@@ -864,6 +855,8 @@ fn drawCharTabs(g: *Game, cy: i32) void {
     const W = sw();
     const Tab = struct { t: gamemod.CharTab, label: [:0]const u8 };
     const tabs = [_]Tab{ .{ .t = .stats, .label = "Stats" }, .{ .t = .skills, .label = "Skills" } };
+    // Pin the tab list 1:1 with CharTab so a new tab can't silently vanish from the strip.
+    comptime std.debug.assert(tabs.len == @typeInfo(gamemod.CharTab).@"enum".fields.len);
     const size: i32 = 30;
     const gap: i32 = 44;
     var total: i32 = gap * (@as(i32, tabs.len) - 1);

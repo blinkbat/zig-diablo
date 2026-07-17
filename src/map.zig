@@ -361,10 +361,11 @@ pub fn load(path: []const u8) LoadError!Map {
         if (std.mem.eql(u8, key, K.version)) {
             const ver = nextF32(&it) catch return fail(lineNo, line, "bad version");
             // Compare as float (never @intFromFloat an unvalidated parse — huge/inf/NaN
-            // makes the cast illegal). Require 1 <= ver <= FORMAT_VERSION: the negated,
-            // range-checked form also rejects NaN, and the lower bound rejects a
-            // truncated/typo'd value (0, negative) that would otherwise load silently.
-            if (!(ver >= 1 and ver <= @as(f32, @floatFromInt(FORMAT_VERSION)))) return fail(lineNo, line, "unsupported map format version");
+            // makes the cast illegal). Require an INTEGER 1 <= ver <= FORMAT_VERSION: the
+            // negated range check also rejects NaN, the lower bound rejects a truncated/typo'd
+            // value (0, negative), and the integrality check rejects a mangled "2.5" that
+            // would otherwise load silently under the wrong format semantics.
+            if (!(ver >= 1 and ver <= @as(f32, @floatFromInt(FORMAT_VERSION))) or ver != @floor(ver)) return fail(lineNo, line, "unsupported map format version");
             sawVersion = true;
         } else if (std.mem.eql(u8, key, K.name)) {
             m.name.set(rest);

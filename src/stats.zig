@@ -17,8 +17,8 @@ pub const DamageType = enum(u3) {
     lightning,
     chaos,
 
-    // Self-maintaining (mirrors player.Skill.count): a new variant grows the damage
-    // packet / resist arrays automatically instead of silently staying length-5.
+    // Self-counting (same idiom as player.Skill.count, not coupled to it): a new variant
+    // grows the damage packet / resist arrays automatically instead of staying length-5.
     pub const count = @typeInfo(DamageType).@"enum".fields.len;
     // The non-physical types, in canonical order — the single source for "iterate the
     // elements" (resist rows, setAllElemental). It IS hand-listed, so the assert below
@@ -106,6 +106,13 @@ pub const Defense = struct {
 
 pub const ATTR_ANCHOR: f32 = 10; // starting vit/str/dex/int/focus
 pub const LUCK_ANCHOR: f32 = 5; // starting luck (rarer, stronger per point)
+comptime {
+    // Attribs' i32 field defaults are @intFromFloat(anchor); keep the anchors integral so
+    // the stored default can't truncate away from the float baseline derive() subtracts
+    // (which would give a fresh hero a non-1.0 multiplier). Tune anchors as whole numbers.
+    std.debug.assert(ATTR_ANCHOR == @floor(ATTR_ANCHOR));
+    std.debug.assert(LUCK_ANCHOR == @floor(LUCK_ANCHOR));
+}
 
 // Vitality → life. (old: MaxHP 100, hpRegen 0.4 at vit 10)
 pub const BASE_HP: f32 = 40;

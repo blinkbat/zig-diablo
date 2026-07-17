@@ -137,7 +137,8 @@ pub const Skill = enum {
     pub fn wantsAim(s: Skill) bool {
         return switch (s) {
             .firebolt, .ice_shard, .throwing_knife, .toxic_flask => true,
-            else => false,
+            // Exhaustive (no else) like offensive(): a new skill must pick an aim mode.
+            .melee, .cleave, .lightning_nova, .dodge, .health_potion, .mana_potion => false,
         };
     }
 
@@ -158,7 +159,8 @@ pub const Skill = enum {
             .ice_shard => ICE_COST,
             .lightning_nova => NOVA_COST,
             .toxic_flask => FLASK_COST,
-            else => 0,
+            // Exhaustive (no else) like offensive(): a new skill must declare its cost.
+            .melee, .cleave, .throwing_knife, .dodge, .health_potion, .mana_potion => 0,
         };
     }
 

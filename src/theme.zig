@@ -13,7 +13,8 @@ pub const healthSocket = rgba(60, 14, 14, 255); // drained orb backing
 pub const manaColor = rgba(50, 90, 220, 255);
 pub const manaSocket = rgba(16, 22, 60, 255);
 
-// Gold (currency): coin drop, pickup popup, belt total.
+// Gold: world gold drops + level-up motes, and the warm gilt for chrome (ornament
+// dividers, tab underline, XP bar, victory tally). No HUD gold readout (owner decree).
 pub const goldColor = rgba(255, 215, 80, 255);
 
 // Cork: potion-flask stopper — belt icon and world flask share one tone.

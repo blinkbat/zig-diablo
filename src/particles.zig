@@ -10,7 +10,8 @@ const cosf = mathx.cosf;
 // PARTICLES — one fixed-capacity pool of emissive motes for every transient effect
 // (sparks, bursts, firebolt trail, portal motes, level-up rings). Drawn after endScene
 // with the default shader, so they glow in the dark and bypass the lighting pipeline.
-// When full, the pool overwrites its oldest slot (a dropped old spark is invisible).
+// When full, the pool overwrites via a ring cursor (swap-remove on death shuffles slot
+// order, so it evicts an arbitrary live mote — a dropped spark is invisible either way).
 
 pub const MAX_PARTICLES = 2048;
 
@@ -50,7 +51,7 @@ pub const Particles = struct {
     pub fn burst(self: *Particles, rng: *mathx.Rng, pos: rl.Vector3, n: usize, speed: f32, size: f32, life: f32, col: rl.Color, grav: f32) void {
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const ang = rng.float() * std.math.tau;
+            const ang = rng.angle();
             const pitch = (rng.float() - 0.25) * 1.6; // biased above the horizon
             const sp = speed * (0.35 + 0.65 * rng.float());
             const cp = cosf(pitch);

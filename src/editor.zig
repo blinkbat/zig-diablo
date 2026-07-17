@@ -138,6 +138,18 @@ comptime {
     for (0..@typeInfo(world.ObstacleKind).@"enum".fields.len) |i| {
         std.debug.assert(std.mem.eql(u8, propBrushes[i], @tagName(@as(world.ObstacleKind, @enumFromInt(i)))));
     }
+    // Entity brushes: the tail labels ("Boss"/"Spawn"/"Portal"/"Erase") ARE EntityBrush's
+    // non-pack tag names (case aside), and each pack label contains its MonsterKind tag
+    // ("zombie pack" ⊃ "zombie"). Pin BOTH orders so reordering either enum without the
+    // brush table is a compile error — entityBrush()/packKind() decode by ordinal.
+    const nPacksAssert = @typeInfo(monster.MonsterKind).@"enum".fields.len;
+    for (0..@typeInfo(EntityBrush).@"enum".fields.len - 1) |i| {
+        std.debug.assert(std.ascii.eqlIgnoreCase(entityBrushes[nPacksAssert + i], @tagName(@as(EntityBrush, @enumFromInt(i + 1)))));
+    }
+    // Index 0 ("pib pack") is flavor for .fallen; pin the packs whose tag is in the label.
+    for (1..nPacksAssert) |i| {
+        std.debug.assert(std.mem.startsWith(u8, entityBrushes[i], @tagName(@as(monster.MonsterKind, @enumFromInt(i)))));
+    }
 }
 
 // Floor-layer brush index (positional, matching floorBrushes).
@@ -458,9 +470,8 @@ pub const Editor = struct {
     fn entityBrush(ed: *const Editor) EntityBrush {
         // First N brushes are the N monster-kind packs (decode to .pack); the tail
         // maps 1:1 onto EntityBrush's non-pack variants IN ORDER, so a new brush
-        // decodes correctly rather than collapsing to .erase. EntityBrush's order must
-        // match entityBrushes' tail — the comptime assert pins only the LENGTH (labels
-        // are stylized, not tag names), so this ordering is a hand-kept convention.
+        // decodes correctly rather than collapsing to .erase. The comptime block above
+        // pins this tail order (labels ARE the tag names, case aside).
         const nPacks = @typeInfo(monster.MonsterKind).@"enum".fields.len;
         const b = ed.brush();
         if (b < nPacks) return .pack;
@@ -1945,7 +1956,10 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
     y += 30;
     ui.tipFor(ctx, ui.rect(px + 8, y - 2, PANEL_W - 16, 26), "East-west half-extent; shrinking clamps contents");
     var halfW = g.map.halfW;
-    if (ui.stepperF(ctx, px + 10, y, "width", &halfW, HALF_STEP, HALF_MIN, HALF_MAX)) {
+    // Cap the stepper at the LARGER of the authoring ceiling and the current extent: a
+    // hand-authored map loaded above HALF_MAX (loader tolerates up to map.HALF_MAX) must
+    // not silently shrink — and delete clamped-out content — on the first "+" press.
+    if (ui.stepperF(ctx, px + 10, y, "width", &halfW, HALF_STEP, HALF_MIN, @max(HALF_MAX, g.map.halfW))) {
         bankUndo(g);
         g.map.halfW = halfW;
         clampContents(&g.map);
@@ -1954,7 +1968,7 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
     y += STEP_ROW_H;
     ui.tipFor(ctx, ui.rect(px + 8, y - 2, PANEL_W - 16, 26), "North-south half-extent; shrinking clamps contents");
     var halfD = g.map.halfD;
-    if (ui.stepperF(ctx, px + 10, y, "depth", &halfD, HALF_STEP, HALF_MIN, HALF_MAX)) {
+    if (ui.stepperF(ctx, px + 10, y, "depth", &halfD, HALF_STEP, HALF_MIN, @max(HALF_MAX, g.map.halfD))) {
         bankUndo(g);
         g.map.halfD = halfD;
         clampContents(&g.map);
