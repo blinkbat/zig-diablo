@@ -590,6 +590,7 @@ pub const Player = struct {
         p.swing = 0;
         p.atkCD = 0;
         p.castCD = 0;
+        @memset(&p.skillCD, 0); // extra-skill recharges reset like the core three (atk/cast/roll)
         p.hasMoveTarget = false;
         p.targetMonster = -1;
         p.chaseMonster = -1;

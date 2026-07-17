@@ -207,6 +207,14 @@ pub const Monster = struct {
         return 1 - m.swing / m.swingTime;
     }
 
+    /// Send the monster into a panic scatter for a randomized duration, keeping the
+    /// LONGER of any current scatter (a follow-up blow or kill-chain must never shorten
+    /// a running panic). One source for the flee-duration roll — pib recoil (a heavy
+    /// blow) and a nearby death both route through here.
+    pub fn startFlee(m: *Monster, rng: *Rng) void {
+        m.fleeTimer = maxF(m.fleeTimer, flee_time_min + rng.float() * flee_time_rand);
+    }
+
     pub fn fleeing(m: *const Monster) bool {
         return m.fleeTimer > 0;
     }

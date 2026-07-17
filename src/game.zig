@@ -46,29 +46,17 @@ const MAX_MONSTERS = 512; // sized for "epic" maps (64 packs x up to 32 members,
 // Scuffed-earth dust for footsteps and dodges; one tint (alpha varies per use).
 const DUST_COLOR = rgba(200, 172, 132, 255);
 
-// Torch tuning. Light anchors to the CARRIED off-hand flame (smoothed — see torchXZ),
-// so shadows fall away from the torch and swing as the hero turns. 4.5 is the height
-// floor: lower breaks the shadow cam's 150-deg FOV clamp or stops clearing a
-// zombie/brute head (~3.9) so they'd stop casting; only the boss crown (~4.9) pokes above.
+// Light tuning. The hero IS the light bearer — no drawn prop (owner 2026-07-17:
+// hero carries no bow/torch so any playstyle reads true); the lamp hangs over him,
+// smoothed via torchXZ. 4.5 is the height floor: lower breaks the shadow cam's
+// 150-deg FOV clamp or stops clearing a zombie/brute head (~3.9) so they'd stop
+// casting; only the boss crown (~4.9) pokes above.
 const TORCH_HEIGHT = 4.5;
 const TORCH_RADIUS = 11.0;
 
 // Hero drawn scaled up about his feet (uniform, so normals stay valid). 1.22 makes
 // the drawn torso fill the collision radius (playermod.radius 0.55).
 const HERO_SCALE = 1.22;
-
-// Off-hand torch grip: ONE set of offsets shared by the drawn stick+flame and
-// torchFlameWorld (light+ember anchor), so flame and light can't drift apart.
-const TORCH_GRIP_RIGHT = 0.45;
-const TORCH_GRIP_FWD = 0.05;
-const TORCH_FLAME_Y = 1.64; // flame-heart height in the hero's ground-local frame
-const TORCH_HAND_Y = 0.95; // stick-grip Y, shared by the drawn stick and the FX flame base
-
-// Bow-hand grip (hero ground-local frame). ONE anchor (heroBowHand) for the drawn
-// bow limbs AND the emissive string, so the string can't detach from the tips.
-const BOW_GRIP_BACK = 0.18;
-const BOW_GRIP_SIDE = 0.4;
-const BOW_GRIP_Y = 1.15;
 
 // A live player fireball is its own moving light, following the bolt beyond the torch
 // radius. Modeled overhead like the torch so its downward shadow map stays oriented.
@@ -392,37 +380,11 @@ fn beginHeroScale(base: rl.Vector3) void {
     rl.gl.rlTranslatef(-base.x, 0, -base.z);
 }
 
-// Carried flame's world position (off-hand side, flame height, SCALED frame). One
-// source shared by the ember spitter, the light (torchXZ anchors here), and the
-// drawn flame (via beginHeroScale).
-fn torchFlameWorld(p: *const Player) rl.Vector3 {
-    const f = mathx.orFacing(p.Facing, 0, -1);
-    const right = mathx.perpXZ(f);
-    return v3(
-        p.Pos.x + (-right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD) * HERO_SCALE,
-        p.Pos.y + TORCH_FLAME_Y * HERO_SCALE,
-        p.Pos.z + (-right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD) * HERO_SCALE,
-    );
-}
-
-// Bow-hand anchor (hero-local frame, see BOW_GRIP_*). Body limbs and FX string both
-// derive endpoints from this with the same bob, so the string meets the tips.
-fn heroBowHand(base: rl.Vector3, f: rl.Vector3, right: rl.Vector3, bob: f32) rl.Vector3 {
-    return v3(
-        base.x - f.x * BOW_GRIP_BACK + right.x * BOW_GRIP_SIDE,
-        BOW_GRIP_Y + bob,
-        base.z - f.z * BOW_GRIP_BACK + right.z * BOW_GRIP_SIDE,
-    );
-}
-
-// Torch-hand anchor (hero-local frame, see TORCH_GRIP_*). ONE XZ formula for the
-// sleeve, the drawn stick, and the flame so they can't detach; caller passes the Y.
-fn heroTorchHand(base: rl.Vector3, f: rl.Vector3, right: rl.Vector3, y: f32) rl.Vector3 {
-    return v3(
-        base.x - right.x * TORCH_GRIP_RIGHT + f.x * TORCH_GRIP_FWD,
-        y,
-        base.z - right.z * TORCH_GRIP_RIGHT + f.z * TORCH_GRIP_FWD,
-    );
+// The light's world anchor: the hero himself (XZ; the lamp height comes from
+// TORCH_HEIGHT at the draw site). One source for the smoothed torchXZ and every
+// teleport snap.
+fn heroLightWorld(p: *const Player) rl.Vector3 {
+    return v3(p.Pos.x, 0, p.Pos.z);
 }
 
 // ---- Game state ----
@@ -737,11 +699,11 @@ fn updatePlaying(g: *Game, dt_in: f32) void {
 
     g.rig.follow(g.p.Pos, dt);
 
-    // Ease the light toward the carried flame so turning swings shadows over a few
+    // Ease the light toward the hero so movement swings shadows over a few
     // frames instead of snapping.
-    const flame = torchFlameWorld(&g.p);
+    const lamp = heroLightWorld(&g.p);
     const lk = 1 - @exp(-dt * 9.0);
-    g.torchXZ = v3(g.torchXZ.x + (flame.x - g.torchXZ.x) * lk, 0, g.torchXZ.z + (flame.z - g.torchXZ.z) * lk);
+    g.torchXZ = v3(g.torchXZ.x + (lamp.x - g.torchXZ.x) * lk, 0, g.torchXZ.z + (lamp.z - g.torchXZ.z) * lk);
 
     // Fog of war: the torch reveals ground it sweeps (monotonic memory); upload the mask
     // before drawWorld samples it.
@@ -1315,9 +1277,9 @@ fn updatePlayerAttack(g: *Game) void {
 fn damageMonster(g: *Game, m: *Monster, dmg: stats.Damage, crit: bool) void {
     const landed = m.hurt(dmg);
     // Pib recoil: a knife pig that eats a heavy blow bolts, the SAME panic path as a
-    // nearby death (they're scared of you). maxF so a follow-up can't shorten a scatter.
+    // nearby death (they're scared of you). startFlee keeps the longer of any scatter.
     if (m.Kind == .fallen and m.alive() and landed >= m.MaxHP * monster.pib_recoil_frac) {
-        m.fleeTimer = maxF(m.fleeTimer, monster.flee_time_min + g.rng.float() * monster.flee_time_rand);
+        m.startFlee(&g.rng);
     }
     // Hit sparks: pale chips off the body; crits flare bigger and golder. (No floating
     // damage numbers by owner decree — the sparks ARE the feedback.)
@@ -1345,11 +1307,11 @@ fn killMonster(g: *Game, m: *Monster) void {
     g.parts.burst(&g.rng, at, n, 6.0, 0.13, 0.7, lerpColor(m.Color, rl.Color.white, 0.25), 10);
     g.parts.burst(&g.rng, at, n / 2, 3.5, 0.16, 0.9, lerpColor(m.Color, rl.Color.black, 0.45), 12);
     // Pibs are cowards: ANY death nearby — a packmate OR any other monster you cut
-    // down — sends the knife pigs scattering (they're scared of you). maxF, not
-    // overwrite: a kill-chain must never SHORTEN a running panic.
+    // down — sends the knife pigs scattering (they're scared of you). startFlee keeps
+    // the longer scatter: a kill-chain must never SHORTEN a running panic.
     for (g.liveMonsters()) |*other| {
         if (other.Kind == .fallen and other.alive() and distXZ(other.Pos, m.Pos) < monster.flee_trigger_radius) {
-            other.fleeTimer = maxF(other.fleeTimer, monster.flee_time_min + g.rng.float() * monster.flee_time_rand);
+            other.startFlee(&g.rng);
         }
     }
     // Zombie's last act: the corpse exhales a lingering miasma cloud — safe to kill,
@@ -1907,15 +1869,17 @@ fn updateAmbientFX(g: *Game, dt: f32) void {
                 .drag = 0.25,
             });
         }
-        // The torch spits: now and then an ember leaps off the flame and dies mid-arc.
-        if (g.rng.float() < 0.22 and g.p.alive()) {
+        // Warm sparks drift up around the light-bearer now and then (the torch prop
+        // is gone; the air near the hero still lives).
+        if (g.rng.float() < 0.12 and g.p.alive()) {
+            const sang = g.rng.angle();
             g.parts.spawn(.{
-                .Pos = torchFlameWorld(&g.p),
-                .Vel = v3((g.rng.float() - 0.5) * 0.7, 1.0 + g.rng.float() * 0.9, (g.rng.float() - 0.5) * 0.7),
+                .Pos = v3(g.p.Pos.x + cosf(sang) * 0.7, g.p.Pos.y + 0.4 + g.rng.float() * 1.4, g.p.Pos.z + sinf(sang) * 0.7),
+                .Vel = v3((g.rng.float() - 0.5) * 0.5, 0.7 + g.rng.float() * 0.7, (g.rng.float() - 0.5) * 0.5),
                 .Life = 0.45 + g.rng.float() * 0.35,
                 .maxLife = 0.8,
-                .Size = 0.04 + g.rng.float() * 0.025,
-                .Color = if (g.rng.float() < 0.6) rgba(255, 180, 70, 240) else rgba(255, 120, 40, 220),
+                .Size = 0.035 + g.rng.float() * 0.02,
+                .Color = if (g.rng.float() < 0.6) rgba(255, 180, 70, 200) else rgba(255, 120, 40, 180),
                 .grav = -0.7, // buoyant: hot air carries it up before it gutters
                 .drag = 1.4,
             });
@@ -2009,12 +1973,12 @@ fn resetArena(g: *Game) void {
     g.setToast("", .{});
 }
 
-// Teleport the hero: set Pos AND snap the camera and smoothed torch anchor. All three
+// Teleport the hero: set Pos AND snap the camera and smoothed light anchor. All three
 // move together — a bare Pos change leaves the shadow rig lerping across the map.
 fn teleportHero(g: *Game, pos: rl.Vector3) void {
     g.p.Pos = pos;
     g.rig.snap(pos);
-    g.torchXZ = torchFlameWorld(&g.p);
+    g.torchXZ = heroLightWorld(&g.p);
 }
 
 // Playtest the CURRENT in-memory map from the editor: real spawns/fog/HUD. Every exit
@@ -2047,9 +2011,8 @@ fn endPlaytest(g: *Game) void {
 
 // ---- Rendering (frozen torchlight + baked scene mesh) ----
 
-// The hero's walk bob, shared by the body and its FX (bow limbs vs. the emissive
-// string) so the two can't drift — a mismatched amplitude would detach the drawn
-// string from the bow tips. Mirrors monsterBob for the foes.
+// The hero's walk bob, shared by the body parts so limbs and torso can't drift.
+// Mirrors monsterBob for the foes.
 fn heroBob(p: *const Player) f32 {
     return BOB_AMP * sinf(p.walkBob);
 }
@@ -2099,12 +2062,16 @@ fn drawHeroBody(p: *const Player) void {
     rl.drawCylinderEx(v3(base.x, 0.88 + bob, base.z), v3(base.x, 0.98 + bob, base.z), 0.435, 0.42, 10, rgba(74, 50, 30, 255));
     sphere(v3(base.x + f.x * 0.42, 0.93 + bob, base.z + f.z * 0.42), 0.06, theme.trimColor);
 
-    // Sleeved arms to the tools: bow hand forward-right, torch hand out left.
+    // Sleeved arms hang relaxed at his sides, gloved hands at the hem — no tool
+    // grips, so the silhouette reads true for any loadout.
     const sleeve = lerpColor(hood, rl.Color.black, 0.1);
-    const bhandB = heroBowHand(base, f, right, bob);
-    rl.drawCapsule(v3(base.x + right.x * 0.28 + f.x * 0.05, 1.3 + bob, base.z + right.z * 0.28 + f.z * 0.05), bhandB, 0.1, 6, 4, sleeve);
-    const thandB = heroTorchHand(base, f, right, 1.28);
-    rl.drawCapsule(v3(base.x - right.x * 0.28 + f.x * 0.02, 1.3 + bob, base.z - right.z * 0.28 + f.z * 0.02), thandB, 0.1, 6, 4, sleeve);
+    const glove = rgba(74, 50, 30, 255);
+    for ([_]f32{ -1, 1 }) |s| {
+        const sh = v3(base.x + right.x * 0.3 * s + f.x * 0.03, 1.32 + bob, base.z + right.z * 0.3 * s + f.z * 0.03);
+        const hand = v3(base.x + right.x * 0.42 * s + f.x * 0.12, 0.88 + bob, base.z + right.z * 0.42 * s + f.z * 0.12);
+        rl.drawCapsule(sh, hand, 0.1, 6, 4, sleeve);
+        sphere(hand, 0.095, glove);
+    }
 
     sphere(v3(base.x, 1.72 + bob, base.z), 0.34, hood);
     sphere(v3(base.x + f.x * 0.22, 1.70 + bob, base.z + f.z * 0.22), 0.2, lerpColor(skin, rl.Color.black, 0.35));
@@ -2112,40 +2079,28 @@ fn drawHeroBody(p: *const Player) void {
     // Brass clasp at the throat where the hood gathers.
     sphere(v3(base.x + f.x * 0.3, 1.46 + bob, base.z + f.z * 0.3), 0.055, theme.trimColor);
 
-    // Quiver slung across the back, fletching poking out over the shoulder.
-    const qb = v3(base.x - f.x * 0.4 - right.x * 0.15, 0.9 + bob, base.z - f.z * 0.4 - right.z * 0.15);
-    const qt = v3(qb.x - right.x * 0.12, qb.y + 0.62, qb.z - right.z * 0.12);
-    rl.drawCylinderEx(qb, qt, 0.12, 0.11, 6, rgba(84, 56, 34, 255));
-    rl.drawCylinderEx(qt, v3(qt.x - right.x * 0.03, qt.y + 0.16, qt.z - right.z * 0.03), 0.08, 0.05, 5, rgba(190, 185, 165, 255));
-
-    const bowCol = rgba(96, 66, 38, 255);
-    const bhand = heroBowHand(base, f, right, bob);
-    rl.drawCylinderEx(bhand, v3(bhand.x - f.x * 0.18, bhand.y + 0.62, bhand.z - f.z * 0.18), 0.07, 0.03, 5, bowCol);
-    rl.drawCylinderEx(bhand, v3(bhand.x - f.x * 0.18, bhand.y - 0.62, bhand.z - f.z * 0.18), 0.07, 0.03, 5, bowCol);
-
-    const thand = heroTorchHand(base, f, right, TORCH_HAND_Y);
-    rl.drawCylinderEx(thand, v3(thand.x, thand.y + 0.55, thand.z), 0.05, 0.04, 5, rgba(70, 48, 30, 255));
+    // Rolled travel-pack across the small of the back — gear that belongs to any
+    // build (the quiver/bow/torch went with the loadout-neutral rework).
+    const pb = v3(base.x - f.x * 0.42 - right.x * 0.2, 1.0 + bob, base.z - f.z * 0.42 - right.z * 0.2);
+    const pt = v3(base.x - f.x * 0.42 + right.x * 0.2, 1.0 + bob, base.z - f.z * 0.42 + right.z * 0.2);
+    rl.drawCapsule(pb, pt, 0.13, 8, 6, rgba(84, 56, 34, 255));
+    rl.drawCylinderEx(v3((pb.x + pt.x) / 2, 0.88 + bob, (pb.z + pt.z) / 2), v3((pb.x + pt.x) / 2, 1.13 + bob, (pb.z + pt.z) / 2), 0.145, 0.145, 8, rgba(58, 38, 22, 255));
 }
 
-// Emissive hero bits (no shadow): bowstring, melee swing arc, the torch flame + embers.
-// Under the same feet-anchored scale as the body, so the flame stays in the hand.
+// Emissive hero bits (no shadow): melee swing arc, the warm carry glow, and the
+// footing ring. Under the same feet-anchored scale as the body.
 fn drawHeroFX(p: *const Player, t: f32) void {
+    _ = t;
     const base = p.Pos;
     beginHeroScale(base);
     defer rl.gl.rlPopMatrix();
     const f = mathx.orFacing(p.Facing, 0, -1);
-    const right = mathx.perpXZ(f);
 
     if (p.rolling()) {
         const tt = p.rollTimer / playermod.rollDur;
         groundRing(v3(base.x, 0.05, base.z), playermod.radius + 0.4 * (1 - tt), rgba(200, 210, 230, mathx.u8f(120 * tt)));
         return;
     }
-
-    // Same bob as the body's limbs (heroBowHand) so the string meets the tips.
-    const bob = heroBob(p);
-    const bhand = heroBowHand(base, f, right, bob);
-    rl.drawLine3D(v3(bhand.x - f.x * 0.18, bhand.y + 0.62, bhand.z - f.z * 0.18), v3(bhand.x - f.x * 0.18, bhand.y - 0.62, bhand.z - f.z * 0.18), rgba(200, 200, 190, 200));
 
     // Melee swing arc.
     if (p.swing > 0) {
@@ -2156,31 +2111,10 @@ fn drawHeroFX(p: *const Player, t: f32) void {
         rl.drawCylinderEx(shoulder, tip, 0.07, 0.03, 6, rgba(255, 240, 190, 255));
     }
 
-    // Torch bounce: the light at his hand throws his camera side into self-shadow, so a
-    // faint warm wash keeps him readable.
+    // Carry glow: the overhead light throws his camera side into self-shadow, so a
+    // faint warm wash keeps him readable (he IS the light bearer).
     sphere(v3(base.x, 1.05, base.z), 0.78, rgba(255, 170, 90, 26));
     sphere(v3(base.x, 1.6, base.z), 0.45, rgba(255, 185, 110, 30));
-
-    // The torch burns like the firebolt: wide corona, orange body, a swaying flame
-    // TONGUE, a white-hot heart, plus the ember drift above.
-    const flick = 1 + 0.18 * sinf(t * 22) + 0.1 * sinf(t * 37);
-    const thand = heroTorchHand(base, f, right, TORCH_HAND_Y);
-    const flame = v3(thand.x, TORCH_FLAME_Y, thand.z);
-    sphere(flame, 0.5 * flick, rgba(230, 80, 20, 40)); // wide soft halo
-    sphere(flame, 0.32 * flick, rgba(235, 95, 25, 120));
-    const tongueH = 0.44 + 0.11 * sinf(t * 13) + 0.06 * sinf(t * 29);
-    const sway = 0.055 * sinf(t * 9) + 0.03 * sinf(t * 17);
-    rl.drawCylinderEx(v3(flame.x, flame.y - 0.1, flame.z), v3(flame.x + sway, flame.y + tongueH, flame.z + sway * 0.6), 0.15, 0.0, 6, mathx.withAlpha(projectile.fireboltColor, 215));
-    rl.drawCylinderEx(v3(flame.x, flame.y - 0.06, flame.z), v3(flame.x + sway * 0.7, flame.y + tongueH * 0.6, flame.z + sway * 0.42), 0.08, 0.0, 6, rgba(255, 240, 175, 255));
-    sphere(v3(flame.x, flame.y + 0.02, flame.z), 0.115 * flick, projectile.flameHeartColor);
-    var i: i32 = 0;
-    while (i < 6) : (i += 1) {
-        const iff: f32 = @floatFromInt(i);
-        const ph = @mod(t * 0.8 + iff * 0.23, 1.0);
-        const drift = 0.14 * sinf(t * 3 + iff * 1.9);
-        const ep = v3(flame.x + drift, flame.y + 0.15 + ph * 0.95, flame.z + drift * 0.5);
-        sphere(ep, 0.045 * (1 - ph), rgba(255, 160, 60, mathx.u8f((1 - ph) * 170)));
-    }
 
     groundRing(v3(base.x, 0.045, base.z), playermod.radius + 0.15, rgba(150, 190, 255, 90));
 }
@@ -2787,12 +2721,15 @@ fn drawGasClouds(g: *Game, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams, 
     }
 }
 
-// Pick the fireball that lights the scene: the first live player bolt, modeled overhead
+// Pick the fireball that lights the scene: the first live FIREBOLT, modeled overhead
 // (FIRE_HEIGHT above its terrain) so the shadow map stays oriented. intensity 0 => no
-// fireball. (The "light blowing out mid-fight" bug was the batch overflow, not this — see drawMonsterBody.)
+// fireball. Only the firebolt is a moving flame — a thrown knife/ice shard/flask is its
+// own emissive (drawProjectiles) and must NOT bathe the ground in orange fire light or
+// trigger the extra fire depth pass. (The "light blowing out mid-fight" bug was the
+// batch overflow, not this — see drawMonsterBody.)
 fn fireLight(g: *Game, t: f32) tl.FireParams {
     for (g.projs.items()) |*pr| {
-        if (!pr.FromPlayer) continue;
+        if (!pr.FromPlayer or pr.Kind != .firebolt) continue;
         const flicker = 0.85 + 0.15 * sinf(t * 27);
         const gy = g.w.groundY(pr.Pos.x, pr.Pos.z);
         return .{

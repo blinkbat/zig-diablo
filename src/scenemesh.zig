@@ -221,6 +221,27 @@ fn bakeBoulder(b: *Builder, o: world.Obstacle) void {
             b.addSphere(v3(x + cosf(ang) * dd, gy + rr * 0.55, z + sinf(ang) * dd), rr, 6, 6, tone);
         }
     }
+    // Weathering on the massive silhouettes (rubble is texture already): crack
+    // seams lying across the faces, lichen rosettes, an embedded chip or two.
+    if (vroll < 0.78) {
+        const crackCol = lerpColor(grime, rl.Color.black, 0.5);
+        var c: i32 = 0;
+        while (c < 3) : (c += 1) {
+            const cf: f32 = @floatFromInt(c);
+            const a = seed * 2.9 + cf * 2.2;
+            const h0 = o.Height * (0.18 + 0.30 * @abs(sinf(seed + cf * 1.3)));
+            const p0 = v3(x + cosf(a) * r * 0.72, gy + h0, z + sinf(a) * r * 0.72);
+            const p1 = v3(x + cosf(a + 0.8) * r * 0.85, gy + h0 * (0.4 + 0.4 * @abs(sinf(cf + seed))), z + sinf(a + 0.8) * r * 0.85);
+            b.addCylinder(p0, p1, 0.035, 0.015, 3, crackCol);
+        }
+        var l: i32 = 0;
+        while (l < 3) : (l += 1) {
+            const lf: f32 = @floatFromInt(l);
+            const a = seed * 4.3 + lf * 2.8;
+            const tone = if (l == 0) rgba(48, 52, 38, 255) else if (l == 1) lerpColor(grime, rl.Color.white, 0.08) else lerpColor(grime, rl.Color.black, 0.3);
+            b.addSphere(v3(x + cosf(a) * r * 0.82, gy + o.Height * (0.22 + 0.18 * lf), z + sinf(a) * r * 0.82), r * (0.12 + 0.05 * @abs(sinf(seed + lf))), 4, 4, tone);
+        }
+    }
 }
 
 fn bakeGravestone(b: *Builder, o: world.Obstacle) void {
@@ -234,6 +255,17 @@ fn bakeGravestone(b: *Builder, o: world.Obstacle) void {
     b.addSphere(v3(o.Pos.x - o.Radius, gy + o.Height, o.Pos.z), ridge_r, 6, 6, o.Tint);
     b.addSphere(v3(o.Pos.x + o.Radius, gy + o.Height, o.Pos.z), ridge_r, 6, 6, o.Tint);
     b.addCube(v3(o.Pos.x, gy + 0.14, o.Pos.z), v3(o.Radius * 2 + 0.3, 0.28, 0.62), dark);
+    // Weathering: moss creeping off the plinth, rain streaks down both faces, and
+    // a chipped shoulder pitting the ridge line.
+    const seed = o.Pos.x * 3.3 + o.Pos.z * 5.9;
+    b.addSphere(v3(o.Pos.x + cosf(seed) * o.Radius * 0.6, gy + 0.31, o.Pos.z + sinf(seed) * 0.22), 0.14, 4, 4, rgba(12, 22, 8, 255));
+    const streakX = o.Pos.x + sinf(seed * 2.1) * o.Radius * 0.55;
+    const streak = lerpColor(o.Tint, rl.Color.black, 0.4);
+    for ([_]f32{ -0.19, 0.19 }) |zoff| {
+        b.addCylinder(v3(streakX, gy + o.Height * 0.92, o.Pos.z + zoff), v3(streakX, gy + o.Height * (0.30 + 0.2 * @abs(sinf(seed))), o.Pos.z + zoff), 0.035, 0.02, 3, streak);
+    }
+    const chipSgn: f32 = if (sinf(seed * 1.7) > 0) 1 else -1;
+    b.addSphere(v3(o.Pos.x + chipSgn * o.Radius * 0.85, gy + o.Height - 0.04, o.Pos.z), 0.10, 4, 4, lerpColor(o.Tint, rl.Color.black, 0.45));
 }
 
 // ---- Trees ----
@@ -316,6 +348,16 @@ fn bakeTrunkGrime(b: *Builder, base: rl.Vector3, lean: rl.Vector3, bow: f32, tru
         const hgt = 0.25 + 0.35 * @abs(sinf(seed + mf * 1.3));
         b.addSphere(v3(base.x + cosf(a) * trunk_r * 0.85, base.y + hgt, base.z + sinf(a) * trunk_r * 0.85), 0.13 + 0.05 * @abs(sinf(seed * 2 + mf)), 4, 4, moss);
     }
+    // Lichen rosettes speckle the mid-trunk (dim sage — output gamma lifts it).
+    const lichen = rgba(44, 50, 38, 255);
+    var l: i32 = 0;
+    while (l < 3) : (l += 1) {
+        const lf: f32 = @floatFromInt(l);
+        const f = 0.15 + 0.50 * @abs(sinf(seed * 2.7 + lf * 1.9));
+        const a = seed * 3.7 + lf * 2.2;
+        const rr = trunk_r * (1 - taper * f);
+        b.addSphere(v3(base.x + lean.x * bow * f * f + cosf(a) * rr * 0.95, base.y + trunkH * f, base.z + lean.z * bow * f * f + sinf(a) * rr * 0.95), 0.075 + 0.03 * @abs(sinf(seed + lf)), 4, 4, lichen);
+    }
 }
 
 // Bracket fungus shelves jutting from dead bark.
@@ -359,6 +401,18 @@ fn bakeBranches(b: *Builder, crown: rl.Vector3, n: i32, brLen: f32, r0: f32, see
 fn bakeCanopyMass(b: *Builder, c: rl.Vector3, r: f32, dark: rl.Color, lite: rl.Color, phase: f32) void {
     b.addSphere(c, r, 8, 8, dark);
     b.addSphere(v3(c.x + cosf(phase) * r * 0.28, c.y + r * 0.42, c.z + sinf(phase) * r * 0.28), r * 0.60, 7, 7, lite);
+    // Leaf-clump mottling: knots sunk DEEP into the dome so only a shallow cap
+    // breaks the surface — tone patches, not bumps (proud knots read as warts;
+    // tried at 0.92r and rejected). Max reach ~1.03r keeps the silhouette clean.
+    var i: i32 = 0;
+    while (i < 3) : (i += 1) {
+        const iff: f32 = @floatFromInt(i);
+        const a = phase * 2.3 + iff * 2.1;
+        const el = 0.15 + 0.4 * @abs(sinf(phase + iff * 1.7));
+        const p = v3(c.x + cosf(a) * r * 0.78 * cosf(el), c.y + sinf(el) * r * 0.78, c.z + sinf(a) * r * 0.78 * cosf(el));
+        const tone = if (@mod(i, 2) == 0) lerpColor(dark, rl.Color.black, 0.22) else lerpColor(lite, rl.Color.white, 0.05);
+        b.addSphere(p, r * (0.20 + 0.05 * @abs(sinf(phase * 3 + iff))), 5, 5, tone);
+    }
 }
 
 fn bakeTree(b: *Builder, o: world.Obstacle) void {
@@ -406,10 +460,22 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
             bakeCanopyMass(b, cc, cr, canopyDark, canopyLite, seed);
             const clumps: i32 = if (full) 6 else 5;
             const clumpsF: f32 = @floatFromInt(clumps);
+            // Wind gap: one clump is missing, and a bare kinked limb reaches out
+            // through the hole — the crown wears its worst season.
+            const skipK: i32 = @intFromFloat(@mod(@abs(seed * 2.7), clumpsF));
             var k: i32 = 0;
             while (k < clumps) : (k += 1) {
                 const kf: f32 = @floatFromInt(k);
                 const ang = kf * (std.math.tau / clumpsF) + o.Height + seed;
+                if (k == skipK) {
+                    const reach = cr * 1.35;
+                    const eb = v3(cc.x + cosf(ang) * reach * 0.55, cc.y + 0.30, cc.z + sinf(ang) * reach * 0.55);
+                    const tp = v3(cc.x + cosf(ang + 0.6) * reach, cc.y + 0.05, cc.z + sinf(ang + 0.6) * reach);
+                    b.addCylinder(v3(crown.x, crown.y + 0.2, crown.z), eb, 0.13, 0.07, 5, branchCol);
+                    b.addCylinder(eb, tp, 0.07, 0.015, 4, branchCol);
+                    b.addCylinder(tp, v3(tp.x + cosf(ang - 0.4) * 0.3, tp.y + 0.2, tp.z + sinf(ang - 0.4) * 0.3), 0.03, 0.0, 3, branchCol);
+                    continue;
+                }
                 const dropY: f32 = if (full) 0.02 + 0.20 * sinf(kf * 1.7 + seed) else 0.05 + 0.38 * sinf(kf * 1.7 + seed);
                 const cp = v3(cc.x + cosf(ang) * cr * 0.78, cc.y + dropY, cc.z + sinf(ang) * cr * 0.78);
                 bakeCanopyMass(b, cp, cr * (0.52 + 0.22 * @abs(sinf(kf + seed))), canopyDark, canopyLite, seed + kf * 2.1);
@@ -437,6 +503,12 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
                 b.addCylinder(boleTop, mid, trunk_r * 0.72, trunk_r * 0.50, 7, bark);
                 b.addCylinder(mid, top, trunk_r * 0.50, trunk_r * 0.28, 6, bark);
                 bakeBranches(b, top, 4, 0.45, 0.12, seed + sf * 2.1, o.Height, false, branchCol);
+                // Half-dead fork (wabi-sabi): on some trees the lesser bough lost
+                // its leaves — bare claws where its crown should be.
+                if (s == 1 and sinf(seed * 5.3) > 0.2) {
+                    bakeBranches(b, top, 5, 0.65, 0.09, seed * 1.7, o.Height, true, branchCol);
+                    continue;
+                }
                 const cr = o.Radius * @as(f32, if (s == 0) 0.90 else 0.72);
                 const cc = v3(top.x + dx * 0.25, top.y + 0.35, top.z + dz * 0.25);
                 bakeCanopyMass(b, cc, cr, canopyDark, canopyLite, seed + sf);
@@ -459,6 +531,12 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
             bakeTrunkGrime(b, base, lean, o.Height, trunkH, trunk_r, 0.45, bark, seed);
             const cr = o.Radius * 1.15;
             bakeCanopyMass(b, v3(crown.x, crown.y + 0.55, crown.z), cr, canopyDark, canopyLite, seed);
+            // A rot hollow gapes at the base flank; one bough among the four died
+            // bare (wabi-sabi — the oak survives its wounds).
+            const ha = seed * 2.9;
+            b.addSphere(v3(x + cosf(ha) * trunk_r * 0.92, gy + 0.55, z + sinf(ha) * trunk_r * 0.92), trunk_r * 0.42, 6, 6, rgba(10, 8, 7, 255));
+            b.addSphere(v3(x + cosf(ha) * trunk_r * 0.80, gy + 0.85, z + sinf(ha) * trunk_r * 0.80), trunk_r * 0.20, 4, 4, lerpColor(bark, rl.Color.black, 0.4));
+            const deadJ: i32 = @intFromFloat(@mod(@abs(seed * 3.9), 4.0));
             var j: i32 = 0;
             while (j < 4) : (j += 1) {
                 const jf: f32 = @floatFromInt(j);
@@ -468,17 +546,80 @@ fn bakeTree(b: *Builder, o: world.Obstacle) void {
                 const tip = v3(crown.x + cosf(ang + 0.35) * out, crown.y + 0.55 + 0.30 * @abs(sinf(jf + seed)), crown.z + sinf(ang + 0.35) * out);
                 b.addCylinder(crown, elbow, 0.24, 0.14, 6, bark);
                 b.addCylinder(elbow, tip, 0.14, 0.05, 5, branchCol);
-                bakeCanopyMass(b, v3(tip.x, tip.y + 0.25, tip.z), cr * 0.55, canopyDark, canopyLite, seed + jf);
+                if (j == deadJ) {
+                    // The dead bough claws on past where its crown should hang.
+                    const t2 = v3(tip.x + cosf(ang + 1.1) * out * 0.5, tip.y + 0.25, tip.z + sinf(ang + 1.1) * out * 0.5);
+                    b.addCylinder(tip, t2, 0.05, 0.0, 4, branchCol);
+                    b.addCylinder(tip, v3(tip.x + cosf(ang - 0.5) * out * 0.35, tip.y - 0.15, tip.z + sinf(ang - 0.5) * out * 0.35), 0.04, 0.0, 3, branchCol);
+                } else {
+                    bakeCanopyMass(b, v3(tip.x, tip.y + 0.25, tip.z), cr * 0.55, canopyDark, canopyLite, seed + jf);
+                }
             }
         },
         .dead => {
-            // Bare claw: no foliage at all, just bark, knots, and bracket fungus.
-            const trunk_r = 0.38;
-            const trunkH = o.Height * 0.78;
-            const crown = bakeTrunkSegs(b, base, lean, o.Height, trunkH, trunk_r, 0.6, 8, bark);
-            bakeBarkRidges(b, base, lean, o.Height, trunkH, trunk_r, 0.6, bark, seed);
-            bakeTrunkGrime(b, base, lean, o.Height, trunkH, trunk_r, 0.6, bark, seed);
-            bakeBranches(b, crown, 8, 0.95, 0.12, seed, o.Height, true, branchCol);
+            // Dead standard: a spire trunk with limbs STAGGERED along it — each
+            // rising, kinking at an elbow, splitting into twig lace — the winter-
+            // tree silhouette. (One claw-wheel of branches at the crown read as a
+            // spiked mace, not a tree.) No foliage; knots and bracket fungus only.
+            const trunk_r = 0.36;
+            const trunkH = o.Height * 0.96;
+            const bow = o.Height;
+            const spire = bakeTrunkSegs(b, base, lean, bow, trunkH, trunk_r, 0.82, 8, bark);
+            bakeBarkRidges(b, base, lean, bow, trunkH, trunk_r, 0.82, bark, seed);
+            bakeTrunkGrime(b, base, lean, bow, trunkH, trunk_r, 0.82, bark, seed);
+            var j: i32 = 0;
+            while (j < 6) : (j += 1) {
+                const jf: f32 = @floatFromInt(j);
+                // Node on the bowed trunk (same quadratic as bakeTrunkSegs); limbs
+                // shorten and thin as they climb.
+                const f = 0.38 + 0.11 * jf;
+                const node = v3(base.x + lean.x * bow * f * f, gy + trunkH * f, base.z + lean.z * bow * f * f);
+                const len = o.Radius * 1.45 * (1.1 - 0.12 * jf) * (0.75 + 0.35 * @abs(sinf(seed * 1.7 + jf)));
+                const rise = 0.45 + 0.25 * @abs(sinf(seed + jf * 1.3));
+                // Three kinked segments, each turning hard at a knuckled joint —
+                // gnarl is repeated direction change, not length.
+                const a1 = seed + jf * 2.4;
+                const turn1 = 0.55 + 0.45 * sinf(seed * 2.3 + jf);
+                const turn2 = 0.5 + 0.4 * sinf(seed * 3.1 + jf * 1.7);
+                const a2 = a1 + turn1;
+                const a3 = a2 - turn2 * 1.6; // doubles back — the arthritic wrist
+                const p1 = v3(node.x + cosf(a1) * len * 0.38, node.y + len * rise * 0.45, node.z + sinf(a1) * len * 0.38);
+                const p2 = v3(p1.x + cosf(a2) * len * 0.34, p1.y + len * rise * 0.32, p1.z + sinf(a2) * len * 0.34);
+                // Tips flatten out, and every other limb droops — dead wood sags.
+                const sag: f32 = if (@mod(j, 2) == 0) -0.10 else 0.10;
+                const p3 = v3(p2.x + cosf(a3) * len * 0.30, p2.y + len * rise * sag, p2.z + sinf(a3) * len * 0.30);
+                const lr = 0.16 * (1.0 - 0.09 * jf);
+                b.addCylinder(node, p1, lr, lr * 0.62, 5, bark);
+                b.addCylinder(p1, p2, lr * 0.62, lr * 0.34, 5, bark);
+                b.addCylinder(p2, p3, lr * 0.34, 0.015, 4, branchCol);
+                // Knuckle knots swell at the joints.
+                b.addSphere(p1, lr * 0.80, 5, 5, lerpColor(bark, rl.Color.black, 0.28));
+                b.addSphere(p2, lr * 0.55, 4, 4, lerpColor(bark, rl.Color.black, 0.28));
+                // Claw twigs: a riser off the mid-joint, sagging fingers off the tip.
+                const t1 = v3(p2.x + cosf(a2 + 1.3) * len * 0.28, p2.y + len * 0.24, p2.z + sinf(a2 + 1.3) * len * 0.28);
+                b.addCylinder(p2, t1, 0.05, 0.0, 3, branchCol);
+                const t2 = v3(p3.x + cosf(a3 - 0.7) * len * 0.30, p3.y - len * 0.10, p3.z + sinf(a3 - 0.7) * len * 0.30);
+                b.addCylinder(p3, t2, 0.04, 0.0, 3, branchCol);
+                const t3 = v3(p3.x + cosf(a3 + 0.5) * len * 0.24, p3.y + len * 0.14, p3.z + sinf(a3 + 0.5) * len * 0.24);
+                b.addCylinder(p3, t3, 0.035, 0.0, 3, branchCol);
+                if (@mod(j, 2) == 0) {
+                    const t4 = v3(t2.x + cosf(a3 - 1.1) * 0.35, t2.y - 0.12, t2.z + sinf(a3 - 1.1) * 0.35);
+                    b.addCylinder(t2, t4, 0.025, 0.0, 3, branchCol);
+                }
+            }
+            // Two crooked fingers keep the spire tip from ending naked.
+            var s: i32 = 0;
+            while (s < 2) : (s += 1) {
+                const sf: f32 = @floatFromInt(s);
+                const fa = seed * 2.2 + sf * 2.9;
+                const fm = v3(spire.x + cosf(fa) * 0.30, spire.y + 0.28, spire.z + sinf(fa) * 0.30);
+                b.addCylinder(spire, fm, 0.07, 0.03, 4, bark);
+                b.addCylinder(fm, v3(fm.x + cosf(fa + 0.9) * 0.30, fm.y + 0.24, fm.z + sinf(fa + 0.9) * 0.30), 0.03, 0.0, 3, branchCol);
+            }
+            // One low broken stub — the storm took a limb.
+            const sa = seed * 3.3;
+            const sn = v3(base.x + lean.x * bow * 0.09, gy + trunkH * 0.3, base.z + lean.z * bow * 0.09);
+            b.addCylinder(sn, v3(sn.x + cosf(sa) * 0.5, sn.y + 0.12, sn.z + sinf(sa) * 0.5), 0.10, 0.0, 4, lerpColor(bark, rl.Color.black, 0.3));
             bakeShelfFungi(b, x, gy, z, trunk_r, seed, 3);
         },
         .snag => {

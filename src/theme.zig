@@ -25,6 +25,19 @@ pub const trimColor = rgba(150, 116, 60, 255);
 // Ink: near-black backing behind pills/bars/plaques (used with withAlpha per site).
 pub const ink = rgba(8, 6, 5, 255);
 
+// Oiled walnut: panel-slab wood, lit top edge falling to the dark tone.
+pub const woodDark = rgba(28, 17, 10, 255);
+pub const woodLight = rgba(50, 32, 17, 255);
+
+// Waxed hardwood molding: the frame band between iron stroke and brass liner,
+// with its varnish highlight.
+pub const woodMid = rgba(84, 55, 32, 255);
+pub const woodBevel = rgba(138, 96, 58, 255);
+
+// Cold iron: heavy frame bands, corner plates, rivet domes (brass rides inside it).
+pub const ironDark = rgba(23, 19, 16, 255);
+pub const ironLight = rgba(66, 58, 47, 255);
+
 // Muted parchment label text: captions, stepper/field labels (alpha varies via withAlpha).
 pub const labelColor = rgba(200, 190, 172, 255);
 
