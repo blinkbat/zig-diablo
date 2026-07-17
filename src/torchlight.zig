@@ -111,50 +111,59 @@ const sceneFS =
     \\// ---- FLOOR MATERIALS ----
     \\// One procedural look per world.FloorMat, ids matching that enum's order (its
     \\// base() tones mirror these — keep in sync). Pre-gamma albedo at a ground point.
+    \\// Crisp world-grid speckle: the sharp octave smooth vnoise lacks — without it
+    \\// broad ground reads as out-of-focus blur.
+    \\float speck(vec2 p, float s) { return hash21(floor(p*s)); }
+    \\// fwidth-antialiased step: edges stay crisp up close and soften with distance
+    \\// instead of shimmering.
+    \\float aastep(float e, float x) { float w = max(fwidth(x), 1e-4); return smoothstep(e - w, e + w, x); }
     \\vec3 matAlbedo(int id, vec2 p) {
     \\    if (id == 1) { // GRASS: fine blade grain over sickly green, whole patches dead
-    \\        float blades = vnoise(p*6.5)*0.6 + vnoise(p*13.0)*0.4;
+    \\        float blades = vnoise(p*6.5)*0.40 + vnoise(p*13.0)*0.28 + speck(p, 21.0)*0.32;
     \\        float dead = smoothstep(0.35, 0.75, vnoise(p*0.09 + 3.7));
     \\        vec3 c = mix(vec3(0.13, 0.18, 0.09), vec3(0.25, 0.21, 0.11), dead);
-    \\        return c*(0.70 + 0.60*blades);
+    \\        return c*(0.62 + 0.76*blades);
     \\    }
     \\    if (id == 2) { // STONE: worn slabs, dark grout seams, moss creeping in the damp
     \\        vec2 gp = p*0.42;
     \\        vec2 f = fract(gp);
-    \\        float seam = smoothstep(0.012, 0.075, min(min(f.x, 1.0 - f.x), min(f.y, 1.0 - f.y)));
+    \\        float d = min(min(f.x, 1.0 - f.x), min(f.y, 1.0 - f.y));
     \\        float tone = 0.76 + 0.46*hash21(floor(gp));
-    \\        vec3 c = vec3(0.235, 0.230, 0.215)*tone*(0.82 + 0.36*vnoise(p*2.7));
+    \\        vec3 c = vec3(0.235, 0.230, 0.215)*tone*(0.85 + 0.30*vnoise(p*2.7))*(0.90 + 0.20*speck(p, 17.0));
     \\        float moss = smoothstep(0.55, 0.85, vnoise(p*0.23 + 7.7));
     \\        c = mix(c, vec3(0.11, 0.15, 0.08), moss*0.55);
-    \\        return mix(c*0.32, c, seam);
+    \\        c *= 0.82 + 0.18*aastep(0.085, d); // shaded bevel ring inside the seam
+    \\        return mix(c*0.30, c, aastep(0.032, d));
     \\    }
     \\    if (id == 3) { // COBBLE: staggered rounded stones over dark packed earth
     \\        vec2 gp = p*1.15;
     \\        gp.x += 0.5*step(0.5, fract(gp.y*0.5));
     \\        vec2 f = fract(gp) - 0.5;
-    \\        float stone = 1.0 - smoothstep(0.30, 0.46, length(f*vec2(1.0, 1.25)));
-    \\        vec3 rock = vec3(0.225, 0.215, 0.195)*(0.72 + 0.56*hash21(floor(gp)))*(0.85 + 0.30*vnoise(p*4.0));
-    \\        return mix(vec3(0.095, 0.080, 0.055), rock, stone);
+    \\        float r = length(f*vec2(1.0, 1.25));
+    \\        vec3 rock = vec3(0.225, 0.215, 0.195)*(0.72 + 0.56*hash21(floor(gp)))*(0.86 + 0.16*vnoise(p*4.0))*(0.90 + 0.20*speck(p, 15.0));
+    \\        rock *= 1.0 - 0.38*smoothstep(0.16, 0.43, r); // domed tops shade toward the rim
+    \\        return mix(vec3(0.095, 0.080, 0.055), rock, 1.0 - aastep(0.43, r));
     \\    }
     \\    if (id == 4) { // MUD: near-black wet earth, broad standing-water darkening
     \\        float pool = smoothstep(0.35, 0.80, vnoise(p*0.35 + 21.0));
     \\        vec3 c = mix(vec3(0.155, 0.120, 0.080), vec3(0.070, 0.055, 0.040), pool);
-    \\        return c*(0.80 + 0.40*vnoise(p*2.3));
+    \\        c *= 0.80 + 0.40*vnoise(p*2.3);
+    \\        return c*(0.93 + 0.14*speck(p, 13.0)); // wet grit — mud stays smoother than stone
     \\    }
     \\    if (id == 5) { // BONE: ash-dark ground littered with clumped pale fragments
-    \\        vec3 ash = vec3(0.125, 0.110, 0.095)*(0.75 + 0.50*vnoise(p*1.7));
+    \\        vec3 ash = vec3(0.125, 0.110, 0.095)*(0.75 + 0.50*vnoise(p*1.7))*(0.92 + 0.16*speck(p, 19.0));
     \\        float bones = smoothstep(0.80, 0.90, vnoise(p*7.5 + 9.1)*0.55 + vnoise(p*0.5 + 3.3)*0.50);
     \\        return mix(ash, vec3(0.50, 0.47, 0.39), bones);
     \\    }
     \\    // DIRT (0, and the fallback): weathers moss-sick to blood-rust; dry patches
     \\    // split into a cracked vein network (parched earth), mossy ground doesn't.
-    \\    float grain = vnoise(p*0.85)*0.55 + vnoise(p*3.9)*0.45;
+    \\    float grain = vnoise(p*0.85)*0.42 + vnoise(p*3.9)*0.33 + speck(p, 19.0)*0.25;
     \\    float dry = vnoise(p*0.11);
     \\    vec3 c = vec3(0.235, 0.195, 0.145)*mix(vec3(0.74, 0.92, 0.72), vec3(1.05, 0.80, 0.64), dry);
     \\    c *= 0.70 + 0.60*grain;
     \\    float ridge = abs(vnoise(p*0.9 + 17.3) - 0.5)*2.0;
-    \\    float crack = (1.0 - smoothstep(0.0, 0.10, ridge))*smoothstep(0.45, 0.8, vnoise(p*0.13 + 5.1));
-    \\    return c*(1.0 - 0.46*crack);
+    \\    float crack = (1.0 - smoothstep(0.0, 0.07, ridge))*smoothstep(0.45, 0.8, vnoise(p*0.13 + 5.1));
+    \\    return c*(1.0 - 0.52*crack);
     \\}
     \\// The area's three materials blended across the ground by two low-frequency
     \\// fields, each border roughened by a mid-frequency octave so transitions read as

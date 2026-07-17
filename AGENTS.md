@@ -9,8 +9,9 @@ Avoid making ad hoc product decisions when writing code -- ask if unsure.
 - `zig` is NOT on PATH. Build with `build.cmd` (debug) or `build-release.cmd`; the
   toolchain is vendored at `..\.zigtoolchain\zig-x86_64-windows-0.14.1\zig.exe`.
 - Verify rendering changes by RUNNING `zig-out\bin\zig-diablo.exe --gameshot` and
-  looking at the 8 PNGs in `shots\` (spawn/rampart, family portrait, portal, stat
-  sheet, menu, death, victory, editor). Don't claim a visual change works without a shot.
+  looking at the 11 PNGs in `shots\` (rampart, family portrait, spawn grove, portal,
+  stat sheet, skills ×2, menu, death, victory, editor). Don't claim a visual change
+  works without a shot.
 - Never write screenshots into the repo tree except `shots\` (gitignored).
 - Don't commit, push, or create branches unless explicitly asked.
 

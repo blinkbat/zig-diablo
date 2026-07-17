@@ -236,85 +236,276 @@ fn bakeGravestone(b: *Builder, o: world.Obstacle) void {
     b.addCube(v3(o.Pos.x, gy + 0.14, o.Pos.z), v3(o.Radius * 2 + 0.3, 0.28, 0.62), dark);
 }
 
+// ---- Trees ----
+// Six silhouettes, deterministic from position so authored woods are stable.
+// The vroll bins keep the OLD dead band (0.45–0.75) as dead wood and the old
+// full band (>=0.75) as full crowns, so existing maps keep their live/dead layout.
+const TreeShape = enum { leaner, fork, ancient, dead, snag, full };
+
+fn treeShape(vroll: f32) TreeShape {
+    if (vroll < 0.20) return .leaner;
+    if (vroll < 0.38) return .fork;
+    if (vroll < 0.45) return .ancient;
+    if (vroll < 0.65) return .dead;
+    if (vroll < 0.75) return .snag;
+    return .full;
+}
+
+// Tapered trunk in 4 segments bowing along `lean` (quadratic: base planted, tip
+// carries the bow). `bow` is the horizontal bow magnitude. Returns the crown point.
+fn bakeTrunkSegs(b: *Builder, base: rl.Vector3, lean: rl.Vector3, bow: f32, trunkH: f32, r_base: f32, taper: f32, sides: i32, bark: rl.Color) rl.Vector3 {
+    const segs_n = 4;
+    var prev = base;
+    var i: i32 = 1;
+    while (i <= segs_n) : (i += 1) {
+        const f: f32 = @as(f32, @floatFromInt(i)) / segs_n;
+        const fp: f32 = @as(f32, @floatFromInt(i - 1)) / segs_n;
+        const top = v3(base.x + lean.x * bow * f * f, base.y + trunkH * f, base.z + lean.z * bow * f * f);
+        b.addCylinder(prev, top, r_base * (1 - taper * fp), r_base * (1 - taper * f), sides, bark);
+        prev = top;
+    }
+    return prev;
+}
+
+// Root flares gripping the ground: old trees don't rise from a clean socket.
+fn bakeRoots(b: *Builder, x: f32, gy: f32, z: f32, n: i32, reach0: f32, rootR: f32, phase: f32, col: rl.Color) void {
+    const nf: f32 = @floatFromInt(n);
+    var r: i32 = 0;
+    while (r < n) : (r += 1) {
+        const rf: f32 = @floatFromInt(r);
+        const ang = rf * (std.math.tau / nf) + phase * 1.7;
+        const reach = reach0 * (1 + 0.36 * sinf(phase * 3 + rf * 2.1));
+        b.addCylinder(v3(x, gy + 0.32, z), v3(x + cosf(ang) * reach, gy + 0.02, z + sinf(ang) * reach), rootR, 0.045, 5, col);
+    }
+}
+
+// Bark fluting: shallow ridge lines up the lower trunk, alternating a hair
+// darker/lighter than bark, so trunks stop reading as smooth pipes.
+fn bakeBarkRidges(b: *Builder, base: rl.Vector3, lean: rl.Vector3, bow: f32, trunkH: f32, trunk_r: f32, taper: f32, bark: rl.Color, seed: f32) void {
+    var i: i32 = 0;
+    while (i < 5) : (i += 1) {
+        const iff: f32 = @floatFromInt(i);
+        const ang = iff * (std.math.tau / 5.0) + seed * 2.7;
+        const tone = if (@mod(i, 2) == 0) lerpColor(bark, rl.Color.black, 0.25) else lerpColor(bark, rl.Color.white, 0.06);
+        const f = 0.40 + 0.20 * @abs(sinf(seed + iff * 2.1)); // ridges die out at varied heights
+        const r0 = trunk_r * 0.90;
+        const r1 = trunk_r * (1 - taper * f) * 0.90;
+        const bot = v3(base.x + cosf(ang) * r0, base.y + 0.04, base.z + sinf(ang) * r0);
+        const top = v3(base.x + lean.x * bow * f * f + cosf(ang) * r1, base.y + trunkH * f, base.z + lean.z * bow * f * f + sinf(ang) * r1);
+        b.addCylinder(bot, top, 0.06, 0.02, 3, tone);
+    }
+}
+
+// Burl knots on the mid-trunk plus a moss saddle on ONE damp flank of the base.
+// Moss starts near-black (output gamma would lift a brighter green to mint).
+fn bakeTrunkGrime(b: *Builder, base: rl.Vector3, lean: rl.Vector3, bow: f32, trunkH: f32, trunk_r: f32, taper: f32, bark: rl.Color, seed: f32) void {
+    var i: i32 = 0;
+    while (i < 2) : (i += 1) {
+        const iff: f32 = @floatFromInt(i);
+        const f = 0.25 + 0.30 * @abs(sinf(seed * 3.1 + iff * 2.9));
+        const ang = seed * 4.3 + iff * 2.6;
+        const rr = trunk_r * (1 - taper * f);
+        const p = v3(base.x + lean.x * bow * f * f + cosf(ang) * rr, base.y + trunkH * f, base.z + lean.z * bow * f * f + sinf(ang) * rr);
+        b.addSphere(p, trunk_r * 0.28, 5, 5, lerpColor(bark, rl.Color.black, 0.35));
+    }
+    const moss = rgba(12, 22, 8, 255);
+    var m: i32 = 0;
+    while (m < 3) : (m += 1) {
+        const mf: f32 = @floatFromInt(m);
+        const a = seed * 1.9 + (mf - 1) * 0.55;
+        const hgt = 0.25 + 0.35 * @abs(sinf(seed + mf * 1.3));
+        b.addSphere(v3(base.x + cosf(a) * trunk_r * 0.85, base.y + hgt, base.z + sinf(a) * trunk_r * 0.85), 0.13 + 0.05 * @abs(sinf(seed * 2 + mf)), 4, 4, moss);
+    }
+}
+
+// Bracket fungus shelves jutting from dead bark.
+fn bakeShelfFungi(b: *Builder, x: f32, gy: f32, z: f32, trunk_r: f32, seed: f32, n: i32) void {
+    var i: i32 = 0;
+    while (i < n) : (i += 1) {
+        const iff: f32 = @floatFromInt(i);
+        const ang = seed * 3.7 + iff * 2.3;
+        const hgt = 0.45 + 0.60 * iff + 0.25 * @abs(sinf(seed + iff * 1.7));
+        const a = v3(x + cosf(ang) * trunk_r * 0.5, gy + hgt, z + sinf(ang) * trunk_r * 0.5);
+        const t = v3(x + cosf(ang) * (trunk_r + 0.30), gy + hgt - 0.06, z + sinf(ang) * (trunk_r + 0.30));
+        b.addCylinder(a, t, 0.15, 0.04, 4, rgba(128, 112, 82, 255));
+    }
+}
+
+// Claw branches radiating from `crown` — bare wood breaking the canopy line.
+// `kinked` adds the skeleton-hand second segment; living trees get short twigs.
+fn bakeBranches(b: *Builder, crown: rl.Vector3, n: i32, brLen: f32, r0: f32, seed: f32, phase: f32, kinked: bool, col: rl.Color) void {
+    const nf: f32 = @floatFromInt(n);
+    var j: i32 = 0;
+    while (j < n) : (j += 1) {
+        const jf: f32 = @floatFromInt(j);
+        const ang = jf * (std.math.tau / nf) + seed;
+        const out = brLen + 0.35 * sinf(phase + jf * 1.9);
+        const tip = v3(crown.x + cosf(ang) * out, crown.y + 0.15 + 0.35 * sinf(jf * 2.3 + seed), crown.z + sinf(ang) * out);
+        b.addCylinder(crown, tip, r0, 0.03, 5, col);
+        if (kinked) {
+            const t2 = v3(tip.x + cosf(ang + 0.9) * out * 0.45, tip.y + 0.22 * sinf(jf + seed * 2.0), tip.z + sinf(ang + 0.9) * out * 0.45);
+            b.addCylinder(tip, t2, 0.05, 0.0, 4, col);
+        } else if (@mod(j, 2) == 0) {
+            const t2 = v3(tip.x + cosf(ang - 0.7) * 0.22, tip.y + 0.26, tip.z + sinf(ang - 0.7) * 0.22);
+            b.addCylinder(tip, t2, 0.035, 0.0, 3, col);
+        }
+    }
+}
+
+// One crown mass: dark body plus a smaller, slightly lighter cap offset upward —
+// two tones give the canopy internal depth the flat single-color blobs lacked.
+// Deep forest green. The scene shader's output gamma (pow 1/2.2) lifts dark
+// albedos hard, so the canopy starts near-black to read as rich green, not sage.
+fn bakeCanopyMass(b: *Builder, c: rl.Vector3, r: f32, dark: rl.Color, lite: rl.Color, phase: f32) void {
+    b.addSphere(c, r, 8, 8, dark);
+    b.addSphere(v3(c.x + cosf(phase) * r * 0.28, c.y + r * 0.42, c.z + sinf(phase) * r * 0.28), r * 0.60, 7, 7, lite);
+}
+
 fn bakeTree(b: *Builder, o: world.Obstacle) void {
     const bark = o.Tint;
     const x = o.Pos.x;
     const z = o.Pos.z;
     const gy = o.Pos.y;
-    const segs_n = 4;
-    // Three silhouettes, deterministic from position so authored woods are stable:
-    // 0 = the gnarled leaner, 1 = a DEAD bare claw (no canopy), 2 = a fuller crown.
     const seed = x * 5.1 + z * 3.7;
     const vroll = @abs(sinf(seed * 12.9898));
-    const dead = vroll >= 0.45 and vroll < 0.75;
-    const full = vroll >= 0.75;
-    // Per-tree lean: every trunk bows its own way and amount; the dead ones bow
-    // hardest, the full-crowned ones barely.
-    const leanMag: f32 = if (dead) 0.16 + 0.15 * @abs(sinf(seed * 1.3)) else if (full) 0.05 else 0.10 + 0.11 * @abs(sinf(seed * 1.3));
-    const lean = v3(cosf(seed) * leanMag, 0, sinf(seed) * leanMag);
-    // Root flares gripping the ground: old trees don't rise from a clean socket.
+    const shape = treeShape(vroll);
+
     const rootCol = lerpColor(bark, rl.Color.black, 0.25);
-    var r: i32 = 0;
-    while (r < 4) : (r += 1) {
-        const rf: f32 = @floatFromInt(r);
-        const ang = rf * (std.math.tau / 4.0) + o.Height * 1.7;
-        const reach = 0.5 + 0.18 * sinf(o.Height * 3 + rf * 2.1);
-        b.addCylinder(v3(x, gy + 0.32, z), v3(x + cosf(ang) * reach, gy + 0.02, z + sinf(ang) * reach), 0.15, 0.045, 5, rootCol);
-    }
-    const trunk_r = 0.38; // trunk base radius, tapering up the segments
-    // Dead trunks spend more of the authored height as bare wood (no crown above).
-    const trunkH = o.Height * @as(f32, if (dead) 0.78 else 0.62);
-    var prev = v3(x, gy, z);
-    var i: i32 = 1;
-    while (i <= segs_n) : (i += 1) {
-        const f: f32 = @as(f32, @floatFromInt(i)) / segs_n;
-        const top = v3(x + lean.x * o.Height * f * f, gy + trunkH * f, z + lean.z * o.Height * f * f);
-        const r0 = trunk_r * (1 - 0.6 * @as(f32, @floatFromInt(i - 1)) / segs_n);
-        const r1 = trunk_r * (1 - 0.6 * f);
-        b.addCylinder(prev, top, r0, r1, 8, bark);
-        prev = top;
-    }
-    const crown = prev;
-
-    // Branches claw long and low — some dip below the crown — so bare wood breaks
-    // the canopy line. Dead trees carry more, longer, thinner claws; full crowns
-    // tuck theirs mostly inside the foliage.
     const branchCol = lerpColor(bark, rl.Color.black, 0.2);
-    const brN: i32 = if (dead) 8 else 6;
-    const brNf: f32 = @floatFromInt(brN);
-    const brLen: f32 = if (dead) 0.95 else if (full) 0.40 else 0.55;
-    var j: i32 = 0;
-    while (j < brN) : (j += 1) {
-        const jf: f32 = @floatFromInt(j);
-        const ang = jf * (std.math.tau / brNf) + seed;
-        const out = brLen + 0.35 * sinf(o.Height + jf * 1.9);
-        const tip = v3(crown.x + cosf(ang) * out, crown.y + 0.15 + 0.35 * sinf(jf * 2.3 + seed), crown.z + sinf(ang) * out);
-        b.addCylinder(crown, tip, if (dead) 0.12 else 0.16, 0.03, 5, branchCol);
-        if (dead) {
-            // A second kinked segment past each claw: the skeleton-hand silhouette.
-            const t2 = v3(tip.x + cosf(ang + 0.9) * out * 0.45, tip.y + 0.22 * sinf(jf + seed * 2.0), tip.z + sinf(ang + 0.9) * out * 0.45);
-            b.addCylinder(tip, t2, 0.05, 0.0, 4, branchCol);
-        }
-    }
-    if (dead) return; // bare claw: no foliage at all
+    const canopyDark = lerpColor(bark, rgba(10, 20, 12, 255), 0.9);
+    const canopyLite = lerpColor(bark, rgba(16, 30, 14, 255), 0.9);
 
-    // Deep forest green. The scene shader's output gamma (pow 1/2.2) lifts dark
-    // albedos hard, so the canopy starts near-black to read as rich green, not sage.
-    const canopy = lerpColor(o.Tint, rgba(10, 20, 12, 255), 0.9);
-    const cr = o.Radius * @as(f32, if (full) 1.3 else 1.05);
-    // Crown mass sags toward the lean and clumps unevenly: a lopsided, half-dead
-    // silhouette instead of a topiary ball. Full crowns sit rounder and denser.
-    const cc = v3(crown.x + lean.x * 2.2, crown.y + 0.42, crown.z + lean.z * 2.2);
-    b.addSphere(cc, cr, 8, 8, canopy);
-    const clumps: i32 = if (full) 6 else 5;
-    const clumpsF: f32 = @floatFromInt(clumps);
-    var k: i32 = 0;
-    while (k < clumps) : (k += 1) {
-        const kf: f32 = @floatFromInt(k);
-        const ang = kf * (std.math.tau / clumpsF) + o.Height + seed;
-        const dropY: f32 = if (full) 0.02 + 0.20 * sinf(kf * 1.7 + seed) else 0.05 + 0.38 * sinf(kf * 1.7 + seed);
-        const cp = v3(cc.x + cosf(ang) * cr * 0.78, cc.y + dropY, cc.z + sinf(ang) * cr * 0.78);
-        b.addSphere(cp, cr * (0.52 + 0.22 * @abs(sinf(kf + seed))), 8, 8, canopy);
+    // Per-tree lean: every trunk bows its own way and amount; dead wood bows
+    // hardest, dense crowns and the ancient barrels barely.
+    const leanMag: f32 = switch (shape) {
+        .dead => 0.16 + 0.15 * @abs(sinf(seed * 1.3)),
+        .snag => 0.10 + 0.10 * @abs(sinf(seed * 1.3)),
+        .full => 0.05,
+        .ancient => 0.04,
+        else => 0.10 + 0.11 * @abs(sinf(seed * 1.3)),
+    };
+    const lean = v3(cosf(seed) * leanMag, 0, sinf(seed) * leanMag);
+    const base = v3(x, gy, z);
+
+    const ancient = shape == .ancient;
+    bakeRoots(b, x, gy, z, if (ancient) 6 else 4, if (ancient) 0.75 else 0.5, if (ancient) 0.20 else 0.15, o.Height, rootCol);
+
+    switch (shape) {
+        .leaner, .full => {
+            const full = shape == .full;
+            const trunk_r = 0.38;
+            const trunkH = o.Height * 0.62;
+            const crown = bakeTrunkSegs(b, base, lean, o.Height, trunkH, trunk_r, 0.6, 8, bark);
+            bakeBarkRidges(b, base, lean, o.Height, trunkH, trunk_r, 0.6, bark, seed);
+            bakeTrunkGrime(b, base, lean, o.Height, trunkH, trunk_r, 0.6, bark, seed);
+            bakeBranches(b, crown, 6, if (full) 0.40 else 0.55, 0.16, seed, o.Height, false, branchCol);
+            const cr = o.Radius * @as(f32, if (full) 1.3 else 1.05);
+            // Crown mass sags toward the lean and clumps unevenly: a lopsided,
+            // half-dead silhouette instead of a topiary ball.
+            const cc = v3(crown.x + lean.x * 2.2, crown.y + 0.42, crown.z + lean.z * 2.2);
+            bakeCanopyMass(b, cc, cr, canopyDark, canopyLite, seed);
+            const clumps: i32 = if (full) 6 else 5;
+            const clumpsF: f32 = @floatFromInt(clumps);
+            var k: i32 = 0;
+            while (k < clumps) : (k += 1) {
+                const kf: f32 = @floatFromInt(k);
+                const ang = kf * (std.math.tau / clumpsF) + o.Height + seed;
+                const dropY: f32 = if (full) 0.02 + 0.20 * sinf(kf * 1.7 + seed) else 0.05 + 0.38 * sinf(kf * 1.7 + seed);
+                const cp = v3(cc.x + cosf(ang) * cr * 0.78, cc.y + dropY, cc.z + sinf(ang) * cr * 0.78);
+                bakeCanopyMass(b, cp, cr * (0.52 + 0.22 * @abs(sinf(kf + seed))), canopyDark, canopyLite, seed + kf * 2.1);
+            }
+        },
+        .fork => {
+            // Twin trunk: a short bole splits into two diverging boughs, each with
+            // its own crown — the Y silhouette reads even at fog distance.
+            const trunk_r = 0.42;
+            const boleH = o.Height * 0.30;
+            const boleTop = bakeTrunkSegs(b, base, lean, o.Height * 0.3, boleH, trunk_r, 0.25, 8, bark);
+            bakeBarkRidges(b, base, lean, o.Height * 0.3, boleH, trunk_r, 0.25, bark, seed);
+            bakeTrunkGrime(b, base, lean, o.Height * 0.3, boleH, trunk_r, 0.25, bark, seed);
+            const splitAng = seed * 2.9;
+            var s: i32 = 0;
+            while (s < 2) : (s += 1) {
+                const sf: f32 = @floatFromInt(s);
+                const sgn: f32 = if (s == 0) 1 else -1;
+                const spread = o.Radius * (0.70 + 0.25 * @abs(sinf(seed * 1.9 + sf)));
+                const bh = o.Height * @as(f32, if (s == 0) 0.62 else 0.52);
+                const dx = cosf(splitAng) * sgn * spread;
+                const dz = sinf(splitAng) * sgn * spread;
+                const mid = v3(boleTop.x + dx * 0.45, gy + (boleH + bh) * 0.5, boleTop.z + dz * 0.45);
+                const top = v3(boleTop.x + dx, gy + bh, boleTop.z + dz);
+                b.addCylinder(boleTop, mid, trunk_r * 0.72, trunk_r * 0.50, 7, bark);
+                b.addCylinder(mid, top, trunk_r * 0.50, trunk_r * 0.28, 6, bark);
+                bakeBranches(b, top, 4, 0.45, 0.12, seed + sf * 2.1, o.Height, false, branchCol);
+                const cr = o.Radius * @as(f32, if (s == 0) 0.90 else 0.72);
+                const cc = v3(top.x + dx * 0.25, top.y + 0.35, top.z + dz * 0.25);
+                bakeCanopyMass(b, cc, cr, canopyDark, canopyLite, seed + sf);
+                var k: i32 = 0;
+                while (k < 3) : (k += 1) {
+                    const kf: f32 = @floatFromInt(k);
+                    const ang = kf * (std.math.tau / 3.0) + seed + sf;
+                    const cp = v3(cc.x + cosf(ang) * cr * 0.72, cc.y + 0.10 + 0.25 * sinf(kf * 1.7 + seed), cc.z + sinf(ang) * cr * 0.72);
+                    bakeCanopyMass(b, cp, cr * (0.50 + 0.20 * @abs(sinf(kf + seed + sf))), canopyDark, canopyLite, seed + kf + sf);
+                }
+            }
+        },
+        .ancient => {
+            // Ancient oak: squat barrel trunk, heavy near-level boughs, one wide
+            // low crown draped over them.
+            const trunk_r = 0.58;
+            const trunkH = o.Height * 0.42;
+            const crown = bakeTrunkSegs(b, base, lean, o.Height, trunkH, trunk_r, 0.45, 8, bark);
+            bakeBarkRidges(b, base, lean, o.Height, trunkH, trunk_r, 0.45, bark, seed);
+            bakeTrunkGrime(b, base, lean, o.Height, trunkH, trunk_r, 0.45, bark, seed);
+            const cr = o.Radius * 1.15;
+            bakeCanopyMass(b, v3(crown.x, crown.y + 0.55, crown.z), cr, canopyDark, canopyLite, seed);
+            var j: i32 = 0;
+            while (j < 4) : (j += 1) {
+                const jf: f32 = @floatFromInt(j);
+                const ang = jf * (std.math.tau / 4.0) + seed;
+                const out = o.Radius * (0.95 + 0.25 * @abs(sinf(seed + jf * 1.9)));
+                const elbow = v3(crown.x + cosf(ang) * out * 0.55, crown.y + 0.30, crown.z + sinf(ang) * out * 0.55);
+                const tip = v3(crown.x + cosf(ang + 0.35) * out, crown.y + 0.55 + 0.30 * @abs(sinf(jf + seed)), crown.z + sinf(ang + 0.35) * out);
+                b.addCylinder(crown, elbow, 0.24, 0.14, 6, bark);
+                b.addCylinder(elbow, tip, 0.14, 0.05, 5, branchCol);
+                bakeCanopyMass(b, v3(tip.x, tip.y + 0.25, tip.z), cr * 0.55, canopyDark, canopyLite, seed + jf);
+            }
+        },
+        .dead => {
+            // Bare claw: no foliage at all, just bark, knots, and bracket fungus.
+            const trunk_r = 0.38;
+            const trunkH = o.Height * 0.78;
+            const crown = bakeTrunkSegs(b, base, lean, o.Height, trunkH, trunk_r, 0.6, 8, bark);
+            bakeBarkRidges(b, base, lean, o.Height, trunkH, trunk_r, 0.6, bark, seed);
+            bakeTrunkGrime(b, base, lean, o.Height, trunkH, trunk_r, 0.6, bark, seed);
+            bakeBranches(b, crown, 8, 0.95, 0.12, seed, o.Height, true, branchCol);
+            bakeShelfFungi(b, x, gy, z, trunk_r, seed, 3);
+        },
+        .snag => {
+            // Snapped snag: the trunk shears off mid-height into a splintered rim
+            // around a rot-black hollow; the lost top lies alongside as a log.
+            const trunk_r = 0.42;
+            const snapH = o.Height * 0.42;
+            const stubTop = bakeTrunkSegs(b, base, lean, o.Height * 0.6, snapH, trunk_r, 0.25, 8, bark);
+            bakeBarkRidges(b, base, lean, o.Height * 0.6, snapH, trunk_r, 0.25, bark, seed);
+            var s: i32 = 0;
+            while (s < 5) : (s += 1) {
+                const sf: f32 = @floatFromInt(s);
+                const ang = sf * (std.math.tau / 5.0) + seed;
+                const spikeH = 0.25 + 0.55 * @abs(sinf(seed * 2.1 + sf * 1.7));
+                const p = v3(stubTop.x + cosf(ang) * trunk_r * 0.68, stubTop.y - 0.05, stubTop.z + sinf(ang) * trunk_r * 0.68);
+                b.addCylinder(p, v3(p.x, p.y + spikeH, p.z), 0.10, 0.0, 4, bark);
+            }
+            b.addSphere(v3(stubTop.x, stubTop.y, stubTop.z), trunk_r * 0.62, 6, 6, rgba(12, 10, 8, 255));
+            // Fallen top stays within the obstacle footprint so bodies don't clip it.
+            const fa = seed * 4.7;
+            const la = v3(x + cosf(fa) * (trunk_r + 0.20), gy + 0.16, z + sinf(fa) * (trunk_r + 0.20));
+            const lb = v3(x + cosf(fa) * (trunk_r + 0.20 + o.Radius * 0.95), gy + 0.13, z + sinf(fa) * (trunk_r + 0.20 + o.Radius * 0.95));
+            b.addCylinder(la, lb, trunk_r * 0.68, trunk_r * 0.45, 7, lerpColor(bark, rl.Color.black, 0.18));
+            b.addSphere(lb, trunk_r * 0.42, 5, 5, rgba(14, 12, 10, 255));
+            b.addCylinder(v3((la.x + lb.x) / 2, gy + 0.2, (la.z + lb.z) / 2), v3((la.x + lb.x) / 2 + cosf(fa + 1.5) * 0.5, gy + 0.55, (la.z + lb.z) / 2 + sinf(fa + 1.5) * 0.5), 0.08, 0.0, 4, branchCol);
+            bakeShelfFungi(b, x, gy, z, trunk_r, seed, 2);
+        },
     }
 }
 

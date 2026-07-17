@@ -3245,11 +3245,12 @@ pub fn run(shot: bool) void {
     defer g.rumble.stop(); // never leave a motor latched on after the window closes
 
     // Screenshot harness: skip the menu, sweep a few vantages — the rampart, arena
-    // center, and the forced-open portal. Camera snaps to each teleport, then a dozen
-    // frames run so fog/particles/rig settle before the shutter.
+    // center, the spawn grove, and the forced-open portal. Camera snaps to each
+    // teleport, then a dozen frames run so fog/particles/rig settle before the shutter.
     const sweep = [_]rl.Vector3{
         mathx.ground(31.5, 20), // atop the Blood Moor rampart (ledge spans x 26.., z 4..30)
         mathx.ground(0, 0),
+        mathx.ground(g.map.spawn.x, g.map.spawn.z), // the spawn grove: one tree of each silhouette
         mathx.ground(g.w.PortalPos.x, g.w.PortalPos.z + 5),
     };
     // Which sweep vantage gets the family-portrait staging (arena center). The portal
