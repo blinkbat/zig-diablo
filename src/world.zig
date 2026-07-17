@@ -28,6 +28,19 @@ pub const FloorMat = enum(u8) {
             .bone => rl.Color.init(46, 42, 36, 255),
         };
     }
+
+    comptime {
+        // torchlight.zig's matAlbedo() encodes these ordinals as raw GLSL id branches
+        // (id==1 grass, id==2 stone, …) and the pave sentinel hardcodes stone=2. Nothing
+        // else pins them, so a reorder here would silently repaint every floor — fail the
+        // build instead.
+        std.debug.assert(@intFromEnum(FloorMat.dirt) == 0);
+        std.debug.assert(@intFromEnum(FloorMat.grass) == 1);
+        std.debug.assert(@intFromEnum(FloorMat.stone) == 2);
+        std.debug.assert(@intFromEnum(FloorMat.cobble) == 3);
+        std.debug.assert(@intFromEnum(FloorMat.mud) == 4);
+        std.debug.assert(@intFromEnum(FloorMat.bone) == 5);
+    }
 };
 
 // primary / secondary / tertiary — repeat a name to narrow an area's variety.

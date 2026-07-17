@@ -301,7 +301,7 @@ fn scrollCorner(cx: i32, cy: i32, corner: u2, a: u8) void {
     rl.drawRing(c, 10.5, 11.4, start + 8, start + 82, 16, withAlpha(theme.trimColor, mathx.u8f(fi(a) * 0.6)));
     diamond(cx + @as(i32, @intFromFloat(sxv * 8)), cy + @as(i32, @intFromFloat(syv * 8)), 3, withAlpha(theme.trimColor, a));
     for ([_]f32{ start, start + 90 }) |deg| {
-        const rr = deg * std.math.pi / 180.0;
+        const rr = mathx.radians(deg);
         rl.drawCircleV(.{ .x = c.x + mathx.cosf(rr) * 16.6, .y = c.y + mathx.sinf(rr) * 16.6 }, 2.0, withAlpha(theme.trimColor, a));
     }
 }
@@ -530,14 +530,19 @@ fn padDpad(cx: i32, cy: i32, r: i32, dir: Dir) void {
     rl.drawLineEx(.{ .x = xf + tip, .y = yf }, .{ .x = xf + off, .y = yf + cw }, 1.6, if (rt) on else dim);
 }
 
+// The dark rounded-pill chrome shared by the controller pictograms (menu + bumper).
+fn padPill(rect: rl.Rectangle) void {
+    rl.drawRectangleRounded(rect, 0.6, 6, rgba(34, 29, 24, 235));
+    rl.drawRectangleRoundedLinesEx(rect, 0.6, 6, 1, withAlpha(theme.trimColor, 160));
+}
+
 // Start-button pictogram: a bumper pill wearing the three-line menu icon (no
 // letter — the physical button has none).
 fn padMenu(cx: i32, cy: i32) void {
     const w: i32 = 24;
     const h: i32 = 16;
     const rect = rl.Rectangle{ .x = fi(cx - @divTrunc(w, 2)), .y = fi(cy - @divTrunc(h, 2)), .width = fi(w), .height = fi(h) };
-    rl.drawRectangleRounded(rect, 0.6, 6, rgba(34, 29, 24, 235));
-    rl.drawRectangleRoundedLinesEx(rect, 0.6, 6, 1, withAlpha(theme.trimColor, 160));
+    padPill(rect);
     var i: i32 = -1;
     while (i <= 1) : (i += 1) {
         const ly = fi(cy) + fi(i) * 3.5;
@@ -551,8 +556,7 @@ fn padBumper(cx: i32, cy: i32, label: [:0]const u8) void {
     const w = textW(label, size) + 12;
     const h: i32 = 18;
     const r = rl.Rectangle{ .x = fi(cx - @divTrunc(w, 2)), .y = fi(cy - @divTrunc(h, 2)), .width = fi(w), .height = fi(h) };
-    rl.drawRectangleRounded(r, 0.6, 6, rgba(34, 29, 24, 235));
-    rl.drawRectangleRoundedLinesEx(r, 0.6, 6, 1, withAlpha(theme.trimColor, 160));
+    padPill(r);
     glyphLabel(label, cx, cy, size, rgba(226, 210, 180, 245));
 }
 
@@ -1387,13 +1391,13 @@ fn drawOrb(cx: i32, cy: i32, radius: i32, frac_in: f32, full: rl.Color, empty: r
     rl.drawRing(cv, rf + 4, rf + 5.5, 0, 360, 48, theme.trimColor);
     rl.drawRing(cv, rf - 1, rf + 1, 0, 360, 48, rgba(15, 12, 10, 255));
     for ([_]f32{ 45, 135, 225, 315 }) |deg| {
-        const rad = deg * std.math.pi / 180.0;
+        const rad = mathx.radians(deg);
         rivet(cx + @as(i32, @intFromFloat(mathx.cosf(rad) * (rf + 2.5))), cy + @as(i32, @intFromFloat(mathx.sinf(rad) * (rf + 2.5))), 3.0);
     }
     // Claw prongs grip the glass at left, bottom, right (top stays clear for the
     // readout).
     for ([_]f32{ 0, 90, 180 }) |deg| {
-        const rad = deg * std.math.pi / 180.0;
+        const rad = mathx.radians(deg);
         const pxf = fi(cx) + mathx.cosf(rad) * (rf - 1);
         const pyf = fi(cy) + mathx.sinf(rad) * (rf - 1);
         rl.drawPoly(.{ .x = pxf, .y = pyf }, 3, 7.5, deg + 180, theme.ironDark);
@@ -1550,7 +1554,7 @@ fn skillEmblemScaled(cx: i32, cy: i32, s: playermod.Skill, col: rl.Color, k: f32
 fn skillReady(p: *const Player, s: playermod.Skill) bool {
     return switch (s) {
         .melee => p.atkCD <= 0,
-        .firebolt => p.castCD <= 0 and p.Mana >= p.spellCost,
+        .firebolt => p.castCD <= 0 and p.Mana >= s.manaCost(),
         .dodge => p.rollCD <= 0,
         .health_potion => p.HealthPots > 0,
         .mana_potion => p.ManaPots > 0,
@@ -1585,7 +1589,7 @@ fn cooldownSweep(x: i32, y: i32, size: i32, cd: f32) void {
     const end: f32 = -90.0 + 360.0 * cd;
     rl.beginScissorMode(x, y, size, size);
     rl.drawCircleSector(c, R, -90, end, 48, withAlpha(rgba(6, 6, 10, 255), 180));
-    const er = end * std.math.pi / 180.0;
+    const er = mathx.radians(end);
     rl.drawLineEx(c, .{ .x = cx + mathx.cosf(er) * R, .y = cy + mathx.sinf(er) * R }, 1.5, withAlpha(rgba(220, 210, 190, 255), 95));
     rl.endScissorMode();
 }

@@ -294,7 +294,7 @@ fn setDisplayMode(g: *Game, want: DisplayMode) void {
 pub fn cycleDisplayMode(g: *Game, fwd: bool) void {
     const n: i32 = @typeInfo(DisplayMode).@"enum".fields.len; // add a mode and the cycle covers it
     const cur: i32 = @intFromEnum(g.displayMode);
-    const next: DisplayMode = @enumFromInt(@mod(cur + (if (fwd) @as(i32, 1) else -1) + n, n));
+    const next: DisplayMode = @enumFromInt(navWrap(cur, if (fwd) 1 else -1, n));
     setDisplayMode(g, next);
 }
 
@@ -363,6 +363,12 @@ const CLEAVE_ARC_DOT: f32 = -0.15;
 // windup decisions all read this, so nobody swings across a cliff edge. Above
 // world.STEP_MAX so a single ramp step is still in reach.
 const SAME_GROUND_DY = 1.0;
+
+// The "comparable ground" test itself — melee strikes (both ways), the windup gate, nova,
+// and the gas clouds all read it, so nobody reaches across a cliff edge on a stale copy.
+fn sameGroundY(ay: f32, by: f32) bool {
+    return @abs(ay - by) < SAME_GROUND_DY;
+}
 
 // Low-poly sphere. raylib's drawSphere is 16x16 with per-call CPU trig; under a dark
 // torch an 8x8 ball is indistinguishable at ~1/4 cost (scene drawn twice a frame).
@@ -876,8 +882,7 @@ fn resolveAim(g: *Game) Aim {
 // A spell's live cooldown window: base recharge shortened by cast speed + CDR, exactly
 // like Firebolt's castRate. One helper so every extra spell recharges on the same curve.
 fn spellCooldown(g: *const Game, base: f32) f32 {
-    const d = g.p.derived;
-    return base * (1 - d.cdrFrac) / d.castSpeedMult;
+    return playermod.castCooldown(g.p.derived, base);
 }
 
 const MSG_NO_MANA = "Not enough mana";
@@ -903,14 +908,15 @@ fn rollCrit(g: *Game, base: f32) struct { dmg: f32, crit: bool } {
 fn castFirebolt(g: *Game) void {
     const p = &g.p;
     if (p.stunned()) return;
-    if (p.castCD > 0 or p.Mana < p.spellCost) {
-        if (p.Mana < p.spellCost) g.setToast(MSG_NO_MANA, .{});
+    const cost = playermod.Skill.manaCost(.firebolt);
+    if (p.castCD > 0 or p.Mana < cost) {
+        if (p.Mana < cost) g.setToast(MSG_NO_MANA, .{});
         return;
     }
     const aim = resolveAim(g);
     p.Facing = aim.dir;
-    p.Mana -= p.spellCost;
-    p.castCD = p.castRate;
+    p.Mana -= cost;
+    p.castCD = spellCooldown(g, playermod.BASE_CAST_RATE);
     // Firebolt is pure fire; resists (not armor) mitigate it. Crit applies here too
     // (luck's crit chance is global, as the stat sheet advertises — not melee-only).
     const roll = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(8)));
@@ -969,7 +975,7 @@ fn castNova(g: *Game) void {
     p.startAuxCD(.lightning_nova, spellCooldown(g, playermod.NOVA_CD));
     for (g.liveMonsters()) |*m| {
         if (!m.alive()) continue;
-        if (distXZ(p.Pos, m.Pos) > NOVA_RADIUS + m.Radius or @abs(m.Pos.y - p.Pos.y) >= SAME_GROUND_DY) continue;
+        if (distXZ(p.Pos, m.Pos) > NOVA_RADIUS + m.Radius or !sameGroundY(m.Pos.y, p.Pos.y)) continue;
         const roll = playermod.NOVA_DMG * p.derived.spellMult + @as(f32, @floatFromInt(g.rng.intn(6)));
         const rc = rollCrit(g, roll);
         damageMonster(g, m, stats.Damage.one(.lightning, rc.dmg), rc.crit);
@@ -997,7 +1003,7 @@ fn doCleave(g: *Game) void {
     var hit = false;
     for (g.liveMonsters()) |*m| {
         if (!m.alive()) continue;
-        if (distXZ(p.Pos, m.Pos) > playerReach(p.atkRange, m.Radius) or @abs(m.Pos.y - p.Pos.y) >= SAME_GROUND_DY) continue;
+        if (distXZ(p.Pos, m.Pos) > playerReach(p.atkRange, m.Radius) or !sameGroundY(m.Pos.y, p.Pos.y)) continue;
         const to = dirXZ(p.Pos, m.Pos);
         if (to.x * p.Facing.x + to.z * p.Facing.z < CLEAVE_ARC_DOT) continue; // behind the swing
         const rc = rollCrit(g, g.rng.range(p.MinDmg, p.MaxDmg));
@@ -1261,7 +1267,7 @@ fn updatePlayerAttack(g: *Game) void {
         p.chaseMonster = -1;
         return;
     }
-    if (distXZ(p.Pos, m.Pos) <= playerReach(p.atkRange, m.Radius) and @abs(m.Pos.y - p.Pos.y) < SAME_GROUND_DY) {
+    if (distXZ(p.Pos, m.Pos) <= playerReach(p.atkRange, m.Radius) and sameGroundY(m.Pos.y, p.Pos.y)) {
         const rc = rollCrit(g, g.rng.range(p.MinDmg, p.MaxDmg));
         p.Facing = dirXZ(p.Pos, m.Pos);
         p.swing = playermod.swingDur;
@@ -1462,7 +1468,7 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
 
     // Melee: close the gap, then commit to a telegraphed swing — but never wind up at
     // someone a cliff above/below; keep pressing (funnels the pack to the ramp).
-    const inMelee = toPlayer <= playerReach(m.atkRange, playermod.radius) and @abs(m.Pos.y - g.p.Pos.y) < SAME_GROUND_DY;
+    const inMelee = toPlayer <= playerReach(m.atkRange, playermod.radius) and sameGroundY(m.Pos.y, g.p.Pos.y);
     if (inMelee and m.atkCD <= 0) {
         m.lungeTimer = 0; // a lunge that connects ends here — no phantom dash after the swing
         m.windup = m.windupTime;
@@ -1548,7 +1554,7 @@ fn resolveMonsterAttack(g: *Game, m: *Monster) void {
     }
     // Same reach the drawn telegraph ring uses (drawMonstersFX), so outside the ring is
     // safe. Melee can't land across a cliff: reach requires comparable ground.
-    if (distXZ(m.Pos, g.p.Pos) <= meleeReach(m.atkRange, playermod.radius) and @abs(m.Pos.y - g.p.Pos.y) < SAME_GROUND_DY) hitPlayer(g, dmg);
+    if (distXZ(m.Pos, g.p.Pos) <= meleeReach(m.atkRange, playermod.radius) and sameGroundY(m.Pos.y, g.p.Pos.y)) hitPlayer(g, dmg);
 }
 
 // Push overlapping monsters apart so a pack doesn't collapse into one point.
@@ -1803,6 +1809,16 @@ fn keepGas(c: SweepCtx, gc: *GasCloud) bool {
     return true;
 }
 
+// Summed DoT of every gas cloud of the given source overlapping `pos` (same-ground only).
+// One loop for the foe-vs-hero sinks so their radius/ground test can't drift apart.
+fn gasDpsAt(g: *const Game, pos: rl.Vector3, fromPlayer: bool) f32 {
+    var dps: f32 = 0;
+    for (g.gas[0..g.gasCount]) |*gc| {
+        if (gc.fromPlayer == fromPlayer and dist2XZ(pos, gc.Pos) <= GAS_RADIUS * GAS_RADIUS and sameGroundY(pos.y, gc.Pos.y)) dps += gc.dps;
+    }
+    return dps;
+}
+
 fn updateGasClouds(g: *Game, dt: f32) void {
     g.gasCount = retain(GasCloud, g.gas[0..g.gasCount], SweepCtx{ .g = g, .dt = dt }, keepGas);
     if (g.gasHurtCD > 0) g.gasHurtCD -= dt;
@@ -1812,27 +1828,25 @@ fn updateGasClouds(g: *Game, dt: f32) void {
     // hero's state — a poison cloud keeps working even while you roll or lie dead.
     const foeTick = g.gasFoeCD <= 0;
     if (foeTick) g.gasFoeCD = GAS_TICK;
-    for (g.liveMonsters()) |*m| {
-        if (!m.alive()) continue;
-        var dps: f32 = 0;
-        for (g.gas[0..g.gasCount]) |*gc| {
-            if (gc.fromPlayer and dist2XZ(m.Pos, gc.Pos) <= GAS_RADIUS * GAS_RADIUS and @abs(m.Pos.y - gc.Pos.y) < SAME_GROUND_DY) dps += gc.dps;
-        }
-        if (dps > 0 and foeTick) {
-            damageMonster(g, m, stats.Damage.one(.chaos, dps * GAS_TICK), false);
+    // Damage only lands on the tick, and gasDpsAt has no side effects, so the per-monster
+    // cloud scan is pure waste on the ~26/27 frames between ticks — gate it on the tick.
+    if (foeTick) {
+        for (g.liveMonsters()) |*m| {
+            if (!m.alive()) continue;
+            const dps = gasDpsAt(g, m.Pos, true);
+            if (dps > 0) damageMonster(g, m, stats.Damage.one(.chaos, dps * GAS_TICK), false);
         }
     }
 
     if (!g.p.alive() or g.p.invulnerable()) return; // a roll carries you clean through the fumes
     // Zombie miasma (not fromPlayer) hurts the hero. Overlapping clouds stack: standing in
-    // a zombie pile's remains is its own mistake.
-    var dps: f32 = 0;
-    for (g.gas[0..g.gasCount]) |*gc| {
-        if (!gc.fromPlayer and dist2XZ(g.p.Pos, gc.Pos) <= GAS_RADIUS * GAS_RADIUS and @abs(g.p.Pos.y - gc.Pos.y) < SAME_GROUND_DY) dps += gc.dps;
-    }
-    if (dps > 0 and g.gasHurtCD <= 0) {
-        g.gasHurtCD = GAS_TICK;
-        gasHurtPlayer(g, dps * GAS_TICK);
+    // a zombie pile's remains is its own mistake. Same gate: only scan when the pulse is ready.
+    if (g.gasHurtCD <= 0) {
+        const dps = gasDpsAt(g, g.p.Pos, false);
+        if (dps > 0) {
+            g.gasHurtCD = GAS_TICK;
+            gasHurtPlayer(g, dps * GAS_TICK);
+        }
     }
 }
 

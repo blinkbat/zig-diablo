@@ -46,6 +46,12 @@ pub const BASE_SPELL_DMG: f32 = 20;
 pub const BASE_ATK_RATE: f32 = 0.85;
 pub const BASE_CAST_RATE: f32 = 0.7;
 pub const BASE_SPELL_COST: f32 = 7;
+
+// A spell's live recharge: base window shortened by cast speed + CDR. One source so the
+// cast gate (game.spellCooldown), the cached Firebolt castRate, and the HUD veil agree.
+pub fn castCooldown(d: stats.Derived, base: f32) f32 {
+    return base * (1 - d.cdrFrac) / d.castSpeedMult;
+}
 // No gear yet: modest innate armor (item armor will add here later). Resists start 0.
 pub const BASE_ARMOR: f32 = 20;
 
@@ -85,8 +91,9 @@ pub const KNIFE_CD: f32 = 0.34;
 
 pub const CLEAVE_CD: f32 = 0.85; // physical melee, hits every foe in a frontal arc
 
-// The three skills; skill points rank these up. Label lives with the enum (like
-// stats.Attribs) so the sheet iterates one source, not a parallel list.
+// The hero's skills (the bar can bind any). Three of them — melee, firebolt, dodge —
+// rank up with skill points. Label lives with the enum (like stats.Attribs) so the
+// sheet iterates one source, not a parallel list.
 pub const Skill = enum {
     // Physical
     melee,
@@ -403,8 +410,7 @@ pub const Player = struct {
     // hero can ONLY be light-stunned (never heavy-stunned like an enemy).
     stunTimer: f32 = 0,
 
-    // Spell (Firebolt).
-    spellCost: f32 = 0,
+    // Spell (Firebolt). Mana cost lives once in Skill.manaCost(.firebolt).
     spellDmg: f32 = 0,
 
     // Presentation.
@@ -448,7 +454,7 @@ pub const Player = struct {
 
         // Cast-speed shortens cooldowns; int's CDR shortens the spell cooldown more.
         p.atkRate = BASE_ATK_RATE / p.derived.castSpeedMult;
-        p.castRate = BASE_CAST_RATE * (1 - p.derived.cdrFrac) / p.derived.castSpeedMult;
+        p.castRate = castCooldown(p.derived, BASE_CAST_RATE);
 
         p.HP = hpFrac * p.MaxHP;
         p.Mana = manaFrac * p.MaxMana;
@@ -632,7 +638,6 @@ pub fn newPlayer(pos: rl.Vector3) Player {
         .ManaPots = 2,
         .targetMonster = -1,
         .atkRange = 2.4,
-        .spellCost = BASE_SPELL_COST,
         .def = .{ .armor = BASE_ARMOR },
     };
     // Default loadout (the game applies any persisted bindings over this after spawn).

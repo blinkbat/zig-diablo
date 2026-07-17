@@ -38,5 +38,5 @@ pub fn rollLoot(m: *const monster.Monster, rng: *mathx.Rng, out: *std.ArrayList(
 }
 
 fn scatter(p: rl.Vector3, rng: *mathx.Rng) rl.Vector3 {
-    return ground(p.x + (rng.float() * 2 - 1) * SCATTER_RADIUS, p.z + (rng.float() * 2 - 1) * SCATTER_RADIUS);
+    return ground(p.x + rng.signed() * SCATTER_RADIUS, p.z + rng.signed() * SCATTER_RADIUS);
 }

@@ -144,7 +144,24 @@ comptime {
 const FloorBrush = enum { ledge, ramp, erase };
 
 // Entities-layer brush index.
-const EntityBrush = enum { pack, boss, spawn, portal, erase };
+const EntityBrush = enum {
+    pack,
+    boss,
+    spawn,
+    portal,
+    erase,
+
+    // The anchor this brush places, if any — so placement routes through the Anchor
+    // table (posPtr) rather than re-deriving the Map field, which can't then drift.
+    fn anchor(b: EntityBrush) ?Anchor {
+        return switch (b) {
+            .boss => .boss,
+            .spawn => .spawn,
+            .portal => .portal,
+            else => null,
+        };
+    }
+};
 
 // Marker identity colors, shared by 3D anchors and minimap glyphs.
 const SPAWN_COL = rgba(140, 200, 255, 255);
@@ -806,9 +823,10 @@ fn deleteSelection(g: *Game) void {
 fn pasteAt(g: *Game, at: rl.Vector3) void {
     const ed = &g.ed;
     if (!clipHas) return ed.status("clipboard is empty (Ctrl+C first)", .{});
-    bankUndo(g);
     const m = &g.map;
+    const before = m.*; // bank only if something is actually placed (else no-op undo/dirty)
     var dropped: usize = 0;
+    var placed: usize = 0;
     for (clipProps[0..clipPropN]) |o| {
         if (m.obstacle_count >= world.MAX_OBSTACLES) {
             dropped += 1;
@@ -817,6 +835,7 @@ fn pasteAt(g: *Game, at: rl.Vector3) void {
         m.obstacles[m.obstacle_count] = o;
         m.obstacles[m.obstacle_count].Pos = clampContent(m, v3(at.x + o.Pos.x, 0, at.z + o.Pos.z));
         m.obstacle_count += 1;
+        placed += 1;
     }
     for (clipDecor[0..clipDecorN]) |d| {
         if (m.decor_count >= world.MAX_DECOR) {
@@ -826,6 +845,7 @@ fn pasteAt(g: *Game, at: rl.Vector3) void {
         m.decor[m.decor_count] = d;
         m.decor[m.decor_count].Pos = clampContent(m, v3(at.x + d.Pos.x, 0, at.z + d.Pos.z));
         m.decor_count += 1;
+        placed += 1;
     }
     for (clipPacks[0..clipPackN]) |pk| {
         if (m.pack_count >= mapmod.MAX_PACKS) {
@@ -837,7 +857,10 @@ fn pasteAt(g: *Game, at: rl.Vector3) void {
         m.packs[m.pack_count].x = pp.x;
         m.packs[m.pack_count].z = pp.z;
         m.pack_count += 1;
+        placed += 1;
     }
+    if (placed == 0) return ed.status("nothing pasted (dropped {d}: limits)", .{dropped});
+    pushUndoFrom(&before);
     markDirty(g);
     if (dropped > 0) {
         ed.status("pasted (dropped {d}: limits)", .{dropped});
@@ -1472,15 +1495,11 @@ pub fn update(g: *Game, dt: f32) void {
                 },
                 .boss, .spawn, .portal => {
                     if (rl.isMouseButtonPressed(.left)) {
-                        bankUndo(g);
                         const ap = clampAnchor(&g.map, tp); // anchors use the deeper inset
-                        switch (ed.entityBrush()) {
-                            .boss => g.map.bossPos = v3(ap.x, 0, ap.z),
-                            .spawn => g.map.spawn = v3(ap.x, 0, ap.z),
-                            .portal => g.map.portal = v3(ap.x, 0, ap.z),
-                            else => {},
-                        }
-                        markDirty(g);
+                        // Route through the Anchor table + setAnchorIfMoved like the
+                        // ctx-menu "Move X here" path, so a click on the anchor's current
+                        // spot banks no undo frame and raises no false dirty flag.
+                        if (ed.entityBrush().anchor()) |a| setAnchorIfMoved(g, a.posPtr(&g.map), ap);
                     }
                 },
                 .erase => {

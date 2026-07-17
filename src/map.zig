@@ -78,16 +78,21 @@ pub const Pack = struct {
 
 pub const MAP_NAME_CAP = 48; // display-name cap; independent of monster.NAME_CAP (boss name)
 
+// Fresh-map arena half-extents; the anchor defaults below derive from this + the
+// INSET constants so a map file omitting spawn:/portal:/bossat: lands them exactly
+// where defaultMap() and the editor's New Map do.
+pub const DEFAULT_HALF: f32 = 30;
+
 pub const Map = struct {
     name: StrBuf(MAP_NAME_CAP) = .{},
     boss: StrBuf(monster.NAME_CAP) = .{}, // copied into Monster.name; caps must match
-    halfW: f32 = 30,
-    halfD: f32 = 30,
+    halfW: f32 = DEFAULT_HALF,
+    halfD: f32 = DEFAULT_HALF,
     floor: world.FloorSet = DEFAULT_FLOOR,
     light: [3]f32 = torchlight.DEFAULT_LIGHT,
-    spawn: rl.Vector3 = v3(0, 0, 24),
-    portal: rl.Vector3 = v3(0, 0, -23),
-    bossPos: rl.Vector3 = v3(0, 0, -18),
+    spawn: rl.Vector3 = v3(0, 0, DEFAULT_HALF - SPAWN_INSET),
+    portal: rl.Vector3 = v3(0, 0, -(DEFAULT_HALF - PORTAL_INSET)),
+    bossPos: rl.Vector3 = v3(0, 0, -(DEFAULT_HALF - BOSS_INSET)),
     ledges: [world.MAX_LEDGES]world.Ledge = undefined,
     ledge_count: usize = 0,
     ramps: [world.MAX_RAMPS]world.Ramp = undefined,
@@ -141,14 +146,9 @@ pub const BOSS_INSET = 12.0;
 /// Fallback world when no map file exists or one fails to parse: a small empty
 /// field with spawn, portal, and one pack, so the game always runs.
 pub fn defaultMap() Map {
-    var m = Map{};
+    var m = Map{}; // anchors already seeded from DEFAULT_HALF + the INSET constants
     m.name.set("Empty Field");
     m.boss.set("The Absence");
-    // Anchors from the INSET constants (like the editor's New Map), not literals, so
-    // retuning an inset or the default half-extent carries through.
-    m.spawn = v3(0, 0, m.halfD - SPAWN_INSET);
-    m.portal = v3(0, 0, -(m.halfD - PORTAL_INSET));
-    m.bossPos = v3(0, 0, -(m.halfD - BOSS_INSET));
     m.packs[0] = .{ .kind = .fallen, .count = 3, .x = 0, .z = 0 };
     m.pack_count = 1;
     return m;

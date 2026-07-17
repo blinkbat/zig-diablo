@@ -164,12 +164,22 @@ pub const Rng = struct {
         return self.float() * std.math.tau;
     }
 
+    /// Uniform f32 in [-1, 1) — the signed-unit scatter idiom, one source.
+    pub fn signed(self: *Rng) f32 {
+        return self.float() * 2 - 1;
+    }
+
     /// [0,n) — Go's rng.Intn(n). Returns 0 for n<=0 (Go would panic).
     pub fn intn(self: *Rng, n: i32) i32 {
         if (n <= 0) return 0;
         return @intCast(self.rand().uintLessThan(u32, @intCast(n)));
     }
 };
+
+/// Degrees → radians. One source for the rotation/arc math in the HUD chrome.
+pub fn radians(deg: f32) f32 {
+    return deg * std.math.pi / 180.0;
+}
 
 /// A time-based seed, mirroring Go's time.Now().UnixNano() seeding.
 pub fn timeSeed() u64 {

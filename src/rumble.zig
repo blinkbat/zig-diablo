@@ -113,6 +113,7 @@ const win = struct {
                 func = f; // keep `lib` loaded for the process lifetime (never FreeLibrary)
                 break;
             }
+            lib.close(); // loaded but lacks the symbol — release before trying the next
         }
         return func;
     }
