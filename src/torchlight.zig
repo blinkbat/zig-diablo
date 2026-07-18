@@ -380,8 +380,11 @@ pub const Torch = struct {
 
     pub fn init() !Torch {
         const shadowMap = loadShadowmap(SHADOWMAP_RESOLUTION);
+        errdefer rl.unloadRenderTexture(shadowMap);
         const fireMap = loadShadowmap(FIRE_SHADOWMAP_RESOLUTION);
+        errdefer rl.unloadRenderTexture(fireMap);
         const depthShader = try rl.loadShaderFromMemory(depthVS, depthFS);
+        errdefer rl.unloadShader(depthShader);
         const scene = try rl.loadShaderFromMemory(sceneVS, sceneFS);
 
         // Constant uniforms.

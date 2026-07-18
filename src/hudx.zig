@@ -130,6 +130,24 @@ fn centered(s: [:0]const u8, cy: i32, size: i32, col: rl.Color) void {
     text(s, @divTrunc(sw(), 2) - @divTrunc(w, 2), cy, size, col);
 }
 
+// Bright metal-leaf tone the engrave bands lift the letterforms toward. One source so
+// glowCentered and engraved can't drift.
+const leafHighlight = rgba(255, 246, 218, 255);
+
+// Metal-leaf engraving: a bright band scissored over the upper face and a deep band
+// under the lower, both re-draws of `s` so the gradient rides the letterforms exactly.
+// Alpha tracks col.a so a fading banner keeps its fade. Shared by glowCentered + engraved.
+fn engraveBands(s: [:0]const u8, x: i32, y: i32, size: i32, col: rl.Color, hiMix: f32, loMix: f32) void {
+    const hh: i32 = @intFromFloat(fsize(size));
+    const w = textW(s, size);
+    rl.beginScissorMode(x - 2, y, w + 4, @divTrunc(hh * 45, 100));
+    drawStr(s, x, y, size, withAlpha(lerpColor(col, leafHighlight, hiMix), col.a));
+    rl.endScissorMode();
+    rl.beginScissorMode(x - 2, y + @divTrunc(hh * 72, 100), w + 4, hh);
+    drawStr(s, x, y, size, withAlpha(lerpColor(col, rl.Color.black, loMix), col.a));
+    rl.endScissorMode();
+}
+
 // Big display text with a warm halo: redrawn at four diagonals in a low-alpha ember
 // tone, under a hard shadow, under the face.
 fn glowCentered(s: [:0]const u8, cy: i32, size: i32, col: rl.Color, halo: rl.Color) void {
@@ -140,15 +158,7 @@ fn glowCentered(s: [:0]const u8, cy: i32, size: i32, col: rl.Color, halo: rl.Col
     }
     drawStr(s, x + 3, cy + 4, size, rgba(0, 0, 0, 220));
     drawStr(s, x, cy, size, col);
-    // Engraved metal-leaf bands riding the letterforms (alpha-preserving so
-    // fading banners keep their fade).
-    const hh: i32 = @intFromFloat(fsize(size));
-    rl.beginScissorMode(x - 2, cy, w + 4, @divTrunc(hh * 45, 100));
-    drawStr(s, x, cy, size, withAlpha(lerpColor(col, rgba(255, 246, 218, 255), 0.30), col.a));
-    rl.endScissorMode();
-    rl.beginScissorMode(x - 2, cy + @divTrunc(hh * 72, 100), w + 4, hh);
-    drawStr(s, x, cy, size, withAlpha(lerpColor(col, rl.Color.black, 0.38), col.a));
-    rl.endScissorMode();
+    engraveBands(s, x, cy, size, col, 0.30, 0.38);
 }
 
 // A soft rounded backing pill behind free-floating text.
@@ -190,6 +200,14 @@ fn rivet(cx: i32, cy: i32, r: f32) void {
     rl.drawCircleV(c, r + 1.5, withAlpha(theme.ink, 220)); // seat shadow
     rl.drawCircleV(c, r, theme.ironLight);
     rl.drawCircleV(.{ .x = fi(cx) - r * 0.30, .y = fi(cy) - r * 0.35 }, r * 0.35, withAlpha(theme.highlightColor, 190)); // catchlight
+}
+
+// The four corner rivets of a rectangular plaque, each `inset` in from its corner.
+// Shared by the skill bar and the top-right plaque so the corner pattern lives once.
+fn cornerRivets(x: i32, y: i32, w: i32, h: i32, inset: i32, r: f32) void {
+    for ([_][2]i32{ .{ x + inset, y + inset }, .{ x + w - inset, y + inset }, .{ x + inset, y + h - inset }, .{ x + w - inset, y + h - inset } }) |c| {
+        rivet(c[0], c[1], r);
+    }
 }
 
 // drawPoly's first vertex sits at 3 o'clock, so 4 sides at rotation 0 is the diamond.
@@ -311,17 +329,8 @@ fn scrollCorner(cx: i32, cy: i32, corner: u2, a: u8) void {
 // re-draws of the same string, so the gradient rides the letterforms exactly.
 // Heading tier and up only (bands collapse into noise below ~20 px).
 fn engraved(s: [:0]const u8, x: i32, y: i32, size: i32, col: rl.Color) void {
-    const hh: i32 = @intFromFloat(fsize(size));
-    const w = textW(s, size);
-    const off: i32 = if (size < 22) 1 else 2;
-    drawStr(s, x + off, y + off, size, rgba(0, 0, 0, @intCast(@as(u16, 200) * col.a / 255)));
-    drawStr(s, x, y, size, col);
-    rl.beginScissorMode(x - 2, y, w + 4, @divTrunc(hh * 45, 100));
-    drawStr(s, x, y, size, withAlpha(lerpColor(col, rgba(255, 246, 218, 255), 0.36), col.a));
-    rl.endScissorMode();
-    rl.beginScissorMode(x - 2, y + @divTrunc(hh * 72, 100), w + 4, hh);
-    drawStr(s, x, y, size, withAlpha(lerpColor(col, rl.Color.black, 0.40), col.a));
-    rl.endScissorMode();
+    text(s, x, y, size, col); // hard shadow + full body (same as any UI text)
+    engraveBands(s, x, y, size, col, 0.36, 0.40);
 }
 fn engravedCentered(s: [:0]const u8, cy: i32, size: i32, col: rl.Color) void {
     engraved(s, @divTrunc(sw(), 2) - @divTrunc(textW(s, size), 2), cy, size, col);
@@ -477,6 +486,12 @@ fn glyphLabel(s: [:0]const u8, cx: i32, cy: i32, size: i32, col: rl.Color) void 
     drawStr(s, cx - @divTrunc(w, 2), y, size, col);
 }
 
+// Iron body of the pad glyphs (dome/tile) — deliberately a hair warmer than theme.ironDark
+// so the controller pictograms recolor together, not one at a time.
+const padBody = rgba(27, 23, 19, 255);
+// Cream ink for pad-glyph labels/lines (menu bars, bumper text).
+const padLabelColor = rgba(226, 210, 180, 245);
+
 // Round face button, library style: dark raised dome + a colored ring + the letter
 // in the button's hue. The color names the button; the body stays in the palette
 // (a full colored disc read as modern plastic against the wood-and-brass chrome).
@@ -484,7 +499,7 @@ fn padFace(cx: i32, cy: i32, r: i32, btn: PadBtn) void {
     const col = padBtnColor(btn);
     const cv = rl.Vector2.init(fi(cx), fi(cy));
     rl.drawCircleV(cv, fi(r) + 1.5, withAlpha(theme.ink, 235)); // seat shadow
-    rl.drawCircleV(cv, fi(r), rgba(27, 23, 19, 255)); // iron body
+    rl.drawCircleV(cv, fi(r), padBody); // iron body
     rl.drawCircleV(.{ .x = fi(cx), .y = fi(cy) - fi(r) * 0.16 }, fi(r) * 0.80, rgba(40, 34, 28, 255)); // raised dome
     rl.drawCircleLines(cx, cy, fi(r) - 1, withAlpha(col, 245)); // colored ring...
     rl.drawCircleLines(cx, cy, fi(r) - 2.2, withAlpha(col, 150)); // ...with a soft echo
@@ -498,7 +513,7 @@ fn padFace(cx: i32, cy: i32, r: i32, btn: PadBtn) void {
 fn padDpad(cx: i32, cy: i32, r: i32, dir: Dir) void {
     const gh = fi(r) * 2;
     const tile = rl.Rectangle{ .x = fi(cx) - fi(r) + 1, .y = fi(cy) - fi(r) + 1, .width = gh - 2, .height = gh - 2 };
-    rl.drawRectangleRounded(tile, 0.35, 6, rgba(27, 23, 19, 255));
+    rl.drawRectangleRounded(tile, 0.35, 6, padBody);
     rl.drawRectangleRoundedLinesEx(tile, 0.35, 6, 1, withAlpha(theme.trimColor, 150));
     const up = dir == .up or dir == .updown;
     const dn = dir == .down or dir == .updown;
@@ -527,28 +542,35 @@ fn padPill(rect: rl.Rectangle) void {
     rl.drawRectangleRoundedLinesEx(rect, 0.6, 6, 1, withAlpha(theme.trimColor, 160));
 }
 
+// Pad-glyph widths, shared by the drawers below and hintGlyphW's layout measurer so
+// the measured column and the drawn pill can't drift apart.
+const PAD_MENU_W: i32 = 24;
+fn padBumperW(label: [:0]const u8) i32 {
+    return textW(label, 12) + 12; // label width + horizontal pill padding
+}
+
 // Start-button pictogram: a bumper pill wearing the three-line menu icon (no
 // letter — the physical button has none).
 fn padMenu(cx: i32, cy: i32) void {
-    const w: i32 = 24;
+    const w: i32 = PAD_MENU_W;
     const h: i32 = 16;
     const rect = rl.Rectangle{ .x = fi(cx - @divTrunc(w, 2)), .y = fi(cy - @divTrunc(h, 2)), .width = fi(w), .height = fi(h) };
     padPill(rect);
     var i: i32 = -1;
     while (i <= 1) : (i += 1) {
         const ly = fi(cy) + fi(i) * 3.5;
-        rl.drawLineEx(.{ .x = fi(cx) - 5, .y = ly }, .{ .x = fi(cx) + 5, .y = ly }, 1.5, rgba(226, 210, 180, 245));
+        rl.drawLineEx(.{ .x = fi(cx) - 5, .y = ly }, .{ .x = fi(cx) + 5, .y = ly }, 1.5, padLabelColor);
     }
 }
 
 // Shoulder-bumper pill (L1 / R1), sized to its label and centered on (cx, cy).
 fn padBumper(cx: i32, cy: i32, label: [:0]const u8) void {
     const size: i32 = 12;
-    const w = textW(label, size) + 12;
+    const w = padBumperW(label);
     const h: i32 = 18;
     const r = rl.Rectangle{ .x = fi(cx - @divTrunc(w, 2)), .y = fi(cy - @divTrunc(h, 2)), .width = fi(w), .height = fi(h) };
     padPill(r);
-    glyphLabel(label, cx, cy, size, rgba(226, 210, 180, 245));
+    glyphLabel(label, cx, cy, size, padLabelColor);
 }
 
 // The controller button that fires skill slot `i`, drawn at (cx, cy). Mirrors
@@ -574,8 +596,8 @@ const Hint = struct {
 fn hintGlyphW(h: Hint, gr: i32) i32 {
     return switch (h.glyph) {
         .face, .dpad => gr * 2,
-        .bumper => |b| textW(b, 12) + 12,
-        .menu => 24,
+        .bumper => |b| padBumperW(b),
+        .menu => PAD_MENU_W,
     };
 }
 
@@ -1094,7 +1116,7 @@ fn drawStatsTab(g: *Game, px: i32, py: i32, pw: i32, ph: i32) void {
         sheetAllocRow(leftX, y, colW, stats.Attribs.label(k), val, sel, p.attrPoints > 0);
     }
 
-    const skHdrY = colY + 32 + 6 * rowH + 14;
+    const skHdrY = colY + 32 + gamemod.SHEET_ATTR_COUNT * rowH + 14;
     engraved("Skills", leftX, skHdrY, 22, sheetGold);
     diamond(leftX - 14, skHdrY + 13, 3.5, withAlpha(theme.trimColor, 200));
     // Iterate gamemod.sheetSkills (the sheet's skill order); label + rank come from
@@ -1681,9 +1703,7 @@ fn drawSkillBar(g: *const Game, cx: i32, y: i32) void {
     woodPanel(tx, ty, tw, th, 215);
     rl.drawRectangleLinesEx(.{ .x = fi(tx), .y = fi(ty), .width = fi(tw), .height = fi(th) }, 2, withAlpha(theme.ironDark, 235));
     forgedRect(tx + 3, ty + 3, tw - 6, th - 6, withAlpha(theme.trimColor, flickA(130, tx)));
-    for ([_][2]i32{ .{ tx + 6, ty + 6 }, .{ tx + tw - 6, ty + 6 }, .{ tx + 6, ty + th - 6 }, .{ tx + tw - 6, ty + th - 6 } }) |c| {
-        rivet(c[0], c[1], 2.4);
-    }
+    cornerRivets(tx, ty, tw, th, 6, 2.4);
     var x = x0;
     var i: usize = 0;
     while (i < playermod.SKILL_SLOTS) : (i += 1) {
@@ -1847,9 +1867,7 @@ fn drawTopRight(g: *Game) void {
     rl.drawRectangle(x, 8, w, 50, withAlpha(theme.ink, 185));
     rl.drawRectangleLines(x, 8, w, 50, withAlpha(theme.ironDark, 230));
     forgedRect(x + 1, 9, w - 2, 48, withAlpha(theme.trimColor, 100));
-    for ([_][2]i32{ .{ x + 6, 14 }, .{ x + w - 6, 14 }, .{ x + 6, 52 }, .{ x + w - 6, 52 } }) |c| {
-        rivet(c[0], c[1], 2.2);
-    }
+    cornerRivets(x, 8, w, 50, 6, 2.2);
     // Skull pip: cranium, jaw, hollow sockets.
     const px = x + 14;
     const bone = rgba(222, 208, 188, 255);

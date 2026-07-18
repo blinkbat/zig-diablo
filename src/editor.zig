@@ -283,6 +283,12 @@ fn normRect(a: rl.Vector3, b: rl.Vector3) SelRect {
     };
 }
 
+// Wireframe box over an XZ rect at height `h` (centered so its base sits on y=0). One
+// spelling of the AABB→cube-wires math for every marquee/feature/erase-highlight preview.
+fn drawRectBox(minX: f32, maxX: f32, minZ: f32, maxZ: f32, h: f32, col: rl.Color) void {
+    rl.drawCubeWiresV(v3((minX + maxX) / 2, h / 2, (minZ + maxZ) / 2), v3(maxX - minX, h, maxZ - minZ), col);
+}
+
 // Clipboard holds objects RELATIVE to the copied rect's center, so a paste lands
 // the arrangement on the cursor. Terrain features are deliberately excluded.
 var clipProps: [world.MAX_OBSTACLES]world.Obstacle = undefined;
@@ -1663,12 +1669,12 @@ fn drawMarkers(g: *Game) void {
     if (ed.selDrag) |a| {
         if (mousePoint(g)) |cur| {
             const s = normRect(a, cur);
-            rl.drawCubeWiresV(v3((s.minX + s.maxX) / 2, 0.4, (s.minZ + s.maxZ) / 2), v3(s.maxX - s.minX, 0.8, s.maxZ - s.minZ), rgba(255, 235, 160, 230));
+            drawRectBox(s.minX, s.maxX, s.minZ, s.maxZ, 0.8, rgba(255, 235, 160, 230));
         }
     }
     if (ed.sel) |s| {
-        rl.drawCubeWiresV(v3((s.minX + s.maxX) / 2, 0.4, (s.minZ + s.maxZ) / 2), v3(s.maxX - s.minX, 0.8, s.maxZ - s.minZ), rgba(255, 220, 120, 255));
-        rl.drawCylinderEx(v3((s.minX + s.maxX) / 2, 0.01, (s.minZ + s.maxZ) / 2), v3((s.minX + s.maxX) / 2, 0.02, (s.minZ + s.maxZ) / 2), 0.3, 0.3, 12, rgba(255, 220, 120, 90));
+        drawRectBox(s.minX, s.maxX, s.minZ, s.maxZ, 0.8, rgba(255, 220, 120, 255));
+        rl.drawCylinderEx(v3(s.cx(), 0.01, s.cz()), v3(s.cx(), 0.02, s.cz()), 0.3, 0.3, 12, rgba(255, 220, 120, 90));
     }
 
     // Prop collision circles so spacing reads at a glance.
@@ -1681,7 +1687,7 @@ fn drawMarkers(g: *Game) void {
         if (mousePoint(g)) |raw| {
             const s = normRect(a, toolPoint(ed, raw));
             const col = if (ed.floorBrush() == .ledge) rgba(255, 220, 120, 220) else rgba(120, 255, 180, 220);
-            rl.drawCubeWiresV(v3((s.minX + s.maxX) / 2, ed.featureH / 2, (s.minZ + s.maxZ) / 2), v3(s.maxX - s.minX, ed.featureH, s.maxZ - s.minZ), col);
+            drawRectBox(s.minX, s.maxX, s.minZ, s.maxZ, ed.featureH, col);
         }
     }
 
@@ -1700,14 +1706,10 @@ fn drawCursorAids(g: *Game) void {
         if (ed.layer == .floor) {
             // Highlight the feature rect the click would remove.
             for (g.map.ramps[0..g.map.ramp_count]) |r| {
-                if (r.contains(raw.x, raw.z)) {
-                    rl.drawCubeWiresV(v3((r.minX + r.maxX) / 2, r.h / 2, (r.minZ + r.maxZ) / 2), v3(r.maxX - r.minX, r.h, r.maxZ - r.minZ), ERASE_FEATURE);
-                }
+                if (r.contains(raw.x, raw.z)) drawRectBox(r.minX, r.maxX, r.minZ, r.maxZ, r.h, ERASE_FEATURE);
             }
             for (g.map.ledges[0..g.map.ledge_count]) |l| {
-                if (l.contains(raw.x, raw.z)) {
-                    rl.drawCubeWiresV(v3((l.minX + l.maxX) / 2, l.h / 2, (l.minZ + l.maxZ) / 2), v3(l.maxX - l.minX, l.h, l.maxZ - l.minZ), ERASE_FEATURE);
-                }
+                if (l.contains(raw.x, raw.z)) drawRectBox(l.minX, l.maxX, l.minZ, l.maxZ, l.h, ERASE_FEATURE);
             }
         } else {
             // Sweep circle, plus a ring on everything it would take.
@@ -1937,9 +1939,13 @@ fn drawPalette(g: *Game, ctx: *ui.Ctx) void {
         if (ui.buttonTip(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 24), "Scatter (X)", 15, false, "Re-roll ALL decor over open floor (undoable)")) scatterDecor(g);
         y += STEP_ROW_H;
         if (ui.buttonTip(ctx, ui.rect(px + 8, y, PALETTE_W - 16, 24), "Clear all", 15, false, "Delete every decor on the map (undoable)")) {
-            bankUndo(g);
-            g.map.decor_count = 0;
-            markDirty(g);
+            // Guard like deleteSelection: clearing an already-empty list must not bank a
+            // no-op undo (evicts a real frame at the cap) or raise a spurious dirty flag.
+            if (g.map.decor_count > 0) {
+                bankUndo(g);
+                g.map.decor_count = 0;
+                markDirty(g);
+            }
         }
         y += STEP_ROW_H;
     }
@@ -2249,7 +2255,7 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
 
     const rowH = 26;
     const menuW = 188;
-    var rows: i32 = 4; // spawn/portal/boss/cancel
+    var rows: i32 = @as(i32, @intCast(Anchor.order.len)) + 1; // one "Move X here" per anchor + Cancel
     rows += switch (nearKind) {
         .pack => 2,
         .ob, .dec => 1,
@@ -2326,8 +2332,8 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
         }
         y += rowH;
     }
-    // Clamp to the arena inset like the LMB placement path (#L1409); a raw ctxWorld
-    // point can land in the void past the wall → unreachable hero/exit + save != authored.
+    // Clamp to the arena inset via clampAnchor (same as the LMB anchor-placement path); a
+    // raw ctxWorld point can land in the void past the wall → unreachable hero/exit + save != authored.
     const ap = clampAnchor(m, p);
     for (Anchor.order) |a| {
         if (ui.button(ctx, ui.rect(mx + 6, y, menuW - 12, rowH - 2), a.moveLabel(), 16, false)) {

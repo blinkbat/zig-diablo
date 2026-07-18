@@ -652,6 +652,7 @@ pub const Game = struct {
     pub fn resetCharScreen(g: *Game) void {
         g.sheetOpen = false;
         g.charTab = .stats;
+        g.sheetSel = 0;
         g.skillSel = 0;
         g.skillZone = .slots;
         g.skillPoolSel = 0;
@@ -849,8 +850,8 @@ fn lmbMove(g: *Game) void {
     p.hasMoveTarget = true;
 }
 
-// Dodge slot: roll toward movement intent, else toward the aim/cursor point. (Space and
-// pad B stay permanent dodge shortcuts regardless of what the bar holds.)
+// Dodge slot: roll toward movement intent, else toward the aim/cursor point. Reached only
+// through the bound slot (no hardcoded shortcut) — every skill fires through the bar.
 fn fireDodge(g: *Game) void {
     var dir = g.kbMove;
     if (lenXZ(dir) < 1e-3) dir = dirXZ(g.p.Pos, g.mouseGround);
