@@ -600,6 +600,9 @@ const HALF_STEP = 4;
 // Members per pack (PACK panel stepper and pack-edit modal).
 const PACK_MIN = 1;
 const PACK_MAX = 32; // matches map.PACK_MEMBERS_MAX
+// Minimum cursor travel between successive brush placements (stroke density).
+const PROP_STEP_MIN = 1.9;
+const DECOR_STEP_MIN = 0.8;
 
 comptime {
     // The invariant the two files share: the editor authors INSIDE what the loader
@@ -1000,7 +1003,7 @@ fn paintStep(g: *Game, raw: rl.Vector3) void {
                 return;
             }
             const tp = toolPoint(ed, raw);
-            if (distXZ(tp, ed.lastPaint) < 1.9) return;
+            if (distXZ(tp, ed.lastPaint) < PROP_STEP_MIN) return;
             if (placeProp(g, tp)) {
                 ed.strokeChanged = true;
                 ed.lastPaint = tp;
@@ -1013,7 +1016,7 @@ fn paintStep(g: *Game, raw: rl.Vector3) void {
                 if (eraseWithin(g, raw, ed.brushR)) ed.strokeChanged = true;
                 return;
             }
-            if (distXZ(raw, ed.lastPaint) < 0.8) return;
+            if (distXZ(raw, ed.lastPaint) < DECOR_STEP_MIN) return;
             // Jitter within brush radius: a sweep scatters, not strings.
             const j = v3(
                 raw.x + (g.rng.float() - 0.5) * ed.brushR,
@@ -1716,9 +1719,11 @@ fn drawMarkers(g: *Game) void {
         rl.drawCylinderEx(v3(s.cx(), 0.01, s.cz()), v3(s.cx(), 0.02, s.cz()), 0.3, 0.3, 12, mathx.withAlpha(SEL_BOX, 90));
     }
 
-    // Prop collision circles so spacing reads at a glance.
-    for (m.obstacles[0..m.obstacle_count]) |o| {
-        gamemod.groundRing(v3(o.Pos.x, g.w.groundY(o.Pos.x, o.Pos.z) + 0.04, o.Pos.z), o.Radius, rgba(255, 255, 255, 50));
+    // Prop collision circles so spacing reads at a glance. Use the world copy, whose
+    // Pos.y already carries the baked groundY (kept in sync by apply), so we don't
+    // re-scan every ledge/ramp per obstacle each frame.
+    for (g.w.obs()) |o| {
+        gamemod.groundRing(v3(o.Pos.x, o.Pos.y + 0.04, o.Pos.z), o.Radius, rgba(255, 255, 255, 50));
     }
 
     // Live drag rect preview for ledge/ramp (corners snapped like the commit).
@@ -1743,12 +1748,22 @@ fn drawCursorAids(g: *Game) void {
 
     if (ed.isEraseBrush()) {
         if (ed.layer == .floor) {
-            // Highlight the feature rect the click would remove.
-            for (g.map.ramps[0..g.map.ramp_count]) |r| {
-                if (r.contains(raw.x, raw.z)) drawRectBox(r.minX, r.maxX, r.minZ, r.maxZ, r.h, ERASE_FEATURE);
-            }
-            for (g.map.ledges[0..g.map.ledge_count]) |l| {
-                if (l.contains(raw.x, raw.z)) drawRectBox(l.minX, l.maxX, l.minZ, l.maxZ, l.h, ERASE_FEATURE);
+            // Highlight the ONE feature the click would remove — same ramp-then-ledge
+            // priority and first-match early-out as eraseFeatureAt, so the preview can't
+            // flag features (overlapping ones) that a single click leaves behind.
+            highlight: {
+                for (g.map.ramps[0..g.map.ramp_count]) |r| {
+                    if (r.contains(raw.x, raw.z)) {
+                        drawRectBox(r.minX, r.maxX, r.minZ, r.maxZ, r.h, ERASE_FEATURE);
+                        break :highlight;
+                    }
+                }
+                for (g.map.ledges[0..g.map.ledge_count]) |l| {
+                    if (l.contains(raw.x, raw.z)) {
+                        drawRectBox(l.minX, l.maxX, l.minZ, l.maxZ, l.h, ERASE_FEATURE);
+                        break :highlight;
+                    }
+                }
             }
         } else {
             // Sweep circle, plus a ring on everything it would take.
@@ -2258,22 +2273,25 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
     var nearIdx: usize = 0;
     var bestD: f32 = 2.0;
     for (m.obstacles[0..m.obstacle_count], 0..) |o, i| {
-        if (distXZ(o.Pos, p) < bestD) {
-            bestD = distXZ(o.Pos, p);
+        const d = distXZ(o.Pos, p);
+        if (d < bestD) {
+            bestD = d;
             nearKind = .ob;
             nearIdx = i;
         }
     }
-    for (m.decor[0..m.decor_count], 0..) |d, i| {
-        if (distXZ(d.Pos, p) < bestD) {
-            bestD = distXZ(d.Pos, p);
+    for (m.decor[0..m.decor_count], 0..) |dc, i| {
+        const d = distXZ(dc.Pos, p);
+        if (d < bestD) {
+            bestD = d;
             nearKind = .dec;
             nearIdx = i;
         }
     }
     for (m.packs[0..m.pack_count], 0..) |pk, i| {
-        if (distXZ(pk.pos(), p) < bestD) {
-            bestD = distXZ(pk.pos(), p);
+        const d = distXZ(pk.pos(), p);
+        if (d < bestD) {
+            bestD = d;
             nearKind = .pack;
             nearIdx = i;
         }
@@ -2286,6 +2304,7 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
         if (r0.contains(p.x, p.z)) {
             featKind = .ramp;
             featIdx = i;
+            break; // first match wins, matching eraseFeatureAt / hover tip
         }
     }
     if (featKind == .none) {
@@ -2293,6 +2312,7 @@ fn drawContextMenu(g: *Game, ctx: *ui.Ctx) void {
             if (l.contains(p.x, p.z)) {
                 featKind = .ledge;
                 featIdx = i;
+                break;
             }
         }
     }

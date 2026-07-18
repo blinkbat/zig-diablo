@@ -39,6 +39,11 @@ pub const POTION_MANA_FLAT = 20;
 // monster telegraph so the drawn ring matches the real hitbox.
 pub const radius: f32 = 0.55;
 
+// Base melee attack range (pre-target-radius/lunge). Co-equal with `radius` in the
+// reach formula (game.meleeReach = atkRange + targetRadius + lunge), so it lives here
+// as a named source rather than a buried struct-init literal.
+pub const BASE_ATK_RANGE: f32 = 2.7;
+
 // Vertical hitbox for incoming shots: a band centered hitY above the feet, ±hitHalf.
 // Archers aim at the band center — same source, so a retune can't strand their shots
 // outside the band they were aimed at.
@@ -52,6 +57,7 @@ pub const hitHalf: f32 = 1.7;
 pub const BASE_MELEE_MIN: f32 = 9;
 pub const BASE_MELEE_MAX: f32 = 15;
 pub const BASE_SPELL_DMG: f32 = 20;
+pub const FIREBOLT_SPREAD: i32 = 8; // random damage added on top of spellDmg, per cast
 pub const BASE_ATK_RATE: f32 = 0.85;
 pub const BASE_CAST_RATE: f32 = 0.7;
 pub const BASE_SPELL_COST: f32 = 7;
@@ -74,6 +80,8 @@ pub const FIREBOLT_RANK_INC: f32 = 0.12; // +12% firebolt damage per rank over 1
 pub const DODGE_RANK_IFRAME: f32 = 0.04; // +0.04s i-frames per rank over 1
 pub const DODGE_RANK_CD: f32 = 0.06; // -0.06s roll cooldown per rank over 1
 pub const DODGE_CD_FLOOR: f32 = 0.55; // roll cooldown never shrinks below this
+pub const DODGE_IFRAME_GAP: f32 = 0.08; // i-frames stay this far below the cooldown so
+// chained rolls always leave a vulnerable window (else high rank = permanent invuln)
 
 // ── Extra-skill kit ──────────────────────────────────────────────────────────
 // The five reassignable skills beyond the core three. Combat numbers are level-1
@@ -81,12 +89,14 @@ pub const DODGE_CD_FLOOR: f32 = 0.55; // roll cooldown never shrinks below this
 // melee), so allocating Int/Dex/Str powers them without a rank system of their own.
 // These are NOT rankable (like the potions) — spatial reach/radius lives in game.zig.
 pub const ICE_DMG: f32 = 16; // cold, single target
+pub const ICE_SPREAD: i32 = 6; // random damage added on top of ICE_DMG*spellMult
 pub const ICE_COST: f32 = 6;
 pub const ICE_CD: f32 = 0.55;
 pub const CHILL_DUR: f32 = 2.0; // seconds a struck foe is slowed
 pub const CHILL_FACTOR: f32 = 0.55; // chilled foes move at 55% speed
 
 pub const NOVA_DMG: f32 = 26; // lightning, AoE burst around the hero
+pub const NOVA_SPREAD: i32 = 6; // random damage added on top of NOVA_DMG*spellMult
 pub const NOVA_COST: f32 = 15;
 pub const NOVA_CD: f32 = 2.2;
 
@@ -138,7 +148,11 @@ pub const Skill = enum {
     // Rankable by skill points (the original three). The rest — potions and the five
     // extra skills — scale off attributes instead, so they get no allocation row.
     pub fn rankable(s: Skill) bool {
-        return s == .melee or s == .firebolt or s == .dodge;
+        return switch (s) {
+            .melee, .firebolt, .dodge => true,
+            // Exhaustive (no else) so a new skill must declare whether it ranks.
+            .cleave, .throwing_knife, .ice_shard, .lightning_nova, .toxic_flask, .health_potion, .mana_potion => false,
+        };
     }
 
     // Offensive skills make the gamepad acquire a target + project an aim point before
@@ -421,11 +435,11 @@ pub const Player = struct {
         p.hpRegen = p.derived.hpRegen;
         p.manaRegen = p.derived.manaRegen;
 
-        const meleeRankMult = 1 + MELEE_RANK_INC * @as(f32, @floatFromInt(p.meleeRank - 1));
+        const meleeRankMult = 1 + MELEE_RANK_INC * rankSteps(p.meleeRank);
         p.MinDmg = BASE_MELEE_MIN * p.derived.meleeMult * meleeRankMult;
         p.MaxDmg = BASE_MELEE_MAX * p.derived.meleeMult * meleeRankMult;
 
-        const fbRankMult = 1 + FIREBOLT_RANK_INC * @as(f32, @floatFromInt(p.fireboltRank - 1));
+        const fbRankMult = 1 + FIREBOLT_RANK_INC * rankSteps(p.fireboltRank);
         p.spellDmg = BASE_SPELL_DMG * p.derived.spellMult * fbRankMult;
 
         // Cast-speed shortens cooldowns; int's CDR shortens the spell cooldown more.
@@ -436,13 +450,22 @@ pub const Player = struct {
         p.Mana = manaFrac * p.MaxMana;
     }
 
-    /// Roll i-frame duration for the current dodge rank.
+    /// Steps a skill has taken over its rank-1 baseline, as f32 — the shared factor in
+    /// every "base + INC * (rank-1)" progression (melee/firebolt damage, dodge i-frames/CD).
+    fn rankSteps(rank: i32) f32 {
+        return @floatFromInt(rank - 1);
+    }
+
+    /// Roll i-frame duration for the current dodge rank. Capped strictly below the
+    /// cooldown so back-to-back rolls can never fully overlap their i-frames — high
+    /// Dodge rank otherwise makes iframe > cooldown and roll-spam grants total invuln.
     pub fn rollIframeDur(p: *const Player) f32 {
-        return rollIframe + DODGE_RANK_IFRAME * @as(f32, @floatFromInt(p.dodgeRank - 1));
+        const raw = rollIframe + DODGE_RANK_IFRAME * rankSteps(p.dodgeRank);
+        return minF(raw, p.rollCooldown() - DODGE_IFRAME_GAP);
     }
     /// Roll cooldown for the current dodge rank (floored so it can't trivialize).
     pub fn rollCooldown(p: *const Player) f32 {
-        return maxF(DODGE_CD_FLOOR, rollCDMax - DODGE_RANK_CD * @as(f32, @floatFromInt(p.dodgeRank - 1)));
+        return maxF(DODGE_CD_FLOOR, rollCDMax - DODGE_RANK_CD * rankSteps(p.dodgeRank));
     }
 
     pub fn addXP(p: *Player, amount: i32) bool {
@@ -483,8 +506,9 @@ pub const Player = struct {
             .melee => p.meleeRank,
             .firebolt => p.fireboltRank,
             .dodge => p.dodgeRank,
-            // Consumables and the attribute-scaled extra skills have no rank.
-            else => 1,
+            // Consumables and the attribute-scaled extra skills have no rank. Exhaustive
+            // (no else) so a new rankable skill can't silently report rank 1.
+            .cleave, .throwing_knife, .ice_shard, .lightning_nova, .toxic_flask, .health_potion, .mana_potion => 1,
         };
     }
 
@@ -496,7 +520,8 @@ pub const Player = struct {
             .melee => p.meleeRank += 1,
             .firebolt => p.fireboltRank += 1,
             .dodge => p.dodgeRank += 1,
-            else => return false, // consumables + extra skills aren't rankable
+            // Exhaustive (no else): consumables + extra skills aren't rankable.
+            .cleave, .throwing_knife, .ice_shard, .lightning_nova, .toxic_flask, .health_potion, .mana_potion => return false,
         }
         p.skillPoints -= 1;
         p.recompute();
@@ -613,7 +638,7 @@ pub fn newPlayer(pos: rl.Vector3) Player {
         .HealthPots = 4,
         .ManaPots = 2,
         .targetMonster = -1,
-        .atkRange = 2.7,
+        .atkRange = BASE_ATK_RANGE,
         .def = .{ .armor = BASE_ARMOR },
     };
     // Default loadout (the game applies any persisted bindings over this after spawn).
@@ -629,7 +654,10 @@ pub fn newPlayer(pos: rl.Vector3) Player {
 // xpForLevel is the XP required to advance FROM the given level. Levels are
 // 1-based; a below-1 level (e.g. a default-constructed player) would make the
 // curve return a negative threshold and spin the level-up loop, so floor it.
+pub const XP_BASE: i32 = 40; // XP to clear level 1
+pub const XP_LINEAR: i32 = 55; // per-level linear term
+pub const XP_QUAD: i32 = 12; // per-level quadratic term
 pub fn xpForLevel(level: i32) i32 {
     const l = if (level < 1) 1 else level;
-    return 40 + (l - 1) * 55 + (l - 1) * (l - 1) * 12;
+    return XP_BASE + (l - 1) * XP_LINEAR + (l - 1) * (l - 1) * XP_QUAD;
 }

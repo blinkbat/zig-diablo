@@ -1028,7 +1028,8 @@ fn drawSkillsTab(g: *Game, px: i32, py: i32, pw: i32, ph: i32) void {
         .slots => p.bar.slots[@intCast(g.skillSel)],
         .pool => playermod.Skill.all[@intCast(g.skillPoolSel)],
     };
-    const blurbY = poolY0 + 2 * (cellH + rowGap) + 4;
+    const poolRows = @divTrunc(@as(i32, @intCast(playermod.Skill.count)) + cols - 1, cols);
+    const blurbY = poolY0 + poolRows * (cellH + rowGap) + 4;
     const blurb: [:0]const u8 = if (focusedSkill) |s| s.blurb() else "This button is unused. Drop a skill onto it from the pool below.";
     centered(blurb, blurbY, 15, rgba(214, 202, 180, 235));
     // Ledger-note flanks: hairlines ending in pips stitch the blurb into the page.
@@ -1786,19 +1787,20 @@ fn drawHUD(g: *Game) void {
     const xpW = manaCX - orbR - 18 - xpX;
     const xpY = H - 24;
     const frac = if (p.XPNext > 0) @as(f32, @floatFromInt(p.XP)) / @as(f32, @floatFromInt(p.XPNext)) else 0;
+    const xpSheen = rgba(255, 245, 190, 255); // brass top-sheen / leading-edge meniscus
     barBacking(xpX, xpY, xpW, 8);
     rl.drawRectangle(xpX, xpY, xpW, 8, rgba(28, 22, 14, 255));
     const fw: i32 = @intFromFloat(fi(xpW) * clampF(frac, 0, 1));
     if (fw > 0) {
         rl.drawRectangleGradientH(xpX, xpY, fw, 8, rgba(140, 100, 30, 255), theme.goldColor);
-        rl.drawRectangle(xpX, xpY, fw, 2, withAlpha(rgba(255, 245, 190, 255), 190));
+        rl.drawRectangle(xpX, xpY, fw, 2, withAlpha(xpSheen, 190));
         const sweepW: i32 = 44;
         const sx = xpX - sweepW + @as(i32, @intFromFloat(@mod(t * 90.0, fi(fw + sweepW * 2))));
         rl.beginScissorMode(xpX, xpY, fw, 8);
         rl.drawRectangleGradientH(sx, xpY, sweepW, 8, withAlpha(rl.Color.white, 0), withAlpha(rl.Color.white, 55));
         rl.drawRectangleGradientH(sx + sweepW, xpY, sweepW, 8, withAlpha(rl.Color.white, 55), withAlpha(rl.Color.white, 0));
         rl.endScissorMode();
-        if (frac < 0.999) rl.drawRectangle(xpX + fw - 1, xpY, 2, 8, withAlpha(rgba(255, 245, 190, 255), 190));
+        if (frac < 0.999) rl.drawRectangle(xpX + fw - 1, xpY, 2, 8, withAlpha(xpSheen, 190));
     }
     barTicksFrame(xpX, xpY, xpW, 8, 10, 110);
     // Tenth pips under the channel — the measured-channel craft, readable at a glance.

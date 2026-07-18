@@ -214,11 +214,13 @@ pub const World = struct {
         return false;
     }
 
-    // Passable when clear of scenery AND the height change is within STEP_MAX —
-    // cliff faces are walls, ramps are gradual.
-    fn passable(self: *const World, p: rl.Vector3, radius: f32, fromY: f32) bool {
-        if (self.blocked(p, radius)) return false;
-        return @abs(self.groundY(p.x, p.z) - fromY) <= STEP_MAX;
+    // Ground height at p when a circle of `radius` may stand there — clear of scenery
+    // AND within STEP_MAX of fromY (cliff faces are walls, ramps are gradual); null when
+    // blocked. Returns the height so callers reuse it instead of re-walking the features.
+    fn passableGroundY(self: *const World, p: rl.Vector3, radius: f32, fromY: f32) ?f32 {
+        if (self.blocked(p, radius)) return null;
+        const gy = self.groundY(p.x, p.z);
+        return if (@abs(gy - fromY) <= STEP_MAX) gy else null;
     }
 
     /// Move by delta, sliding along obstacles (full, then X-only, then Z-only). The
@@ -226,11 +228,11 @@ pub const World = struct {
     pub fn moveWithCollision(self: *const World, pos: rl.Vector3, delta: rl.Vector3, radius: f32) rl.Vector3 {
         const fromY = self.groundY(pos.x, pos.z);
         const tryPos = v3(pos.x + delta.x, 0, pos.z + delta.z);
-        if (self.passable(tryPos, radius, fromY)) return self.snapY(tryPos);
+        if (self.passableGroundY(tryPos, radius, fromY)) |gy| return v3(tryPos.x, gy, tryPos.z);
         const xPos = v3(pos.x + delta.x, 0, pos.z);
-        if (self.passable(xPos, radius, fromY)) return self.snapY(xPos);
+        if (self.passableGroundY(xPos, radius, fromY)) |gy| return v3(xPos.x, gy, xPos.z);
         const zPos = v3(pos.x, 0, pos.z + delta.z);
-        if (self.passable(zPos, radius, fromY)) return self.snapY(zPos);
+        if (self.passableGroundY(zPos, radius, fromY)) |gy| return v3(zPos.x, gy, zPos.z);
         return self.snapY(pos);
     }
 

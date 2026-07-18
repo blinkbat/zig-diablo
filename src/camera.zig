@@ -7,6 +7,10 @@ const clampF = mathx.clampF;
 // Default framing (pulled in so lit detail reads). Shared by the rig's initial
 // state and every reset-to-default (editor Home, screenshot harness).
 pub const DEFAULT_ZOOM = 1.4;
+pub const MIN_ZOOM = 0.6; // furthest out
+pub const MAX_ZOOM = 2.2; // closest in (DEFAULT_ZOOM sits between these)
+const ZOOM_STEP = 0.12; // zoom change per wheel/stick notch
+const FOLLOW_RATE = 8.0; // follow-smoothing rate (higher = snappier glide)
 
 // Follow-camera state: a fixed high three-quarter iso angle behind the player, zoomable.
 pub const CamRig = struct {
@@ -29,7 +33,7 @@ pub const CamRig = struct {
         const off = isoOffset(c.zoom);
         // Rise with the target so framing on a rampart matches framing on the floor.
         const want = v3(target.x + off.x, target.y + off.y, target.z + off.z);
-        const a = clampF(dt * 8, 0, 1);
+        const a = clampF(dt * FOLLOW_RATE, 0, 1);
         c.cam.position = c.cam.position.lerp(want, a);
         const lookAt = v3(target.x, target.y + LOOK_HEIGHT, target.z);
         c.cam.target = c.cam.target.lerp(lookAt, a);
@@ -42,7 +46,7 @@ pub const CamRig = struct {
     }
 
     pub fn addZoom(c: *CamRig, delta: f32) void {
-        c.zoom = clampF(c.zoom + delta * 0.12, 0.6, 2.2);
+        c.zoom = clampF(c.zoom + delta * ZOOM_STEP, MIN_ZOOM, MAX_ZOOM);
     }
 };
 

@@ -146,8 +146,9 @@ const NAV_REPEAT_DELAY = 0.40; // held this long before the first auto-repeat
 const NAV_REPEAT_RATE = 0.11; // then one step every this many seconds
 
 const NavDir = enum(usize) { up, down, left, right };
-var navArmed = [_]bool{true} ** 4; // ready to fire (stick is below the release threshold)
-var navNextRepeat = [_]f64{0} ** 4;
+const NAV_DIRS = @typeInfo(NavDir).@"enum".fields.len; // pins the per-dir arrays to the enum
+var navArmed = [_]bool{true} ** NAV_DIRS; // ready to fire (stick is below the release threshold)
+var navNextRepeat = [_]f64{0} ** NAV_DIRS;
 
 // Signed tilt toward `dir` (matches stickXZ: up = -Y, left = -X). 0 without a controller.
 fn stickAmount(dir: NavDir) f32 {

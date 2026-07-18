@@ -229,7 +229,7 @@ pub fn makeMonster(kind: MonsterKind, tier: i32, rng: *Rng, pos: rl.Vector3) Mon
     var m = Monster{ .Kind = kind, .Pos = pos, .Facing = v3(0, 0, 1) };
     // Heavy-stun meter as a multiple of MaxHP (per kind): tankier = harder to
     // stagger. Applied after MaxHP is known.
-    var stunFactor: f32 = 1.4;
+    var stunFactor: f32 = undefined; // every kind arm below sets it (switch is exhaustive)
     switch (kind) {
         .fallen => {
             m.name.set("Pib"); // the knife pigs (gf-certified)

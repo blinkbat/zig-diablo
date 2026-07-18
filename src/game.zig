@@ -39,7 +39,10 @@ const maxF = mathx.maxF;
 
 const alloc = std.heap.c_allocator;
 
-const MAX_MONSTERS = 512; // sized for "epic" maps (64 packs x up to 32 members, capped)
+// Runtime spawn cap. Well below the authored worst case (map.MAX_PACKS *
+// map.PACK_MEMBERS_MAX members + a boss); spawnPacks deploys the boss first, then drops
+// rank-and-file once this fills, so an over-stuffed map never clears without a champion.
+const MAX_MONSTERS = 512;
 // Firebolt cooldown/crit come from the RPG layer: p.castRate, p.derived.critChance,
 // stats.CRIT_MULT. See stats.zig / player.zig.
 
@@ -284,19 +287,20 @@ fn poolIndexOf(s: playermod.Skill) i32 {
     return 0;
 }
 
+// Toggle one raylib display latch on/off (windowed is the un-latched base state).
+fn applyModeToggle(m: DisplayMode) void {
+    switch (m) {
+        .borderless => rl.toggleBorderlessWindowed(),
+        .fullscreen => rl.toggleFullscreen(),
+        .windowed => {},
+    }
+}
+
 // Switch display mode, unwinding the active mode first (raylib toggles are on/off latches).
 fn setDisplayMode(g: *Game, want: DisplayMode) void {
     if (g.displayMode == want) return;
-    switch (g.displayMode) {
-        .borderless => rl.toggleBorderlessWindowed(),
-        .fullscreen => rl.toggleFullscreen(),
-        .windowed => {},
-    }
-    switch (want) {
-        .borderless => rl.toggleBorderlessWindowed(),
-        .fullscreen => rl.toggleFullscreen(),
-        .windowed => {},
-    }
+    applyModeToggle(g.displayMode);
+    applyModeToggle(want);
     g.displayMode = want;
 }
 
@@ -340,6 +344,11 @@ pub fn menuActivate(g: *Game, idx: i32) void {
 // A melee monster's true reach: attack range + target radius + a small lunge. Strike
 // check and drawn telegraph ring MUST share this so outside-the-ring is safe.
 const MELEE_LUNGE = 0.35;
+
+// Incoming-shot vertical band on a monster: centered MONSTER_HIT_FRAC up its height,
+// half-height MONSTER_HIT_FRAC*Height plus a small pad. Mirrors the hero's hitY/hitHalf.
+const MONSTER_HIT_FRAC = 0.55;
+const MONSTER_HIT_PAD = 0.7;
 fn meleeReach(atkRange: f32, targetRadius: f32) f32 {
     return atkRange + targetRadius + MELEE_LUNGE;
 }
@@ -357,9 +366,11 @@ const TARGET_TINT = rgba(180, 235, 255, 255);
 // (resolveMonsterAttack) and the drawn fists (drawMonsterBody).
 const ZOMBIE_SLAM_FWD = 0.7;
 
-// Hero's strike reach: attack range + target radius. One helper so chase-stop and
-// hit check can't drift apart.
-fn playerReach(atkRange: f32, targetRadius: f32) f32 {
+// Base strike reach: attack range + target radius (no lunge). One helper so the hero's
+// chase-stop/hit check and the monster's melee-windup gate can't drift apart. (The actual
+// blow — hero or monster — reaches MELEE_LUNGE farther; see meleeReach, which the drawn
+// ring mirrors so the telegraph never lies.)
+fn baseReach(atkRange: f32, targetRadius: f32) f32 {
     return atkRange + targetRadius;
 }
 
@@ -590,8 +601,9 @@ pub const Game = struct {
     fn spawnPacks(g: *Game) void {
         const tier: i32 = @intCast(g.areaIndex);
         // Boss FIRST so the champion always claims a slot: an editor/hand-authored map
-        // whose packs exceed MAX_MONSTERS (64 packs x up to 32 = 2048) must drop
-        // rank-and-file, never the boss — else the area "clears" with no champion.
+        // whose packs exceed MAX_MONSTERS (up to map.MAX_PACKS * map.PACK_MEMBERS_MAX
+        // members) must drop rank-and-file, never the boss — else the area "clears" with no
+        // champion.
         g.spawn(monster.makeBoss(tier, g.map.boss.slice(), &g.rng, g.randomOpenTileNear(g.map.bossPos, 3)));
         for (g.map.packList()) |pk| {
             var i: i32 = 0;
@@ -626,7 +638,7 @@ pub const Game = struct {
     fn randomOpenTileNear(g: *Game, center: rl.Vector3, spread: f32) rl.Vector3 {
         var attempt: i32 = 0;
         while (attempt < 40) : (attempt += 1) {
-            const p = mathx.ground(center.x + (g.rng.float() * 2 - 1) * spread, center.z + (g.rng.float() * 2 - 1) * spread);
+            const p = mathx.ground(center.x + g.rng.signed() * spread, center.z + g.rng.signed() * spread);
             if (g.w.onFeature(p.x, p.z)) continue;
             if (!g.w.blocked(p, 0.8)) return p;
         }
@@ -929,19 +941,16 @@ fn rollCrit(g: *Game, base: f32) struct { dmg: f32, crit: bool } {
 
 fn castFirebolt(g: *Game) void {
     const p = &g.p;
-    if (p.stunned()) return;
-    const cost = playermod.Skill.manaCost(.firebolt);
-    if (p.castCD > 0 or p.Mana < cost) {
-        if (p.Mana < cost) g.setToast(MSG_NO_MANA, .{});
-        return;
-    }
+    if (p.stunned() or p.castCD > 0) return;
+    // Same gate shape as the other spells: silent on cooldown, MSG_NO_MANA via the one
+    // shared mana gate (spendMana) — no hand-rolled toast/deduct copy.
+    if (!spendMana(g, playermod.Skill.manaCost(.firebolt))) return;
     const aim = resolveAim(g);
     p.Facing = aim.dir;
-    p.Mana -= cost;
     p.castCD = p.castRate; // recompute()'s cached window — the HUD veil divides by the same number
     // Firebolt is pure fire; resists (not armor) mitigate it. Crit applies here too
     // (luck's crit chance is global, as the stat sheet advertises — not melee-only).
-    const roll = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(8)));
+    const roll = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(playermod.FIREBOLT_SPREAD)));
     const dmg = stats.Damage.one(.fire, rollCrit(g, roll).dmg);
     g.projs.add(projectile.newFirebolt(p.Pos, aim.dir, dmg, aim.y, distXZ(p.Pos, aim.pt)));
     g.rumble.play(rumble.cast);
@@ -956,7 +965,7 @@ fn castIceShard(g: *Game) void {
     const aim = resolveAim(g);
     p.Facing = aim.dir;
     p.startAuxCD(.ice_shard, spellCooldown(g, playermod.ICE_CD));
-    const roll = playermod.ICE_DMG * p.derived.spellMult + @as(f32, @floatFromInt(g.rng.intn(6)));
+    const roll = playermod.ICE_DMG * p.derived.spellMult + @as(f32, @floatFromInt(g.rng.intn(playermod.ICE_SPREAD)));
     g.projs.add(projectile.newIceShard(p.Pos, aim.dir, stats.Damage.one(.cold, rollCrit(g, roll).dmg), aim.y, distXZ(p.Pos, aim.pt)));
     g.rumble.play(rumble.cast);
 }
@@ -998,7 +1007,7 @@ fn castNova(g: *Game) void {
     for (g.liveMonsters()) |*m| {
         if (!m.alive()) continue;
         if (distXZ(p.Pos, m.Pos) > NOVA_RADIUS + m.Radius or !sameGroundY(m.Pos.y, p.Pos.y)) continue;
-        const roll = playermod.NOVA_DMG * p.derived.spellMult + @as(f32, @floatFromInt(g.rng.intn(6)));
+        const roll = playermod.NOVA_DMG * p.derived.spellMult + @as(f32, @floatFromInt(g.rng.intn(playermod.NOVA_SPREAD)));
         const rc = rollCrit(g, roll);
         damageMonster(g, m, stats.Damage.one(.lightning, rc.dmg), rc.crit);
         // A jagged arc from the hero to each struck foe.
@@ -1027,7 +1036,7 @@ fn doCleave(g: *Game) void {
     var hit = false;
     for (g.liveMonsters()) |*m| {
         if (!m.alive()) continue;
-        if (distXZ(p.Pos, m.Pos) > playerReach(p.atkRange, m.Radius) or !sameGroundY(m.Pos.y, p.Pos.y)) continue;
+        if (distXZ(p.Pos, m.Pos) > baseReach(p.atkRange, m.Radius) or !sameGroundY(m.Pos.y, p.Pos.y)) continue;
         const to = dirXZ(p.Pos, m.Pos);
         if (to.x * p.Facing.x + to.z * p.Facing.z < CLEAVE_ARC_DOT) continue; // behind the swing
         const rc = rollCrit(g, g.rng.range(p.MinDmg, p.MaxDmg));
@@ -1221,7 +1230,7 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
         // Engaged: close on the committed foe until inside striking range. Stop half a
         // body-radius inside reach so the hero settles into solid range, not at the edge.
         if (g.monsterByID(p.chaseMonster)) |m| {
-            if (m.alive() and distXZ(p.Pos, m.Pos) > playerReach(p.atkRange, m.Radius) - m.Radius * 0.5) {
+            if (m.alive() and distXZ(p.Pos, m.Pos) > baseReach(p.atkRange, m.Radius) - m.Radius * 0.5) {
                 dir = dirXZ(p.Pos, m.Pos);
                 moving = true;
             }
@@ -1273,8 +1282,10 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
 fn updatePlayerAttack(g: *Game) void {
     const p = &g.p;
     // Melee only swings once you've EXPLICITLY engaged (chaseMonster) — a merely
-    // selected/hovered target never triggers an auto-swing.
-    if (p.rolling() or p.stunned() or p.chaseMonster < 0 or p.atkCD > 0) return;
+    // selected/hovered target never triggers an auto-swing. Never restart a swing already
+    // in progress (e.g. a Cleave sweep fired earlier this frame) — that would overwrite its
+    // swingKind with .thrust and make the drawn animation lie about the attack.
+    if (p.rolling() or p.stunned() or p.chaseMonster < 0 or p.atkCD > 0 or p.swing > 0) return;
     if (g.monsterByID(p.chaseMonster)) |cm| {
         if (!cm.alive()) {
             p.chaseMonster = -1;
@@ -1294,7 +1305,7 @@ fn updatePlayerAttack(g: *Game) void {
     for (g.liveMonsters()) |*m| {
         if (!m.alive() or !sameGroundY(m.Pos.y, p.Pos.y)) continue;
         const d = distXZ(p.Pos, m.Pos);
-        if (d > playerReach(p.atkRange, m.Radius) + MELEE_STEP) continue;
+        if (d > baseReach(p.atkRange, m.Radius) + MELEE_STEP) continue;
         const d2 = d * d;
         if (d2 < best2) {
             best2 = d2;
@@ -1310,7 +1321,7 @@ fn updatePlayerAttack(g: *Game) void {
 
     // Close a short step if the foe sits just past reach, so the blow connects instead of
     // stopping short at the edge.
-    const reach = playerReach(p.atkRange, m.Radius);
+    const reach = baseReach(p.atkRange, m.Radius);
     var d = distXZ(p.Pos, m.Pos);
     if (d > reach) {
         const dir = dirXZ(p.Pos, m.Pos);
@@ -1520,7 +1531,7 @@ fn updateMonster(g: *Game, m: *Monster, dt: f32) void {
 
     // Melee: close the gap, then commit to a telegraphed swing — but never wind up at
     // someone a cliff above/below; keep pressing (funnels the pack to the ramp).
-    const inMelee = toPlayer <= playerReach(m.atkRange, playermod.radius) and sameGroundY(m.Pos.y, g.p.Pos.y);
+    const inMelee = toPlayer <= baseReach(m.atkRange, playermod.radius) and sameGroundY(m.Pos.y, g.p.Pos.y);
     if (inMelee and m.atkCD <= 0) {
         m.lungeTimer = 0; // a lunge that connects ends here — no phantom dash after the swing
         m.windup = m.windupTime;
@@ -1730,7 +1741,7 @@ fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
     // rampart clears the heads between it and its mark.
     if (pr.FromPlayer) {
         for (g.liveMonsters()) |*m| {
-            if (m.alive() and dist2XZ(m.Pos, pr.Pos) < (m.Radius + pr.Radius) * (m.Radius + pr.Radius) and @abs(pr.Pos.y - (m.Pos.y + m.Height * 0.55)) < m.Height * 0.55 + 0.7) {
+            if (m.alive() and dist2XZ(m.Pos, pr.Pos) < (m.Radius + pr.Radius) * (m.Radius + pr.Radius) and @abs(pr.Pos.y - (m.Pos.y + m.Height * MONSTER_HIT_FRAC)) < m.Height * MONSTER_HIT_FRAC + MONSTER_HIT_PAD) {
                 // A flask carries no direct hit — it bursts into a cloud (impactBurst).
                 if (pr.Kind != .flask) {
                     damageMonster(g, m, pr.Damage, false);
@@ -2586,8 +2597,8 @@ pub fn drawMonsterBody(m: *const Monster, highlight: bool) void {
             const sp = m.swingProgress();
             for ([_]f32{ -1, 1 }) |s| {
                 const sh = v3(x + (right.x * m.Radius * 0.7 * s + lean.x) * shrink, shY, z + (right.z * m.Radius * 0.7 * s + lean.z) * shrink);
-                const baseReach: f32 = if (s > 0) 0.9 else 0.68;
-                const reach = baseReach + sinf(lurch + s * 1.6) * 0.16;
+                const armReach: f32 = if (s > 0) 0.9 else 0.68;
+                const reach = armReach + sinf(lurch + s * 1.6) * 0.16;
                 var hand = v3(sh.x + f.x * reach * shrink, shY - 0.12, sh.z + f.z * reach * shrink);
                 if (sp > 0) {
                     const e = 1 - (1 - sp) * (1 - sp); // crash out of the raise
@@ -3402,7 +3413,7 @@ pub fn run(shot: bool) void {
                         g.menuSel = MENU_OPTIONS_IDX;
                     }
                     // Left/right cycles the display value on the Display row.
-                    if (g.menuSel == 0 and (input.navLeft() or input.navRight())) {
+                    if (g.menuSel == @intFromEnum(OptionsItem.display) and (input.navLeft() or input.navRight())) {
                         cycleDisplayMode(&g, input.navRight());
                     }
                 }

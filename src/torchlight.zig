@@ -212,6 +212,7 @@ const sceneFS =
     \\    float edgeFade = 1.0 - smoothstep(0.36, 0.49, length(p.xy - 0.5));
     \\    return sc/25.0 * edgeFade;
     \\}
+    \\float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); } // Rec.601
     \\void main() {
     \\    vec4 texelColor = texture(texture0, fragTexCoord);
     \\    vec3 normal = normalize(fragNormal);
@@ -222,6 +223,7 @@ const sceneFS =
     \\    // can never trip the flag. (The default 1x1 white texture samples white at
     \\    // any uv, so texture0 stays valid for flagged fragments too.)
     \\    vec3 albedo;
+    \\    float bodyMask = 0.0; // 1 on props/bodies, 0 on baked floor — gates the warm sheen below
     \\    if (fragTexCoord.x < -1.5) {
     \\        albedo = matAlbedo(2, fragPosition.xz)*fragColor.rgb; // built pavement is stone
     \\    } else if (fragTexCoord.x < -0.5) {
@@ -232,6 +234,7 @@ const sceneFS =
     \\        float grain = vnoise(fragPosition.xz*0.85)*0.55 + vnoise(fragPosition.xz*3.9)*0.45;
     \\        float gstr = mix(0.12, 0.24, upMask);
     \\        albedo = texelColor.rgb*fragColor.rgb*(1.0 - gstr + 2.0*gstr*grain);
+    \\        bodyMask = 1.0;
     \\    }
     \\    vec3 l = normalize(lightPos - fragPosition);
     \\    float NdotL = max(dot(normal, l), 0.0);
@@ -257,6 +260,13 @@ const sceneFS =
     \\    float sTorch = shadowFrac(shadowMap, lightVP, float(shadowMapResolution), dot(normal, l), torchSpread);
     \\    finalColor = mix(finalColor, vec4(0, 0, 0, 1), sTorch);
     \\    finalColor.rgb += albedo*(ambient.rgb/10.0);
+    \\    // WARM BODY SHEEN: bodies catch a warm silhouette rim + a gleam toward the flame,
+    \\    // re-coloring mass the murk grade below would otherwise flatten to grey. Gated to
+    \\    // bodyMask so the floor keeps its matte, hot-spot-free look; damped in shadow and
+    \\    // by the torch falloff so it stays a lit-disc effect, not a constant glow.
+    \\    float rimHi = pow(1.0 - upMask, 2.0);
+    \\    float gleam = pow(NdotL, 12.0);
+    \\    finalColor.rgb += bodyMask*vec3(1.15, 0.80, 0.45)*(rimHi*0.10 + gleam*0.15)*torchAtten*(1.0 - 0.75*sTorch);
     \\    // ACTIVE DISC: your torch only reaches so far. `active` is 1 at the hero and
     \\    // fades to 0 at the torch radius (horizontal distance from the torch axis = you),
     \\    // so it reads as a disc of light. Everything above is the fully lit "active"
@@ -271,8 +281,8 @@ const sceneFS =
     \\    finalColor.rgb *= mix(vec3(0.60, 0.72, 0.74), vec3(1.13, 0.99, 0.80), core);
     \\    // MURK GRADE: drain saturation as the light thins — color lives near the
     \\    // flame, the rim decays toward ashen monochrome before the fog takes over.
-    \\    float fLuma = dot(finalColor.rgb, vec3(0.299, 0.587, 0.114));
-    \\    finalColor.rgb = mix(finalColor.rgb, vec3(fLuma), 0.10 + 0.25*(1.0 - core));
+    \\    float fLuma = luma(finalColor.rgb);
+    \\    finalColor.rgb = mix(finalColor.rgb, vec3(fLuma), (0.10 + 0.25*(1.0 - core))*(1.0 - 0.6*bodyMask));
     \\    // FOG OF WAR: persistent exploration at this ground point (0 unseen .. 1 seen).
     \\    // The arena spans [-fogHalf.x, fogHalf.x] on X and [-fogHalf.y, fogHalf.y]
     \\    // on Z; map that onto the [0,1] fog map (componentwise).
@@ -281,8 +291,8 @@ const sceneFS =
     \\    // SEEN: a dim, cool, desaturated memory of the lit terrain -- drained toward
     \\    // grey, tinted cool, and darkened -- clearly distinct from the warm active disc.
     \\    // Unseen ground (seen = 0) collapses to black, so the world genuinely hides.
-    \\    float luma = dot(memBase, vec3(0.299, 0.587, 0.114));
-    \\    vec3 memory = mix(vec3(luma), memBase, 0.25)*vec3(0.50, 0.64, 0.62);
+    \\    float memLuma = luma(memBase);
+    \\    vec3 memory = mix(vec3(memLuma), memBase, 0.25)*vec3(0.50, 0.64, 0.62);
     \\    vec3 seenColor = memory*0.14*seen;
     \\    finalColor.rgb = mix(seenColor, finalColor.rgb, litDisc);
     \\    // FIREBALL: a second moving light, added AFTER the fog blend so a fireball
@@ -503,10 +513,16 @@ pub const Torch = struct {
         self.endDepthPass();
     }
 
+    // Upload an rl.Vector3 to a scene-shader vec3 uniform. One helper so the pos/color
+    // unpack-and-set idiom lives once (mirrors lightColorVec).
+    fn setVec3(self: *Torch, loc: i32, v: rl.Vector3) void {
+        const a = [3]f32{ v.x, v.y, v.z };
+        rl.setShaderValue(self.scene, loc, &a, .vec3);
+    }
+
     // Main-pass uniforms: call after beginDrawing()+clear and BEFORE beginMode3D(cam).
     pub fn applyUniforms(self: *Torch, lp: LightParams) void {
-        const p = [3]f32{ lp.pos.x, lp.pos.y, lp.pos.z };
-        rl.setShaderValue(self.scene, self.loc_lightPos, &p, .vec3);
+        self.setVec3(self.loc_lightPos, lp.pos);
         const r = lp.radius;
         rl.setShaderValue(self.scene, self.loc_lightRadius, &r, .float);
         rl.setShaderValueMatrix(self.scene, self.loc_lightVP, self.lightVP);
@@ -521,10 +537,8 @@ pub const Torch = struct {
         const i = fp.intensity;
         rl.setShaderValue(self.scene, self.loc_fireIntensity, &i, .float);
         if (i <= 0) return;
-        const p = [3]f32{ fp.pos.x, fp.pos.y, fp.pos.z };
-        rl.setShaderValue(self.scene, self.loc_firePos, &p, .vec3);
-        const c = [3]f32{ fp.color.x, fp.color.y, fp.color.z };
-        rl.setShaderValue(self.scene, self.loc_fireColor, &c, .vec3);
+        self.setVec3(self.loc_firePos, fp.pos);
+        self.setVec3(self.loc_fireColor, fp.color);
         const r = fp.radius;
         rl.setShaderValue(self.scene, self.loc_fireRadius, &r, .float);
         rl.setShaderValueMatrix(self.scene, self.loc_fireVP, self.fireVP);

@@ -91,9 +91,12 @@ pub const Particles = struct {
             // Rest on the LOCAL floor (heightfield world — sparks on a rampart mustn't
             // fall through its top). Only catch a mote crossing the floor from above;
             // one that drifted sideways under a ledge is already inside the cliff, and
-            // snapping it up would read as a teleport.
-            const floorY = w.groundY(p.Pos.x, p.Pos.z) + 0.02;
-            if (p.Pos.y < floorY and prevY >= floorY) p.Pos.y = floorY;
+            // snapping it up would read as a teleport. A non-descending mote (Vel.y >= 0)
+            // keeps Pos.y >= prevY, so it can't cross downward — skip the heightfield query.
+            if (p.Vel.y < 0) {
+                const floorY = w.groundY(p.Pos.x, p.Pos.z) + 0.02;
+                if (p.Pos.y < floorY and prevY >= floorY) p.Pos.y = floorY;
+            }
             i += 1;
         }
     }
