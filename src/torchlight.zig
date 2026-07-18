@@ -308,6 +308,15 @@ const sceneFS =
     \\}
 ;
 
+// FLOOR SENTINELS — scenemesh bakes these into texcoord u; sceneFS above branches on
+// the hardcoded -1.5 / -0.5 thresholds. Owned HERE, next to the shader, with a pin so
+// renumbering a sentinel can't silently repaint every ledge cap as the wrong material.
+pub const FLAG_FLOOR: f32 = -1;
+pub const FLAG_PAVE: f32 = -2;
+comptime {
+    std.debug.assert(FLAG_PAVE < -1.5 and FLAG_FLOOR > -1.5 and FLAG_FLOOR < -0.5);
+}
+
 fn loadShadowmap(res: i32) rl.RenderTexture2D {
     const fbo = rl.gl.rlLoadFramebuffer();
     const depthTex = rl.gl.rlLoadTextureDepth(res, res, false);

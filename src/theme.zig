@@ -48,6 +48,10 @@ pub const highlightColor = rgba(255, 235, 190, 255);
 // Warm parchment value text: stepper readouts, focused field text — brighter than labelColor.
 pub const valueColor = rgba(255, 240, 205, 255);
 
+// Toast/status text: the bright parchment on an ink pill, one tone for the HUD toast
+// and the editor status bar.
+pub const toastText = rgba(255, 245, 210, 255);
+
 // Panel/modal title text (small-caps captions, topbar map name).
 pub const titleColor = rgba(255, 230, 190, 255);
 

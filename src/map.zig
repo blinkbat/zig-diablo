@@ -529,7 +529,11 @@ pub fn listCampaign(paths: *[MAX_MAPS][PATH_CAP]u8, lens: *[MAX_MAPS]usize) usiz
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ext)) continue;
         if (n >= MAX_MAPS) break;
-        const full = std.fmt.bufPrint(&paths[n], "{s}/{s}", .{ dir, entry.name }) catch continue;
+        const full = std.fmt.bufPrint(&paths[n], "{s}/{s}", .{ dir, entry.name }) catch {
+            // Campaign order is load-bearing — a silently skipped map shifts every tier.
+            std.debug.print("map list error: {s}/{s} exceeds PATH_CAP {d}, skipped\n", .{ dir, entry.name, PATH_CAP });
+            continue;
+        };
         lens[n] = full.len;
         n += 1;
     }

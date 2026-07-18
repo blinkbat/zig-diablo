@@ -18,6 +18,9 @@ pub const rollIframe = 0.34;
 
 // Melee swing animation length (seconds).
 pub const swingDur = 0.22;
+// Which animation a live swing plays: melee strikes ONE foe, so it reads as a fencing
+// thrust; cleave is the wide frontal sweep.
+pub const SwingKind = enum { thrust, sweep };
 
 // Seconds the hero flashes white when struck.
 pub const hitflash = 0.25;
@@ -35,6 +38,12 @@ pub const POTION_MANA_FLAT = 20;
 // varies at runtime). Used for movement collision and melee reach, and read by the
 // monster telegraph so the drawn ring matches the real hitbox.
 pub const radius: f32 = 0.55;
+
+// Vertical hitbox for incoming shots: a band centered hitY above the feet, ±hitHalf.
+// Archers aim at the band center — same source, so a retune can't strand their shots
+// outside the band they were aimed at.
+pub const hitY: f32 = 1.1;
+pub const hitHalf: f32 = 1.7;
 
 // ── Base kit (pre-attribute) ─────────────────────────────────────────────────
 // Level-1, anchor-attribute numbers. recompute() multiplies these by
@@ -132,16 +141,6 @@ pub const Skill = enum {
         return s == .melee or s == .firebolt or s == .dodge;
     }
 
-    // Aimed skills fire toward the selected foe / cursor point (projectiles). Melee-family
-    // and self-centered bursts key off the chase target or the hero, not an aim point.
-    pub fn wantsAim(s: Skill) bool {
-        return switch (s) {
-            .firebolt, .ice_shard, .throwing_knife, .toxic_flask => true,
-            // Exhaustive (no else) like offensive(): a new skill must pick an aim mode.
-            .melee, .cleave, .lightning_nova, .dodge, .health_potion, .mana_potion => false,
-        };
-    }
-
     // Offensive skills make the gamepad acquire a target + project an aim point before
     // firing (mirrors the old X-attack acquire). Movement/consumables don't.
     pub fn offensive(s: Skill) bool {
@@ -210,13 +209,14 @@ pub const SkillBar = struct {
     slots: [SKILL_SLOTS]?Skill = [_]?Skill{null} ** SKILL_SLOTS,
 
     /// The out-of-the-box loadout, mapped to the pad's six action buttons:
-    /// A empty, X melee, Y firebolt, B dodge, L1 health potion, R1 mana potion. The five
-    /// extra skills start unbound — you assign them on the loadout screen. Used by a fresh
-    /// hero and as the fallback when no saved bindings exist (or a stale format migrates).
+    /// A empty, X melee, Y empty, B dodge, L1 health potion, R1 mana potion. You start
+    /// with just the basic melee attack plus survival (dodge + potions); every offensive
+    /// skill — firebolt and the five extras — starts unbound, assigned on the loadout
+    /// screen. Used by a fresh hero and as the fallback when no saved bindings exist (or a
+    /// stale format migrates).
     pub fn default() SkillBar {
         var b = SkillBar{};
         b.assign(1, .melee);
-        b.assign(2, .firebolt);
         b.assign(3, .dodge);
         b.assign(4, .health_potion);
         b.assign(5, .mana_potion);
@@ -243,34 +243,6 @@ pub const SkillBar = struct {
         return null;
     }
 
-    /// Cycle `slot` forward (dir=+1) or back (-1) through the skills available to it —
-    /// each skill that's free or already here, plus "empty". A skill bound to ANOTHER
-    /// slot is skipped, so cycling never steals a binding (uniqueness holds without the
-    /// stealing that plain `assign` would do). This is the controller/keyboard analogue
-    /// of cycling a slot with the mouse (click / scroll).
-    pub fn cycle(b: *SkillBar, slot: usize, dir: i32) void {
-        var opts: [Skill.count + 1]?Skill = undefined;
-        var n: usize = 0;
-        for (Skill.all) |s| {
-            const at = b.slotOf(s);
-            if (at == null or at.? == slot) {
-                opts[n] = s;
-                n += 1;
-            }
-        }
-        opts[n] = null; // empty is always reachable
-        n += 1;
-        var cur: usize = n - 1; // fall back to the empty option if current isn't listed
-        for (opts[0..n], 0..) |o, i| {
-            if (o == b.slots[slot]) {
-                cur = i;
-                break;
-            }
-        }
-        const ni = @mod(@as(i32, @intCast(cur)) + dir, @as(i32, @intCast(n)));
-        b.slots[slot] = opts[@intCast(ni)];
-    }
-
     // ── Persistence ──
     // The loadout is a player preference, so it survives across runs and app restarts.
     // Format mirrors the map files: a `version:` header then `slotN: token` lines
@@ -281,8 +253,9 @@ pub const SkillBar = struct {
     // FORMAT 2 added the potions to the bar. FORMAT 3 remapped the slots to the six pad
     // action buttons (A/X/Y/B/L1/R1) — a FORMAT-2 file's five slots meant different
     // buttons, so it migrates to default() rather than binding skills to the wrong keys.
-    // A file from any older format is likewise reset.
-    pub const FORMAT = 3;
+    // FORMAT 4 stripped firebolt from the starting bar (melee + survival only), so older
+    // saves migrate to the new default. A file from any older format is likewise reset.
+    pub const FORMAT = 4;
 
     pub fn save(b: *const SkillBar, path: []const u8) !void {
         const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
@@ -417,6 +390,7 @@ pub const Player = struct {
 
     // Presentation.
     swing: f32 = 0,
+    swingKind: SwingKind = .thrust,
     hitFlash: f32 = 0,
     walkBob: f32 = 0,
 
@@ -639,7 +613,7 @@ pub fn newPlayer(pos: rl.Vector3) Player {
         .HealthPots = 4,
         .ManaPots = 2,
         .targetMonster = -1,
-        .atkRange = 2.4,
+        .atkRange = 2.7,
         .def = .{ .armor = BASE_ARMOR },
     };
     // Default loadout (the game applies any persisted bindings over this after spawn).

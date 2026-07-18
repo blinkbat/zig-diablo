@@ -187,6 +187,11 @@ const ERASE_RING = rgba(255, 60, 40, 255);
 const ERASE_FEATURE = rgba(255, 80, 60, 230);
 const ERASE_SWEEP = rgba(255, 90, 70, 200);
 
+// Selection gold, same discipline as the erase reds: the live marquee is a touch
+// brighter than the committed box + its center puck + the ledge-drag preview.
+const SEL_LIVE = rgba(255, 235, 160, 230);
+const SEL_BOX = rgba(255, 220, 120, 255);
+
 // Map-name / filename field capacity: the typed-name buffer and every slug buffer it
 // feeds share this, so a longer name can't silently truncate when slugged to a path.
 const NAME_CAP = 40;
@@ -345,9 +350,15 @@ fn pushUndoFrom(before: *const mapmod.Map) void {
     redoLen = 0;
 }
 
+// A mutation (undo pop, paste, delete, scatter) landing mid-gesture interleaves undo
+// frames out of order and desyncs armed grabs — every such entry point checks this.
+fn midGesture(ed: *const Editor) bool {
+    return ed.dragStart != null or ed.grabIdx != null or ed.strokeActive or ed.selMove != null or ed.selDrag != null;
+}
+
 fn doUndo(g: *Game) void {
     const ed = &g.ed;
-    if (ed.dragStart != null or ed.grabIdx != null or ed.strokeActive or ed.selMove != null or ed.selDrag != null) return; // never pop mid-gesture
+    if (midGesture(ed)) return; // never pop mid-gesture
     if (undoLen == 0) return ed.status("nothing to undo", .{});
     if (redoLen < UNDO_CAP) {
         redoStack[redoLen] = g.map;
@@ -361,7 +372,7 @@ fn doUndo(g: *Game) void {
 
 fn doRedo(g: *Game) void {
     const ed = &g.ed;
-    if (ed.dragStart != null or ed.grabIdx != null or ed.strokeActive or ed.selMove != null or ed.selDrag != null) return;
+    if (midGesture(ed)) return;
     if (redoLen == 0) return ed.status("nothing to redo", .{});
     if (undoLen < UNDO_CAP) {
         undoStack[undoLen] = g.map;
@@ -426,16 +437,22 @@ pub const Editor = struct {
     pendingOpen: usize = 0,
     field_buf: [NAME_CAP]u8 = [_]u8{0} ** NAME_CAP, // modal text input
     field_len: usize = 0,
-    newHalfW: f32 = 30,
-    newHalfD: f32 = 30,
+    newHalfW: f32 = mapmod.DEFAULT_HALF,
+    newHalfD: f32 = mapmod.DEFAULT_HALF,
 
     status_buf: [ui.MSG_CAP]u8 = [_]u8{0} ** ui.MSG_CAP,
     status_len: usize = 0,
     status_t: f32 = 0,
 
     pub fn status(ed: *Editor, comptime fmt: []const u8, args: anytype) void {
-        const s = std.fmt.bufPrintZ(&ed.status_buf, fmt, args) catch return;
-        ed.status_len = s.len;
+        // Truncate on overflow, never drop: a clipped "SAVE FAILED: <path>" beats
+        // silence exactly when the path is long enough to blow the cap.
+        var scratch: [256]u8 = undefined;
+        const s = std.fmt.bufPrint(&scratch, fmt, args) catch &scratch;
+        const n = @min(s.len, ed.status_buf.len - 1);
+        @memcpy(ed.status_buf[0..n], s[0..n]);
+        ed.status_buf[n] = 0;
+        ed.status_len = n;
         ed.status_t = STATUS_SECS;
     }
 
@@ -506,7 +523,7 @@ const STATUS_SECS = 2.5; // how long a status toast lingers before fading
 
 fn clearRecovery() void {
     std.fs.cwd().deleteFile(REC_PATH) catch {};
-    std.fs.cwd().deleteFile(REC_PATH ++ ".bak") catch {};
+    std.fs.cwd().deleteFile(REC_PATH ++ mapmod.bak_ext) catch {};
 }
 
 fn recoveryExists() bool {
@@ -1103,8 +1120,19 @@ fn requestAction(g: *Game, act: Pending, openIdx: usize) void {
 fn doOpen(g: *Game, idx: usize) void {
     const ed = &g.ed;
     resetTransient(g); // no gesture straddles two maps
-    g.areaIndex = @min(idx, if (g.mapCount == 0) 0 else g.mapCount - 1);
-    g.map = g.loadMapAt(g.areaIndex);
+    const target = @min(idx, if (g.mapCount == 0) 0 else g.mapCount - 1);
+    if (g.mapCount > 0) {
+        // Load directly, not via loadMapAt: its defaultMap fallback would silently bind
+        // ed.path to the unreadable file and the next Ctrl+S would clobber it.
+        const path = g.mapPaths[target][0..g.mapPathLens[target]];
+        g.map = mapmod.load(path) catch |e| {
+            ed.status("OPEN FAILED: {s} ({s})", .{ path, @errorName(e) });
+            return; // keep editing what's loaded; the file on disk stays untouched
+        };
+    } else {
+        g.map = mapmod.defaultMap();
+    }
+    g.areaIndex = target;
     apply(g);
     ed.camTarget = g.map.spawn;
     g.rig.snap(ed.camTarget);
@@ -1313,7 +1341,9 @@ pub fn update(g: *Game, dt: f32) void {
         }
     }
     if (rl.isKeyPressed(.g)) ed.grid = !ed.grid;
-    if (rl.isKeyPressed(.x) and !ctrl and ed.layer == .decor) scatterDecor(g); // Decor-only, matches Scatter button (Ctrl+X is cut)
+    // Mutating hotkeys share doUndo's mid-gesture gate: a scatter/paste/delete landing
+    // inside a live stroke or grab would bank undo frames out of order.
+    if (rl.isKeyPressed(.x) and !ctrl and ed.layer == .decor and !midGesture(ed)) scatterDecor(g); // Decor-only, matches Scatter button (Ctrl+X is cut)
 
     if (ctrl and shift and rl.isKeyPressed(.s)) {
         openModal(ed, .save_as);
@@ -1325,18 +1355,20 @@ pub fn update(g: *Game, dt: f32) void {
     }
     if (ctrl and rl.isKeyPressed(.y)) doRedo(g);
     if (ctrl and rl.isKeyPressed(.c)) copySelection(g, false);
-    if (ctrl and rl.isKeyPressed(.x)) copySelection(g, true);
-    if (ctrl and rl.isKeyPressed(.v)) {
+    if (ctrl and rl.isKeyPressed(.x) and !midGesture(ed)) copySelection(g, true);
+    if (ctrl and rl.isKeyPressed(.v) and !midGesture(ed)) {
         if (mousePoint(g)) |p| pasteAt(g, p);
     }
-    if (rl.isKeyPressed(.delete)) deleteSelection(g);
+    if (rl.isKeyPressed(.delete) and !midGesture(ed)) deleteSelection(g);
     if (ctrl and rl.isKeyPressed(.r) and recoveryExists()) {
         if (mapmod.load(REC_PATH)) |m| {
             resetTransient(g); // no gesture straddles the map swap (mirrors doOpen)
+            // The path doesn't change, so this is an ordinary mutation: the pre-recovery
+            // map stays one Ctrl+Z away (a stale autosave must never eat fresh work).
+            bankUndo(g);
             g.map = m;
             apply(g);
             ed.dirty = true;
-            clearHistory();
             ed.status("recovered autosave - Ctrl+S to keep it", .{});
         } else |_| {
             ed.status("recovery file is unreadable", .{});
@@ -1371,6 +1403,7 @@ pub fn update(g: *Game, dt: f32) void {
         if (ed.sel != null or ed.selDrag != null) {
             ed.sel = null;
             ed.selDrag = null;
+            ed.selMove = null; // an orphaned move latch would silently block undo/redo
             return;
         }
         requestAction(g, .exit, 0);
@@ -1459,14 +1492,8 @@ pub fn update(g: *Game, dt: f32) void {
                 }
             },
             .decor, .props => {
-                if (rl.isMouseButtonPressed(.left)) {
-                    ed.strokeActive = true;
-                    ed.strokeChanged = false;
-                    strokeBefore = g.map;
-                    ed.lastPaint = v3(1e9, 0, 1e9);
-                }
-                if (ed.strokeActive and rl.isMouseButtonDown(.left)) paintStep(g, p);
-                if (rl.isMouseButtonReleased(.left) and ed.strokeActive) endStroke(ed);
+                if (rl.isMouseButtonPressed(.left)) beginStroke(g);
+                pumpStroke(g, p);
             },
             .entities => switch (ed.entityBrush()) {
                 .pack => {
@@ -1520,13 +1547,8 @@ pub fn update(g: *Game, dt: f32) void {
                     }
                 },
                 .erase => {
-                    if (rl.isMouseButtonPressed(.left)) {
-                        ed.strokeActive = true;
-                        ed.strokeChanged = false;
-                        strokeBefore = g.map;
-                    }
-                    if (ed.strokeActive and rl.isMouseButtonDown(.left)) paintStep(g, p);
-                    if (rl.isMouseButtonReleased(.left) and ed.strokeActive) endStroke(ed);
+                    if (rl.isMouseButtonPressed(.left)) beginStroke(g);
+                    pumpStroke(g, p);
                 },
             },
         }
@@ -1540,6 +1562,23 @@ pub fn update(g: *Game, dt: f32) void {
         if (ed.strokeActive) endStroke(ed);
         releaseGrab(g);
     }
+}
+
+// Arm a paint/erase stroke: one undo snapshot for the whole gesture, stamp spacing
+// reset so the first stamp always lands. Paired with pumpStroke/endStroke — paint and
+// entity-erase share the ritual so the undo banking can't drift between them.
+fn beginStroke(g: *Game) void {
+    const ed = &g.ed;
+    ed.strokeActive = true;
+    ed.strokeChanged = false;
+    strokeBefore = g.map;
+    ed.lastPaint = v3(1e9, 0, 1e9);
+}
+
+fn pumpStroke(g: *Game, p: rl.Vector3) void {
+    const ed = &g.ed;
+    if (ed.strokeActive and rl.isMouseButtonDown(.left)) paintStep(g, p);
+    if (rl.isMouseButtonReleased(.left) and ed.strokeActive) endStroke(ed);
 }
 
 fn endStroke(ed: *Editor) void {
@@ -1669,12 +1708,12 @@ fn drawMarkers(g: *Game) void {
     if (ed.selDrag) |a| {
         if (mousePoint(g)) |cur| {
             const s = normRect(a, cur);
-            drawRectBox(s.minX, s.maxX, s.minZ, s.maxZ, 0.8, rgba(255, 235, 160, 230));
+            drawRectBox(s.minX, s.maxX, s.minZ, s.maxZ, 0.8, SEL_LIVE);
         }
     }
     if (ed.sel) |s| {
-        drawRectBox(s.minX, s.maxX, s.minZ, s.maxZ, 0.8, rgba(255, 220, 120, 255));
-        rl.drawCylinderEx(v3(s.cx(), 0.01, s.cz()), v3(s.cx(), 0.02, s.cz()), 0.3, 0.3, 12, rgba(255, 220, 120, 90));
+        drawRectBox(s.minX, s.maxX, s.minZ, s.maxZ, 0.8, SEL_BOX);
+        rl.drawCylinderEx(v3(s.cx(), 0.01, s.cz()), v3(s.cx(), 0.02, s.cz()), 0.3, 0.3, 12, mathx.withAlpha(SEL_BOX, 90));
     }
 
     // Prop collision circles so spacing reads at a glance.
@@ -1686,7 +1725,7 @@ fn drawMarkers(g: *Game) void {
     if (ed.dragStart) |a| {
         if (mousePoint(g)) |raw| {
             const s = normRect(a, toolPoint(ed, raw));
-            const col = if (ed.floorBrush() == .ledge) rgba(255, 220, 120, 220) else rgba(120, 255, 180, 220);
+            const col = if (ed.floorBrush() == .ledge) mathx.withAlpha(SEL_BOX, 220) else rgba(120, 255, 180, 220);
             drawRectBox(s.minX, s.maxX, s.minZ, s.maxZ, ed.featureH, col);
         }
     }
@@ -1775,6 +1814,7 @@ fn packColor(k: monster.MonsterKind) rl.Color {
 const TOPBAR_H = 40;
 const PALETTE_W = 148;
 const PANEL_W = 224;
+const STATUSBAR_H = 30; // bottom hint bar; the minimap seats on top of it
 const MM_S = 150; // minimap side
 const LAYER_ROW_H = 30; // stride of a layer/brush button row
 const STEP_ROW_H = 28; // vertical stride of a property/stepper row in the panels
@@ -1804,6 +1844,7 @@ pub fn drawOverlay(g: *Game) void {
     if (modalOpen) {
         ctx.pressed = livePressed;
         ctx.down = liveDown;
+        ctx.tipLen = 0; // silenced chrome must not float its tooltips over the modal
     }
     drawModal(g, &ctx);
     hoverWorldTip(g, &ctx);
@@ -1988,11 +2029,14 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
         const active = std.meta.eql(g.map.floor, p.floor);
         // Swatch halves show the primary/secondary materials' base tones.
         if (ui.swatch(ctx, sx, y, 24, 22, world.FloorMat.base(p.floor[0]), world.FloorMat.base(p.floor[1]), active)) {
-            bankUndo(g);
-            g.map.floor = p.floor;
-            g.map.light = p.light;
-            markDirty(g);
-            ed.status("floor: {s}", .{p.name});
+            // Re-clicking the live preset is a no-op: no undo frame, no dirty flag.
+            if (!active or !std.meta.eql(g.map.light, p.light)) {
+                bankUndo(g);
+                g.map.floor = p.floor;
+                g.map.light = p.light;
+                markDirty(g);
+                ed.status("floor: {s}", .{p.name});
+            }
         }
         sx += 28;
     }
@@ -2111,7 +2155,7 @@ fn setAnchorIfMoved(g: *Game, anchor: *rl.Vector3, ap: rl.Vector3) void {
 fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     const ed = &g.ed;
     const mx = W - MM_S - 14;
-    const my = H - 30 - MM_S - 14;
+    const my = H - STATUSBAR_H - MM_S - 14;
     const frame = ui.rect(mx - 5, my - 5, MM_S + 10, MM_S + 10);
     ui.panel(frame, null);
     ui.tipFor(ctx, frame, "The whole map - click or drag to travel");
@@ -2177,9 +2221,9 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
 
 fn drawStatusBar(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     const ed = &g.ed;
-    ui.claimedPanel(ctx, ui.rect(0, H - 30, W, 30), null); // whole bar is chrome
+    ui.claimedPanel(ctx, ui.rect(0, H - STATUSBAR_H, W, STATUSBAR_H), null); // whole bar is chrome
     const hints: [:0]const u8 = "Tab layer   1-9 brush   LMB paint   Shift+drag select   Ctrl+C/X/V   Del   RMB menu/pan   M mirror   [ ] size   Ctrl+Z undo   Ctrl+S save   F5 playtest";
-    hudx.text(hints, 12, H - 25, 15, withAlpha(theme.labelColor, 220));
+    hudx.text(hints, 12, H - STATUSBAR_H + 5, 15, withAlpha(theme.labelColor, 220));
 
     var right: [ui.MSG_CAP]u8 = undefined;
     var coord: [:0]const u8 = "";
@@ -2189,14 +2233,14 @@ fn drawStatusBar(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
         }
     }
     if (coord.len > 0) {
-        hudx.text(coord, W - hudx.textW(coord, 15) - 12, H - 25, 15, withAlpha(theme.labelColor, 220));
+        hudx.text(coord, W - hudx.textW(coord, 15) - 12, H - STATUSBAR_H + 5, 15, withAlpha(theme.labelColor, 220));
     }
 
     if (ed.status_t > 0 and ed.status_len > 0) {
         const s = ed.status_buf[0..ed.status_len :0];
         const w = hudx.textW(s, 19);
         hudx.pill(@divTrunc(W, 2) - @divTrunc(w, 2) - 14, TOPBAR_H + 8, w + 28, 30, withAlpha(theme.ink, 185));
-        hudx.text(s, @divTrunc(W, 2) - @divTrunc(w, 2), TOPBAR_H + 14, 19, rgba(255, 245, 210, 255));
+        hudx.text(s, @divTrunc(W, 2) - @divTrunc(w, 2), TOPBAR_H + 14, 19, theme.toastText);
     }
 }
 
@@ -2407,7 +2451,7 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
             const mb = ui.beginModal(ctx, 440, listH, "Open Map");
             var y: i32 = mb.y + 48;
             if (g.mapCount == 0) {
-                hudx.text("no map files found in maps/", mb.x + 24, y, 15, rgba(210, 195, 175, 230));
+                hudx.text("no map files found in " ++ mapmod.dir ++ "/", mb.x + 24, y, 15, rgba(210, 195, 175, 230));
                 y += 34;
             }
             for (0..g.mapCount) |i| {

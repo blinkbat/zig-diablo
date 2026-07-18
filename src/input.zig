@@ -66,10 +66,26 @@ fn slotPadButton(sp: SlotPad) rl.GamepadButton {
     };
 }
 
+// A UI surface that closes on a pad button (B cancel, A confirm) leaves that button
+// HELD into the next gameplay frame, where slotPadDown would instantly fire whatever
+// skill rides it (B = dodge on the default bar). A swallowed slot stays dead until
+// its button is physically released.
+var slotSwallow = [_]bool{false} ** playermod.SKILL_SLOTS;
+
+/// Call when a UI surface closes into gameplay on a pad press.
+pub fn swallowHeldSlots() void {
+    for (&slotSwallow, 0..) |*s, i| s.* = padDown(slotPadButton(slotPad[i]));
+}
+
 /// Is this slot's controller button held this frame? Held (not edge) so a combat skill
 /// auto-repeats under its cooldown. `slotPadPressed` is the down-edge, for consumables.
 pub fn slotPadDown(slot: usize) bool {
-    return padDown(slotPadButton(slotPad[slot]));
+    const down = padDown(slotPadButton(slotPad[slot]));
+    if (slotSwallow[slot]) {
+        if (down) return false;
+        slotSwallow[slot] = false;
+    }
+    return down;
 }
 pub fn slotPadPressed(slot: usize) bool {
     return padPressed(slotPadButton(slotPad[slot]));

@@ -99,6 +99,15 @@ const GAS_LIFE = 7.0;
 const GAS_GROW = 0.5; // seconds to billow to full size
 const GAS_TICK = 0.45; // seconds between hurt pulses in a cloud
 const GAS_DPS_FRAC = 0.3; // cloud dps as a fraction of the dead zombie's MaxDmg
+// The miasma's green family in one block, spawn burst through hero cough, so the rot
+// can be regraded without a six-site hunt. (The flask projectile keeps its own
+// projectile.toxicColor — vial glass, not cloud.)
+const GAS_BURST_COLOR = rgba(188, 228, 112, 230);
+const GAS_WISP_COLOR = rgba(198, 235, 124, 190);
+const GAS_STAIN_COLOR = rgba(52, 105, 28, 255); // alpha computed per frame at the draw
+const GAS_HEART_COLOR = rgba(98, 175, 50, 255);
+const GAS_BLOB_COLOR = rgba(72, 142, 38, 255);
+const GAS_COUGH_COLOR = rgba(140, 180, 80, 200);
 
 const GasCloud = struct {
     Pos: rl.Vector3 = mathx.zero3,
@@ -316,6 +325,7 @@ pub fn menuActivate(g: *Game, idx: i32) void {
         // Resume a live run if one is paused behind the menu; otherwise start fresh.
         .adventure => if (g.canResume) {
             g.paused = false; // don't resume into a frozen (P-paused) world
+            input.swallowHeldSlots(); // held menu-confirm (A) is slot 0's button
             g.scene = .playing;
         } else g.startRun(),
         .editor => editor.enter(g),
@@ -353,9 +363,15 @@ fn playerReach(atkRange: f32, targetRadius: f32) f32 {
     return atkRange + targetRadius;
 }
 
+// A swing just short of reach lunges the hero this far forward to connect, rather than
+// whiffing at the edge. Small enough to read as a step, not a dash.
+const MELEE_STEP: f32 = 0.6;
+
 // Extra-skill footprints. Nova is a burst around the hero; Cleave sweeps a frontal arc
 // out to the melee reach. CLEAVE_ARC_DOT is the cosine cutoff between facing and the
-// direction to a foe — -0.15 ≈ a ~190° fan, so it catches flanking foes but not your back.
+// direction to a foe — -0.15 ≈ a ~197° fan, so it catches flanking foes but not your back.
+// The drawn sweep derives its half-angle from THIS dot (acos) per the telegraph rule:
+// the steel must not understate the cone it hits.
 const NOVA_RADIUS: f32 = 5.0;
 const CLEAVE_ARC_DOT: f32 = -0.15;
 
@@ -549,6 +565,7 @@ pub const Game = struct {
         g.kills = 0;
         g.elapsed = 0;
         g.enterArea(0);
+        input.swallowHeldSlots(); // a held restart-confirm (A) must not fire slot 0 on frame one
         g.scene = .playing;
     }
 
@@ -666,6 +683,7 @@ pub const Game = struct {
             g.loadout = g.p.bar;
             playermod.SkillBar.save(&g.p.bar, SKILLBAR_PATH) catch {};
         }
+        input.swallowHeldSlots(); // the B that closed the sheet is dodge's button — don't roll
         g.resetCharScreen();
     }
 
@@ -794,6 +812,9 @@ fn mouseSlotFires(g: *const Game, slot: usize, btn: rl.MouseButton) bool {
 fn keySlotFires(g: *const Game, slot: usize) bool {
     return if (slotConsumable(g, slot)) input.slotKeyPressed(slot) else input.slotKeyDown(slot);
 }
+fn padSlotFires(g: *const Game, slot: usize) bool {
+    return if (slotConsumable(g, slot)) input.slotPadPressed(slot) else input.slotPadDown(slot);
+}
 
 // Fire the skill bound to `slot`. An empty slot is a no-op — except LMB, which keeps
 // click-to-move so clearing slot 0 never strands the hero. `isLMB` marks the left mouse
@@ -917,12 +938,12 @@ fn castFirebolt(g: *Game) void {
     const aim = resolveAim(g);
     p.Facing = aim.dir;
     p.Mana -= cost;
-    p.castCD = spellCooldown(g, playermod.BASE_CAST_RATE);
+    p.castCD = p.castRate; // recompute()'s cached window — the HUD veil divides by the same number
     // Firebolt is pure fire; resists (not armor) mitigate it. Crit applies here too
     // (luck's crit chance is global, as the stat sheet advertises — not melee-only).
     const roll = p.spellDmg + @as(f32, @floatFromInt(g.rng.intn(8)));
     const dmg = stats.Damage.one(.fire, rollCrit(g, roll).dmg);
-    g.projs.add(projectile.newFirebolt(p.Pos, aim.dir, dmg, aimYVel(p.Pos.y + projectile.fireboltMuzzleDY, aim.y, distXZ(p.Pos, aim.pt), projectile.fireboltSpeed)));
+    g.projs.add(projectile.newFirebolt(p.Pos, aim.dir, dmg, aim.y, distXZ(p.Pos, aim.pt)));
     g.rumble.play(rumble.cast);
 }
 
@@ -931,12 +952,12 @@ fn castFirebolt(g: *Game) void {
 fn castIceShard(g: *Game) void {
     const p = &g.p;
     if (p.stunned() or !p.auxReady(.ice_shard)) return;
-    if (!spendMana(g, playermod.ICE_COST)) return;
+    if (!spendMana(g, playermod.Skill.manaCost(.ice_shard))) return;
     const aim = resolveAim(g);
     p.Facing = aim.dir;
     p.startAuxCD(.ice_shard, spellCooldown(g, playermod.ICE_CD));
     const roll = playermod.ICE_DMG * p.derived.spellMult + @as(f32, @floatFromInt(g.rng.intn(6)));
-    g.projs.add(projectile.newIceShard(p.Pos, aim.dir, stats.Damage.one(.cold, rollCrit(g, roll).dmg), aimYVel(p.Pos.y + projectile.handMuzzleDY, aim.y, distXZ(p.Pos, aim.pt), projectile.iceShardSpeed)));
+    g.projs.add(projectile.newIceShard(p.Pos, aim.dir, stats.Damage.one(.cold, rollCrit(g, roll).dmg), aim.y, distXZ(p.Pos, aim.pt)));
     g.rumble.play(rumble.cast);
 }
 
@@ -949,7 +970,7 @@ fn throwKnife(g: *Game) void {
     p.Facing = aim.dir;
     p.startAuxCD(.throwing_knife, spellCooldown(g, playermod.KNIFE_CD));
     const roll = g.rng.range(playermod.KNIFE_MIN, playermod.KNIFE_MAX) * p.derived.rangedMult;
-    g.projs.add(projectile.newKnife(p.Pos, aim.dir, stats.Damage.phys(rollCrit(g, roll).dmg), aimYVel(p.Pos.y + projectile.handMuzzleDY, aim.y, distXZ(p.Pos, aim.pt), projectile.knifeSpeed)));
+    g.projs.add(projectile.newKnife(p.Pos, aim.dir, stats.Damage.phys(rollCrit(g, roll).dmg), aim.y, distXZ(p.Pos, aim.pt)));
     g.rumble.play(rumble.attack_hit);
 }
 
@@ -958,12 +979,12 @@ fn throwKnife(g: *Game) void {
 fn throwFlask(g: *Game) void {
     const p = &g.p;
     if (p.stunned() or !p.auxReady(.toxic_flask)) return;
-    if (!spendMana(g, playermod.FLASK_COST)) return;
+    if (!spendMana(g, playermod.Skill.manaCost(.toxic_flask))) return;
     const aim = resolveAim(g);
     p.Facing = aim.dir;
     p.startAuxCD(.toxic_flask, spellCooldown(g, playermod.FLASK_CD));
     const dps = playermod.FLASK_DPS * p.derived.spellMult;
-    g.projs.add(projectile.newFlask(p.Pos, aim.dir, dps, aimYVel(p.Pos.y + projectile.handMuzzleDY, aim.y, distXZ(p.Pos, aim.pt), projectile.flaskSpeed)));
+    g.projs.add(projectile.newFlask(p.Pos, aim.dir, dps, aim.y, distXZ(p.Pos, aim.pt)));
     g.rumble.play(rumble.cast);
 }
 
@@ -972,7 +993,7 @@ fn throwFlask(g: *Game) void {
 fn castNova(g: *Game) void {
     const p = &g.p;
     if (p.stunned() or !p.auxReady(.lightning_nova)) return;
-    if (!spendMana(g, playermod.NOVA_COST)) return;
+    if (!spendMana(g, playermod.Skill.manaCost(.lightning_nova))) return;
     p.startAuxCD(.lightning_nova, spellCooldown(g, playermod.NOVA_CD));
     for (g.liveMonsters()) |*m| {
         if (!m.alive()) continue;
@@ -991,7 +1012,8 @@ fn castNova(g: *Game) void {
 }
 
 // Cleave: a sweeping physical strike that hits every live foe in a frontal arc within
-// melee reach. Uses the melee swing animation + cooldown feel; scales with melee damage.
+// melee reach. Shares melee's swing timer but plays the wide sweep (melee thrusts);
+// scales with melee damage.
 fn doCleave(g: *Game) void {
     const p = &g.p;
     if (p.stunned() or p.rolling() or !p.auxReady(.cleave)) return;
@@ -1001,6 +1023,7 @@ fn doCleave(g: *Game) void {
     }
     p.startAuxCD(.cleave, playermod.CLEAVE_CD);
     p.swing = playermod.swingDur;
+    p.swingKind = .sweep;
     var hit = false;
     for (g.liveMonsters()) |*m| {
         if (!m.alive()) continue;
@@ -1012,14 +1035,6 @@ fn doCleave(g: *Game) void {
         hit = true;
     }
     g.rumble.play(if (hit) rumble.attack_hit else rumble.dodge);
-}
-
-// Vertical velocity carrying a shot from muzzle to target height over its flight (a
-// bolt raining off a rampart, an arrow climbing up). Clamped so point-blank aims
-// can't become mortars.
-fn aimYVel(fromY: f32, toY: f32, distH: f32, speed: f32) f32 {
-    const ft = maxF(distH, 2.0) / speed;
-    return clampF((toY - fromY) / ft, -9.0, 9.0);
 }
 
 // Attempt a dodge roll in dir, with shared feedback on success. Keyboard and gamepad
@@ -1089,7 +1104,9 @@ fn handleGamepad(g: *Game) void {
     var aimTarget: ?i32 = null;
     var scannedAim = false;
     if (aiming) {
-        g.mouseGround = v3(p.Pos.x + aimDir.x * AIM_REACH, 0, p.Pos.z + aimDir.z * AIM_REACH);
+        // Snap the projected point to terrain like the mouse path (updateAim→pickGround)
+        // — y=0 would dive pad-aimed shots into the floor when firing along a rampart.
+        g.mouseGround = g.w.snapY(v3(p.Pos.x + aimDir.x * AIM_REACH, 0, p.Pos.z + aimDir.z * AIM_REACH));
         aimTarget = padAcquireTarget(g, aimDir); // best-aligned foe under the stick
         scannedAim = true;
         if (aimTarget) |id| p.targetMonster = id; // sticky manual pick via the right stick
@@ -1113,14 +1130,12 @@ fn handleGamepad(g: *Game) void {
         if (p.targetMonster < 0) {
             if ((if (scannedAim) aimTarget else padAcquireTarget(g, aimDir))) |tid| p.targetMonster = tid;
         }
-        if (!aiming) g.mouseGround = v3(p.Pos.x + p.Facing.x * AIM_REACH, 0, p.Pos.z + p.Facing.z * AIM_REACH);
+        if (!aiming) g.mouseGround = g.w.snapY(v3(p.Pos.x + p.Facing.x * AIM_REACH, 0, p.Pos.z + p.Facing.z * AIM_REACH));
     }
     if (!p.rolling()) {
         var s: usize = 0;
         while (s < playermod.SKILL_SLOTS) : (s += 1) {
-            // Potions on the down-EDGE (one per tap); combat skills while held.
-            const fires = if (slotConsumable(g, s)) input.slotPadPressed(s) else input.slotPadDown(s);
-            if (fires) fireSlot(g, s, false);
+            if (padSlotFires(g, s)) fireSlot(g, s, false);
         }
     }
 }
@@ -1257,26 +1272,62 @@ fn updatePlayerMovement(g: *Game, dt: f32) void {
 
 fn updatePlayerAttack(g: *Game) void {
     const p = &g.p;
-    // Melee only swings at the foe you EXPLICITLY engaged (chaseMonster) — a merely
+    // Melee only swings once you've EXPLICITLY engaged (chaseMonster) — a merely
     // selected/hovered target never triggers an auto-swing.
     if (p.rolling() or p.stunned() or p.chaseMonster < 0 or p.atkCD > 0) return;
-    const m = g.monsterByID(p.chaseMonster) orelse {
-        p.chaseMonster = -1;
-        return;
-    };
-    if (!m.alive()) {
+    if (g.monsterByID(p.chaseMonster)) |cm| {
+        if (!cm.alive()) {
+            p.chaseMonster = -1;
+            return;
+        }
+    } else {
         p.chaseMonster = -1;
         return;
     }
-    if (distXZ(p.Pos, m.Pos) <= playerReach(p.atkRange, m.Radius) and sameGroundY(m.Pos.y, p.Pos.y)) {
-        const rc = rollCrit(g, g.rng.range(p.MinDmg, p.MaxDmg));
-        p.Facing = dirXZ(p.Pos, m.Pos);
-        p.swing = playermod.swingDur;
-        p.atkCD = p.atkRate;
-        g.rumble.play(if (rc.crit) rumble.crit_hit else rumble.attack_hit);
-        // Melee is untyped physical — armor (not resists) mitigates it.
-        damageMonster(g, m, stats.Damage.phys(rc.dmg), rc.crit);
+
+    // Swing at whoever's actually in front of the blade: the nearest live foe on
+    // comparable ground within a short step of reach — NOT necessarily the one you
+    // engaged. If a closer foe wandered into range, the swing lands on it and re-engages
+    // it, so a strike never whiffs past a nearby enemy onto a stale target.
+    var target: ?*Monster = null;
+    var best2: f32 = std.math.floatMax(f32);
+    for (g.liveMonsters()) |*m| {
+        if (!m.alive() or !sameGroundY(m.Pos.y, p.Pos.y)) continue;
+        const d = distXZ(p.Pos, m.Pos);
+        if (d > playerReach(p.atkRange, m.Radius) + MELEE_STEP) continue;
+        const d2 = d * d;
+        if (d2 < best2) {
+            best2 = d2;
+            target = m;
+        }
     }
+    const m = target orelse return; // nobody in range yet — keep closing
+
+    if (m.id != p.chaseMonster) {
+        p.chaseMonster = m.id; // re-engage the foe we're actually swinging at
+        p.targetMonster = m.id;
+    }
+
+    // Close a short step if the foe sits just past reach, so the blow connects instead of
+    // stopping short at the edge.
+    const reach = playerReach(p.atkRange, m.Radius);
+    var d = distXZ(p.Pos, m.Pos);
+    if (d > reach) {
+        const dir = dirXZ(p.Pos, m.Pos);
+        const advance = mathx.minF(MELEE_STEP, d - reach + 0.05);
+        p.Pos = g.w.moveWithCollision(p.Pos, v3(dir.x * advance, 0, dir.z * advance), playermod.radius);
+        d = distXZ(p.Pos, m.Pos);
+    }
+    if (d > reach) return; // step blocked (wall) — try again next frame
+
+    const rc = rollCrit(g, g.rng.range(p.MinDmg, p.MaxDmg));
+    p.Facing = dirXZ(p.Pos, m.Pos);
+    p.swing = playermod.swingDur;
+    p.swingKind = .thrust;
+    p.atkCD = p.atkRate;
+    g.rumble.play(if (rc.crit) rumble.crit_hit else rumble.attack_hit);
+    // Melee is untyped physical — armor (not resists) mitigates it.
+    damageMonster(g, m, stats.Damage.phys(rc.dmg), rc.crit);
 }
 
 // Deal a typed hit: mitigation/HP/stun live in monster.hurt; FX (sparks, gore) and the
@@ -1540,8 +1591,10 @@ fn resolveMonsterAttack(g: *Game, m: *Monster) void {
         // flying shaft are one motion. It angles to the player's true elevation — a
         // rampart is cover from the cliff side, not from a clean line.
         const bowHead = skelBow(m).head;
-        const from = v3(bowHead.x, m.Pos.y + bowHead.y, bowHead.z);
-        g.projs.add(projectile.newArrow(from, dirXZ(from, g.p.Pos), dmg, aimYVel(from.y + projectile.arrowMuzzleDY, g.p.Pos.y + 1.0, distXZ(from, g.p.Pos), projectile.arrowSpeed)));
+        // spawn() lifts by arrowMuzzleDY (ground-point contract) — pre-subtract so the
+        // shaft materializes ON the drawn bow, not a muzzle-height above it.
+        const from = v3(bowHead.x, m.Pos.y + bowHead.y - projectile.arrowMuzzleDY, bowHead.z);
+        g.projs.add(projectile.newArrow(from, dirXZ(from, g.p.Pos), dmg, g.p.Pos.y + playermod.hitY, distXZ(from, g.p.Pos)));
         // String-snap: a flick of pale sparks off the arrowhead at release.
         g.parts.burst(&g.rng, v3(bowHead.x, m.Pos.y + bowHead.y, bowHead.z), 5, 2.6, 0.05, 0.3, rgba(255, 240, 210, 230), 4);
         return;
@@ -1599,19 +1652,24 @@ fn onPlayerDeath(g: *Game) void {
     endRun(g, .dead);
 }
 
-fn hitPlayer(g: *Game, dmg: stats.Damage) void {
+// Every hero damage source funnels here: i-frame gate, mitigation, and the death check
+// live ONCE. Returns what landed (0 = negated/resisted → the caller skips its FX). A new
+// damage source (trap, DoT) only has to pick its flash/rumble/burst dressing.
+fn hurtHero(g: *Game, dmg: stats.Damage) f32 {
     // I-frames from a dodge roll negate the blow entirely.
-    if (g.p.invulnerable()) {
-        return;
-    }
+    if (g.p.invulnerable()) return 0;
     // takeDamage applies armor+resists and returns what landed (a big hit light-stuns).
-    // Zero landed → no FX/death check.
-    if (g.p.takeDamage(dmg) <= 0) return;
+    const landed = g.p.takeDamage(dmg);
+    if (landed > 0) onPlayerDeath(g);
+    return landed;
+}
+
+fn hitPlayer(g: *Game, dmg: stats.Damage) void {
+    if (hurtHero(g, dmg) <= 0) return;
     g.damageFlash = DAMAGE_FLASH_DUR;
     g.shake = maxF(g.shake, 0.25);
     g.rumble.play(rumble.hurt);
     g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 1.35, g.p.Pos.z), 8, 4.5, 0.1, 0.45, rgba(220, 40, 40, 255), 9);
-    onPlayerDeath(g);
 }
 
 // Retain-in-place: keep items where keepFn returns true, compacting survivors to the
@@ -1682,7 +1740,7 @@ fn keepProjectile(c: SweepCtx, pr: *Projectile) bool {
                 return false;
             }
         }
-    } else if (g.p.alive() and dist2XZ(g.p.Pos, pr.Pos) < (playermod.radius + pr.Radius) * (playermod.radius + pr.Radius) and @abs(pr.Pos.y - (g.p.Pos.y + 1.1)) < 1.7) {
+    } else if (g.p.alive() and dist2XZ(g.p.Pos, pr.Pos) < (playermod.radius + pr.Radius) * (playermod.radius + pr.Radius) and @abs(pr.Pos.y - (g.p.Pos.y + playermod.hitY)) < playermod.hitHalf) {
         hitPlayer(g, pr.Damage);
         impactBurst(g, pr);
         return false;
@@ -1783,7 +1841,7 @@ fn addGasCloud(g: *Game, pos: rl.Vector3, dps: f32, fromPlayer: bool) void {
     g.gas[g.gasCount] = .{ .Pos = pos, .life = GAS_LIFE, .dps = dps, .seed = g.rng.angle(), .fromPlayer = fromPlayer };
     g.gasCount += 1;
     // The rot boiling OUT — buoyant, sickly.
-    g.parts.burst(&g.rng, v3(pos.x, pos.y + 0.7, pos.z), 18, 2.4, 0.15, 1.2, rgba(188, 228, 112, 230), -2);
+    g.parts.burst(&g.rng, v3(pos.x, pos.y + 0.7, pos.z), 18, 2.4, 0.15, 1.2, GAS_BURST_COLOR, -2);
 }
 
 // Advance one miasma cloud: age it out, exhale slow wisps while it lives. Wisps gate
@@ -1802,7 +1860,7 @@ fn keepGas(c: SweepCtx, gc: *GasCloud) bool {
             .maxLife = 1.7,
             .Size = 0.12 + g.rng.float() * 0.09,
             // Bright enough that the pool's alpha blend only lifts the ground, never dims it.
-            .Color = rgba(198, 235, 124, 190),
+            .Color = GAS_WISP_COLOR,
             .grav = -0.35, // rot gas rises
             .drag = 1.2,
         });
@@ -1855,12 +1913,10 @@ fn updateGasClouds(g: *Game, dt: f32) void {
 // is FELT (flash + rumble + a cough of green).
 fn gasHurtPlayer(g: *Game, dmg: f32) void {
     // Miasma is poison — classed as chaos, so chaos resist (not armor) blunts it.
-    // Zero landed (fully resisted) → no cough/flash/rumble, mirroring hitPlayer.
-    if (g.p.takeDamage(stats.Damage.one(.chaos, dmg)) <= 0) return;
+    if (hurtHero(g, stats.Damage.one(.chaos, dmg)) <= 0) return;
     g.damageFlash = maxF(g.damageFlash, DAMAGE_FLASH_DUR * 0.5);
     g.rumble.play(rumble.gas_tick);
-    g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 1.3, g.p.Pos.z), 4, 1.8, 0.08, 0.5, rgba(140, 180, 80, 200), -1);
-    onPlayerDeath(g);
+    g.parts.burst(&g.rng, v3(g.p.Pos.x, g.p.Pos.y + 1.3, g.p.Pos.z), 4, 1.8, 0.08, 0.5, GAS_COUGH_COLOR, -1);
 }
 
 // Ambient particles: violet motes up the open portal, gold glints over piles, warm
@@ -1955,8 +2011,11 @@ fn updatePortal(g: *Game) void {
         g.setToast("Area cleared - a portal has opened!", .{});
     }
     // Lingering gas or a last arrow can kill the same frame the hero reaches the ring —
-    // death must win over the portal.
-    if (g.w.PortalOpen and g.p.alive() and distXZ(g.p.Pos, g.w.PortalPos) < 2.4) {
+    // death must win over the portal. Same-ground gate like melee/loot: a hero on a
+    // ledge above the ring must not fall through the cliff into the vortex.
+    if (g.w.PortalOpen and g.p.alive() and distXZ(g.p.Pos, g.w.PortalPos) < 2.4 and
+        sameGroundY(g.p.Pos.y, g.w.groundY(g.w.PortalPos.x, g.w.PortalPos.z)))
+    {
         if (g.playtest) {
             endPlaytest(g);
             g.ed.status("portal reached - playtest complete", .{});
@@ -2032,6 +2091,46 @@ fn heroBob(p: *const Player) f32 {
     return BOB_AMP * sinf(p.walkBob);
 }
 
+// The hero's blade arm through the melee thrust, in one place: body pose and FX steel
+// read the same grip so glove and blade can't separate (same contract as pibGrip).
+//
+// Melee strikes ONE foe, so it reads as a fencing lunge, not a sweep: the point snaps
+// out of the guard (dead stop at full extension), plants for a beat, then eases back.
+// At full extension the tip sits exactly at atkRange — the steel never lies about reach.
+const HeroThrust = struct { ext: f32, sh: rl.Vector3, hand: rl.Vector3, tip: rl.Vector3 };
+
+fn heroThrustAt(p: *const Player, a: f32) HeroThrust {
+    var ext: f32 = 0;
+    if (a < 0.32) {
+        const u = clampF(a, 0, 0.32) / 0.32;
+        ext = 1 - (1 - u) * (1 - u);
+    } else if (a < 0.58) {
+        ext = 1;
+    } else {
+        const u = clampF((a - 0.58) / 0.42, 0, 1);
+        ext = 1 - u * u * (3 - 2 * u);
+    }
+    const base = p.Pos;
+    const bob = heroBob(p);
+    const f = mathx.orFacing(p.Facing, 0, -1);
+    const right = mathx.perpXZ(f);
+    const shDrive = 0.03 + 0.1 * ext; // shoulder rides the lunge lean
+    const sh = v3(base.x + right.x * 0.3 + f.x * shDrive, 1.32 + bob, base.z + right.z * 0.3 + f.z * shDrive);
+    // Hip-high guard grip rolls inward and up as it drives to a chest-high point.
+    const lat = 0.34 - 0.22 * ext;
+    const fwd = 0.16 + 0.5 * ext;
+    const handY = 0.98 + bob + 0.24 * ext;
+    const hand = v3(base.x + right.x * lat + f.x * fwd, handY, base.z + right.z * lat + f.z * fwd);
+    const tipDist = 0.55 + (p.atkRange / HERO_SCALE - 0.55) * ext;
+    const tip = v3(base.x + f.x * tipDist + right.x * lat * 0.3, handY + 0.12 * (1 - ext), base.z + f.z * tipDist + right.z * lat * 0.3);
+    return .{ .ext = ext, .sh = sh, .hand = hand, .tip = tip };
+}
+
+fn heroThrust(p: *const Player) HeroThrust {
+    const live = p.swing > 0 and p.swingKind == .thrust;
+    return heroThrustAt(p, if (live) 1 - p.swing / playermod.swingDur else 0);
+}
+
 // The hero: a cloaked, hooded ranger; plain tint (torchlight shades it). Drawn
 // HERO_SCALE bigger about the feet (depth pass too, so the shadow grows with him).
 fn drawHeroBody(p: *const Player) void {
@@ -2060,39 +2159,56 @@ fn drawHeroBody(p: *const Player) void {
         return;
     }
 
+    const thr = heroThrust(p);
     const legCol = rgba(40, 40, 46, 255);
     for ([_]f32{ -1, 1 }) |s| {
-        const lx = base.x + right.x * 0.18 * s;
-        const lz = base.z + right.z * 0.18 * s;
-        rl.drawCapsule(v3(lx, 0.08, lz), v3(lx, 0.55 + bob, lz), 0.16, 8, 6, legCol);
+        // Thrust lunge: blade-side foot drives ahead, off foot braces behind.
+        const lungeAmt: f32 = if (s > 0) 0.34 else -0.26;
+        const lunge = thr.ext * lungeAmt;
+        const lx = base.x + right.x * 0.18 * s + f.x * lunge;
+        const lz = base.z + right.z * 0.18 * s + f.z * lunge;
+        rl.drawCapsule(v3(lx, 0.08, lz), v3(lx - f.x * lunge * 0.55, 0.55 + bob - 0.06 * thr.ext, lz - f.z * lunge * 0.55), 0.16, 8, 6, legCol);
     }
 
     if (p.hitFlash > 0) cloak = lerpColor(cloak, rl.Color.white, 0.6);
     // The cloak flares from the belt into an A-line skirt — the "cloaked wanderer" shape
     // from the iso camera (feet peek below the hem).
+    const ld = 0.12 * thr.ext; // lunge lean: hood and shoulders drive over the front foot
     rl.drawCylinderEx(v3(base.x, 0.6 + bob, base.z), v3(base.x, 0.16 + bob * 0.5, base.z), 0.33, 0.54, 10, lerpColor(cloak, rl.Color.black, 0.22));
-    rl.drawCapsule(v3(base.x, 0.5 + bob, base.z), v3(base.x, 1.42 + bob, base.z), 0.42, 12, 8, cloak);
+    rl.drawCapsule(v3(base.x, 0.5 + bob, base.z), v3(base.x + f.x * ld, 1.42 + bob, base.z + f.z * ld), 0.42, 12, 8, cloak);
     rl.drawCapsule(v3(base.x - f.x * 0.22, 0.55 + bob, base.z - f.z * 0.22), v3(base.x - f.x * 0.12, 1.25 + bob, base.z - f.z * 0.12), 0.3, 10, 6, lerpColor(cloak, rl.Color.black, 0.25));
     // Leather belt with a brass buckle — a warm accent splitting the silhouette into torso-over-skirt.
     rl.drawCylinderEx(v3(base.x, 0.88 + bob, base.z), v3(base.x, 0.98 + bob, base.z), 0.435, 0.42, 10, rgba(74, 50, 30, 255));
     sphere(v3(base.x + f.x * 0.42, 0.93 + bob, base.z + f.z * 0.42), 0.06, theme.trimColor);
 
     // Sleeved arms hang relaxed at his sides, gloved hands at the hem — no tool
-    // grips, so the silhouette reads true for any loadout.
+    // grips, so the silhouette reads true for any loadout. The melee thrust is the one
+    // exception: the blade arm snaps into a fencing extension (grip shared with the FX
+    // steel via heroThrust), the off arm sweeps back and up for counterbalance.
     const sleeve = lerpColor(hood, rl.Color.black, 0.1);
     const glove = rgba(74, 50, 30, 255);
-    for ([_]f32{ -1, 1 }) |s| {
-        const sh = v3(base.x + right.x * 0.3 * s + f.x * 0.03, 1.32 + bob, base.z + right.z * 0.3 * s + f.z * 0.03);
-        const hand = v3(base.x + right.x * 0.42 * s + f.x * 0.12, 0.88 + bob, base.z + right.z * 0.42 * s + f.z * 0.12);
-        rl.drawCapsule(sh, hand, 0.1, 6, 4, sleeve);
-        sphere(hand, 0.095, glove);
+    if (thr.ext > 0) {
+        rl.drawCapsule(thr.sh, thr.hand, 0.1, 6, 4, sleeve);
+        sphere(thr.hand, 0.095, glove);
+        const e = thr.ext;
+        const bsh = v3(base.x - right.x * 0.3 + f.x * 0.03, 1.32 + bob, base.z - right.z * 0.3 + f.z * 0.03);
+        const bhand = v3(base.x - right.x * (0.42 + 0.08 * e) + f.x * (0.12 - 0.5 * e), 0.88 + bob + 0.3 * e, base.z - right.z * (0.42 + 0.08 * e) + f.z * (0.12 - 0.5 * e));
+        rl.drawCapsule(bsh, bhand, 0.1, 6, 4, sleeve);
+        sphere(bhand, 0.095, glove);
+    } else {
+        for ([_]f32{ -1, 1 }) |s| {
+            const sh = v3(base.x + right.x * 0.3 * s + f.x * 0.03, 1.32 + bob, base.z + right.z * 0.3 * s + f.z * 0.03);
+            const hand = v3(base.x + right.x * 0.42 * s + f.x * 0.12, 0.88 + bob, base.z + right.z * 0.42 * s + f.z * 0.12);
+            rl.drawCapsule(sh, hand, 0.1, 6, 4, sleeve);
+            sphere(hand, 0.095, glove);
+        }
     }
 
-    sphere(v3(base.x, 1.72 + bob, base.z), 0.34, hood);
-    sphere(v3(base.x + f.x * 0.22, 1.70 + bob, base.z + f.z * 0.22), 0.2, lerpColor(skin, rl.Color.black, 0.35));
-    rl.drawCylinderEx(v3(base.x - f.x * 0.1, 1.9 + bob, base.z - f.z * 0.1), v3(base.x - f.x * 0.3, 2.18 + bob, base.z - f.z * 0.3), 0.18, 0.02, 6, hood);
+    sphere(v3(base.x + f.x * ld, 1.72 + bob, base.z + f.z * ld), 0.34, hood);
+    sphere(v3(base.x + f.x * (0.22 + ld), 1.70 + bob, base.z + f.z * (0.22 + ld)), 0.2, lerpColor(skin, rl.Color.black, 0.35));
+    rl.drawCylinderEx(v3(base.x - f.x * (0.1 - ld), 1.9 + bob, base.z - f.z * (0.1 - ld)), v3(base.x - f.x * (0.3 - ld), 2.18 + bob, base.z - f.z * (0.3 - ld)), 0.18, 0.02, 6, hood);
     // Brass clasp at the throat where the hood gathers.
-    sphere(v3(base.x + f.x * 0.3, 1.46 + bob, base.z + f.z * 0.3), 0.055, theme.trimColor);
+    sphere(v3(base.x + f.x * (0.3 + ld), 1.46 + bob, base.z + f.z * (0.3 + ld)), 0.055, theme.trimColor);
 
     // Rolled travel-pack across the small of the back — gear that belongs to any
     // build (the quiver/bow/torch went with the loadout-neutral rework).
@@ -2117,13 +2233,37 @@ fn drawHeroFX(p: *const Player, t: f32) void {
         return;
     }
 
-    // Melee swing arc.
+    // Melee steel, two dialects: the basic strike is ONE foe, so it draws a fencing
+    // thrust — point out to full reach, planted, recovered. Cleave draws the wide
+    // frontal sweep. Both track atkRange so the steel never lies about reach.
     if (p.swing > 0) {
-        const sw = p.swing / playermod.swingDur;
-        const reach = 0.7 + sw * 0.9;
-        const shoulder = v3(base.x + f.x * 0.3, 1.2, base.z + f.z * 0.3);
-        const tip = v3(base.x + f.x * reach, 1.2 + sw * 0.4, base.z + f.z * reach);
-        rl.drawCylinderEx(shoulder, tip, 0.07, 0.03, 6, rgba(255, 240, 190, 255));
+        const a = 1 - p.swing / playermod.swingDur; // 0 → 1 across the swing
+        if (p.swingKind == .thrust) {
+            // One foe, one line: a single live rapier — a ghost fan is collinear on a
+            // thrust and hides inside the blade. The lunge pose and the 4-frame snap
+            // carry the motion.
+            const gt = heroThrustAt(p, a);
+            rl.drawCylinderEx(gt.hand, gt.tip, 0.05, 0.012, 6, rgba(255, 240, 190, 255));
+            // The point catches the light as it plants: full flash at extension.
+            steelGlint(gt.tip, 0.12 + 0.26 * gt.ext, 0.4 + 0.6 * gt.ext);
+        } else {
+            const perp = v3(-f.z, 0, f.x); // hero's left in XZ
+            const L = p.atkRange / HERO_SCALE; // full reach, like the thrust tip — steel never lies
+            const shoulder = v3(base.x + f.x * 0.25, 1.15, base.z + f.z * 0.25);
+            const half = std.math.acos(CLEAVE_ARC_DOT); // sweep exactly the hit cone's half-angle
+            // Live edge plus a short fan of trailing ghosts behind it fakes motion blur.
+            var i: i32 = 0;
+            while (i < 4) : (i += 1) {
+                const ga = clampF(a - @as(f32, @floatFromInt(i)) * 0.07, 0, 1);
+                const th = half * (1 - 2 * ga);
+                const dir = v3(f.x * @cos(th) + perp.x * @sin(th), 0, f.z * @cos(th) + perp.z * @sin(th));
+                const rise = 0.32 * @sin(ga * std.math.pi); // blade lifts through the middle of the arc
+                const tip = v3(shoulder.x + dir.x * L, shoulder.y + rise, shoulder.z + dir.z * L);
+                const fade: f32 = if (i == 0) 1.0 else 0.4 * (1 - @as(f32, @floatFromInt(i)) / 4);
+                rl.drawCylinderEx(shoulder, tip, if (i == 0) 0.08 else 0.05, 0.02, 6, rgba(255, 240, 190, mathx.u8f(255 * fade)));
+                if (i == 0) sphere(tip, 0.09, rgba(255, 250, 220, 230)); // spark at the live tip
+            }
+        }
     }
 
     // Carry glow: the overhead light throws his camera side into self-shadow, so a
@@ -2588,6 +2728,20 @@ pub fn groundRing(center: rl.Vector3, r: f32, col: rl.Color) void {
     rl.drawCircle3D(center, r, v3(1, 0, 0), 90, col);
 }
 
+// A steel point catching the light: a pin-bright core with thin tapered flash rays.
+// A glint is a STAR, never a ball — stacked fat spheres read as geometry stuck to the
+// blade. Long vertical pair + a shorter XZ-diagonal pair (iso camera yaw is fixed, so
+// one world diagonal always reads as a slash across the point). Friend and foe share
+// this so every blade speaks the same light.
+fn steelGlint(pos: rl.Vector3, size: f32, intensity: f32) void {
+    const col = rgba(255, 255, 245, mathx.u8f(140 + 115 * intensity));
+    sphere(pos, 0.028 + 0.022 * intensity, col);
+    const dx = 0.7071 * size * 0.6;
+    for ([_][3]f32{ .{ 0, size, 0 }, .{ 0, -size, 0 }, .{ dx, 0, -dx }, .{ -dx, 0, dx } }) |d| {
+        rl.drawCylinderEx(pos, v3(pos.x + d[0], pos.y + d[1], pos.z + d[2]), 0.016, 0, 4, col);
+    }
+}
+
 // Everything that casts a shadow, submitted in one place so a new caster can't be
 // added to one depth pass and forgotten in the other.
 fn submitCasters(g: *Game, ms: []const Monster, lightGround: rl.Vector3, torchR: f32, fp: tl.FireParams, drawHero: bool) void {
@@ -2660,8 +2814,7 @@ fn drawMonstersFX(ms: []const Monster, lightXZ: rl.Vector3, pPos: rl.Vector3, to
             const tip = pibGrip(m).tip;
             const flare = maxF(wp, sinf(sp * std.math.pi)); // peaks as the blade crosses you
             const tw = 0.7 + 0.3 * sinf(t * 9 + m.Pos.x * 3 + m.Pos.z * 5); // idle twinkle
-            sphere(tip, (0.035 + 0.07 * flare) * tw, rgba(255, 255, 245, 255));
-            sphere(tip, (0.1 + 0.15 * flare) * tw, rgba(255, 250, 220, mathx.u8f(40 + 110 * flare)));
+            steelGlint(tip, (0.16 + 0.3 * flare) * tw, 0.35 + 0.65 * flare);
             // The cut leaves a trail of fading tip-ghosts along the arc — reads as a sweep, not a teleport.
             if (sp > 0) {
                 var k: f32 = 1;
@@ -2719,9 +2872,9 @@ fn drawGasClouds(g: *Game, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams, 
         const fade = clampF(gc.life / (GAS_LIFE * 0.28), 0, 1); // thin out at the end
         const r = GAS_RADIUS * grow;
         const a = fade * (0.8 + 0.2 * sinf(t * 2.3 + gc.seed)); // slow breathing
-        rl.drawCylinderEx(v3(gc.Pos.x, gc.Pos.y + 0.02, gc.Pos.z), v3(gc.Pos.x, gc.Pos.y + 0.05, gc.Pos.z), r, r, 20, rgba(52, 105, 28, mathx.u8f(56 * a)));
+        rl.drawCylinderEx(v3(gc.Pos.x, gc.Pos.y + 0.02, gc.Pos.z), v3(gc.Pos.x, gc.Pos.y + 0.05, gc.Pos.z), r, r, 20, mathx.withAlpha(GAS_STAIN_COLOR, mathx.u8f(56 * a)));
         // A bright heart low in the cloud so the hazard reads under the churn. (Additive: overlaps brighten.)
-        sphere(v3(gc.Pos.x, gc.Pos.y + 0.45 * grow, gc.Pos.z), r * 0.38 * grow, rgba(98, 175, 50, mathx.u8f(62 * a)));
+        sphere(v3(gc.Pos.x, gc.Pos.y + 0.45 * grow, gc.Pos.z), r * 0.38 * grow, mathx.withAlpha(GAS_HEART_COLOR, mathx.u8f(62 * a)));
         // Blobs churn on slow per-cloud lissajous seats out to the footprint edge.
         var i: usize = 0;
         while (i < 5) : (i += 1) {
@@ -2731,7 +2884,7 @@ fn drawGasClouds(g: *Game, lightXZ: rl.Vector3, torchR: f32, fp: tl.FireParams, 
             const bx = gc.Pos.x + cosf(t * (0.5 + 0.09 * fi) + ph) * orbit;
             const bz = gc.Pos.z + sinf(t * (0.4 + 0.07 * fi) + ph * 1.7) * orbit;
             const by = gc.Pos.y + (0.3 + 0.22 * fi) * grow + 0.1 * sinf(t * 1.1 + ph);
-            sphere(v3(bx, by, bz), r * (0.5 - 0.05 * fi) * grow, rgba(72, 142, 38, mathx.u8f((48 - 5 * fi) * a)));
+            sphere(v3(bx, by, bz), r * (0.5 - 0.05 * fi) * grow, mathx.withAlpha(GAS_BLOB_COLOR, mathx.u8f((48 - 5 * fi) * a)));
         }
     }
 }
@@ -2848,21 +3001,22 @@ fn drawLoot(lootList: *std.ArrayList(LootDrop), lightXZ: rl.Vector3, torchR: f32
 
 pub fn drawPortal(w: *const world.World, t: f32) void {
     const pp = w.PortalPos;
+    const gy = w.groundY(pp.x, pp.z); // an editor can seat the gate on a ledge — ride its floor
     if (!w.PortalOpen) {
         // Dormant: a dark stone dais with a slow-pulsing rune ring and a dim heart-ember,
         // banked and waiting.
-        rl.drawCylinderEx(v3(pp.x, 0.02, pp.z), v3(pp.x, 0.06, pp.z), 2.0, 2.0, 24, rgba(42, 42, 58, 220));
+        rl.drawCylinderEx(v3(pp.x, gy + 0.02, pp.z), v3(pp.x, gy + 0.06, pp.z), 2.0, 2.0, 24, rgba(42, 42, 58, 220));
         const pulse = mathx.u8f(70 + 45 * sinf(t * 1.4));
-        groundRing(v3(pp.x, 0.09, pp.z), 1.55, rgba(110, 100, 170, pulse));
-        groundRing(v3(pp.x, 0.09, pp.z), 1.15, rgba(110, 100, 170, pulse / 2));
-        sphere(v3(pp.x, 0.18, pp.z), 0.11 + 0.02 * sinf(t * 1.4), rgba(120, 105, 210, pulse));
-        sphere(v3(pp.x, 0.18, pp.z), 0.26, rgba(120, 105, 210, pulse / 4));
+        groundRing(v3(pp.x, gy + 0.09, pp.z), 1.55, rgba(110, 100, 170, pulse));
+        groundRing(v3(pp.x, gy + 0.09, pp.z), 1.15, rgba(110, 100, 170, pulse / 2));
+        sphere(v3(pp.x, gy + 0.18, pp.z), 0.11 + 0.02 * sinf(t * 1.4), rgba(120, 105, 210, pulse));
+        sphere(v3(pp.x, gy + 0.18, pp.z), 0.26, rgba(120, 105, 210, pulse / 4));
         return;
     }
     // Open: a violet vortex built from AIR — a glowing dais, two helix strands up a
     // tapering throat, thin rim rings. (Stacked cylinders read as an opaque blob; points/lines stay airy.)
-    rl.drawCylinderEx(v3(pp.x, 0.02, pp.z), v3(pp.x, 0.05, pp.z), 2.3, 2.3, 28, rgba(70, 50, 130, 150));
-    rl.drawCylinderEx(v3(pp.x, 0.05, pp.z), v3(pp.x, 0.08, pp.z), 1.9, 1.9, 28, rgba(120, 90, 220, 100));
+    rl.drawCylinderEx(v3(pp.x, gy + 0.02, pp.z), v3(pp.x, gy + 0.05, pp.z), 2.3, 2.3, 28, rgba(70, 50, 130, 150));
+    rl.drawCylinderEx(v3(pp.x, gy + 0.05, pp.z), v3(pp.x, gy + 0.08, pp.z), 1.9, 1.9, 28, rgba(120, 90, 220, 100));
     var strand: i32 = 0;
     while (strand < 2) : (strand += 1) {
         const sPh: f32 = @floatFromInt(strand);
@@ -2871,7 +3025,7 @@ pub fn drawPortal(w: *const world.World, t: f32) void {
             const f: f32 = @as(f32, @floatFromInt(s)) / 13.0;
             const ang = t * 2.6 + f * 12.0 + sPh * std.math.pi;
             const r = (1.55 - f * 0.95) + 0.08 * sinf(t * 3 + f * 9);
-            const y = 0.12 + f * 3.1;
+            const y = gy + 0.12 + f * 3.1;
             const pos = v3(pp.x + cosf(ang) * r, y, pp.z + sinf(ang) * r);
             const c = lerpColor(rgba(150, 170, 255, 255), rgba(230, 160, 255, 240), f);
             sphere(pos, 0.17 * (1 - f * 0.4), c);
@@ -2879,17 +3033,17 @@ pub fn drawPortal(w: *const world.World, t: f32) void {
         }
     }
     // Breathing rim rings anchor the throat to the dais.
-    groundRing(v3(pp.x, 0.1, pp.z), 1.6 + 0.08 * sinf(t * 2.1), rgba(200, 170, 255, 190));
-    groundRing(v3(pp.x, 0.1, pp.z), 1.25 + 0.06 * sinf(t * 2.1 + 1.5), rgba(160, 130, 255, 130));
+    groundRing(v3(pp.x, gy + 0.1, pp.z), 1.6 + 0.08 * sinf(t * 2.1), rgba(200, 170, 255, 190));
+    groundRing(v3(pp.x, gy + 0.1, pp.z), 1.25 + 0.06 * sinf(t * 2.1 + 1.5), rgba(160, 130, 255, 130));
     // A sky-beam over the gate — the arena's one landmark, a violet column readable across the dark.
-    rl.drawCylinderEx(v3(pp.x, 0.1, pp.z), v3(pp.x, 8.0, pp.z), 1.05, 0.28, 12, rgba(150, 110, 255, 26));
-    rl.drawCylinderEx(v3(pp.x, 0.1, pp.z), v3(pp.x, 5.4, pp.z), 0.5, 0.12, 10, rgba(200, 170, 255, 44));
+    rl.drawCylinderEx(v3(pp.x, gy + 0.1, pp.z), v3(pp.x, gy + 8.0, pp.z), 1.05, 0.28, 12, rgba(150, 110, 255, 26));
+    rl.drawCylinderEx(v3(pp.x, gy + 0.1, pp.z), v3(pp.x, gy + 5.4, pp.z), 0.5, 0.12, 10, rgba(200, 170, 255, 44));
     // Three rune-sparks patrol the rim, counter-rotating against the helix.
     var k: i32 = 0;
     while (k < 3) : (k += 1) {
         const kf: f32 = @floatFromInt(k);
         const ang = -t * 1.3 + kf * (std.math.tau / 3.0);
-        const rp = v3(pp.x + cosf(ang) * 2.0, 0.3 + 0.1 * sinf(t * 2.2 + kf * 2.1), pp.z + sinf(ang) * 2.0);
+        const rp = v3(pp.x + cosf(ang) * 2.0, gy + 0.3 + 0.1 * sinf(t * 2.2 + kf * 2.1), pp.z + sinf(ang) * 2.0);
         sphere(rp, 0.08, rgba(225, 200, 255, 235));
         sphere(rp, 0.2, rgba(180, 140, 255, 70));
     }
@@ -3221,7 +3375,7 @@ pub fn run(shot: bool) void {
         g.spawn(monster.makeMonster(.zombie, 0, &g.rng, mathx.ground(23.5, 19)));
         const boltFrom = v3(31.5, 2.4, 20);
         const boltTo = v3(21, 0, 13.5);
-        g.projs.add(projectile.newFirebolt(boltFrom, dirXZ(boltFrom, boltTo), stats.Damage.one(.fire, playermod.BASE_SPELL_DMG), aimYVel(2.4 + projectile.fireboltMuzzleDY, 0.9, distXZ(boltFrom, boltTo), projectile.fireboltSpeed)));
+        g.projs.add(projectile.newFirebolt(boltFrom, dirXZ(boltFrom, boltTo), stats.Damage.one(.fire, playermod.BASE_SPELL_DMG), 0.9, distXZ(boltFrom, boltTo)));
     }
     var frame: i32 = 0;
     var shotIdx: usize = 0;
@@ -3297,6 +3451,10 @@ pub fn run(shot: bool) void {
         // Silent while paused, with no controller, or in the headless screenshot harness.
         g.rumble.update(dt, !shot and rl.isGamepadAvailable(PAD) and !g.paused);
 
+        // Family portrait holds the hero mid-plant (ext=1, ping star) through the settle
+        // frames — dt is uncapped, so a one-shot timer could expire before the capture.
+        if (shot and shotIdx == FAMILY_SHOT and g.scene == .playing) g.p.swing = playermod.swingDur * 0.55;
+
         if (g.scene == .editor) {
             editor.draw(&g);
             editor.drawOverlay(&g);
@@ -3356,6 +3514,7 @@ pub fn run(shot: bool) void {
                     continue;
                 }
                 teleportHero(&g, sweep[shotIdx]);
+                g.p.swing = 0; // a posed/live swing never bleeds into the next vantage
                 g.banner.time = 0; // the area banner would sit right over the subjects
                 if (shotIdx == FAMILY_SHOT) {
                     // Family portrait: one of each kind around the hero, three-quarter and zoomed — verifies every silhouette.
@@ -3385,6 +3544,10 @@ pub fn run(shot: bool) void {
                     // Engage the brute so the top-center enemy plate is in frame (hover re-derives,
                     // but the attack target sticks and the plate reads from it).
                     g.p.targetMonster = g.monsters[posedBase + 3].id;
+                    // Hero mid-thrust at the engaged brute (facing auto-tracks the target).
+                    // swingDur is a const, so the timer can't be stretched like the posed
+                    // monsters' — it gets re-pinned every settle frame instead.
+                    g.p.swingKind = .thrust;
                     // Brute part-way into its heavy-stun meter to verify the amber stun channel under the HP bar.
                     g.monsters[posedBase + 3].stunFill = 0.6;
                     // And one fresh corpse mid-fade, to verify the spreading blood pool.
@@ -3395,8 +3558,10 @@ pub fn run(shot: bool) void {
                     // Miasma already billowed out (aged past grow-in to verify the full cloud).
                     spawnGasCloud(&g, g.monsters[g.monsterCount - 1].Pos, g.monsters[g.monsterCount - 1].MaxDmg * GAS_DPS_FRAC);
                     if (g.gasCount > 0) g.gas[g.gasCount - 1].life = GAS_LIFE - 1.5;
-                    // A firebolt frozen mid-flight, to verify the bolt + its trail.
-                    g.projs.add(projectile.newFirebolt(mathx.ground(px - 1.5, pz + 2.5), v3(-0.8, 0, 0.6), stats.Damage.one(.fire, playermod.BASE_SPELL_DMG), 0));
+                    // A firebolt frozen mid-flight, to verify the bolt + its trail (aimed
+                    // at its own muzzle height = level drift for the still).
+                    const bp = mathx.ground(px - 1.5, pz + 2.5);
+                    g.projs.add(projectile.newFirebolt(bp, v3(-0.8, 0, 0.6), stats.Damage.one(.fire, playermod.BASE_SPELL_DMG), bp.y + projectile.fireboltMuzzleDY, 10));
                     // Ground loot just out of pickup range, to verify the drop beams.
                     g.lootList.append(.{ .Kind = .gold, .Pos = mathx.ground(px - 0.4, pz + 4.0), .Amount = 25 }) catch {};
                     g.lootList.append(.{ .Kind = .health_potion, .Pos = mathx.ground(px - 2.6, pz + 2.0), .Amount = 1 }) catch {};

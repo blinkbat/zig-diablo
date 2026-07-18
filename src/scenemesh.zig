@@ -25,10 +25,15 @@ const alloc = std.heap.c_allocator;
 
 // FLOOR SENTINELS — the scene shader keys walkable-ground materials off a NEGATIVE
 // texcoord u (immediate-mode raylib draws only emit u >= 0, so props can't trip it).
-// -1 = the area's blended floor-material field; -2 = forced masonry pavement
-// (ledge caps, ramp tops). Must match the branch thresholds in torchlight's sceneFS.
-const FLAG_FLOOR: f32 = -1;
-const FLAG_PAVE: f32 = -2;
+// -1 = the area's blended floor-material field; -2 = forced masonry pavement (ledge
+// caps, ramp tops). Owned by torchlight next to the sceneFS thresholds they must match.
+const tl = @import("torchlight.zig");
+const FLAG_FLOOR = tl.FLAG_FLOOR;
+const FLAG_PAVE = tl.FLAG_PAVE;
+
+// One moss for every growth (gravestones, trunks). Near-black on purpose: the scene
+// shader gammas output, so rich darks must START near-black (see the canopy note).
+const MOSS = rgba(12, 22, 8, 255);
 
 const Builder = struct {
     pos: std.ArrayList(f32),
@@ -258,7 +263,7 @@ fn bakeGravestone(b: *Builder, o: world.Obstacle) void {
     // Weathering: moss creeping off the plinth, rain streaks down both faces, and
     // a chipped shoulder pitting the ridge line.
     const seed = o.Pos.x * 3.3 + o.Pos.z * 5.9;
-    b.addSphere(v3(o.Pos.x + cosf(seed) * o.Radius * 0.6, gy + 0.31, o.Pos.z + sinf(seed) * 0.22), 0.14, 4, 4, rgba(12, 22, 8, 255));
+    b.addSphere(v3(o.Pos.x + cosf(seed) * o.Radius * 0.6, gy + 0.31, o.Pos.z + sinf(seed) * 0.22), 0.14, 4, 4, MOSS);
     const streakX = o.Pos.x + sinf(seed * 2.1) * o.Radius * 0.55;
     const streak = lerpColor(o.Tint, rl.Color.black, 0.4);
     for ([_]f32{ -0.19, 0.19 }) |zoff| {
@@ -340,13 +345,12 @@ fn bakeTrunkGrime(b: *Builder, base: rl.Vector3, lean: rl.Vector3, bow: f32, tru
         const p = v3(base.x + lean.x * bow * f * f + cosf(ang) * rr, base.y + trunkH * f, base.z + lean.z * bow * f * f + sinf(ang) * rr);
         b.addSphere(p, trunk_r * 0.28, 5, 5, lerpColor(bark, rl.Color.black, 0.35));
     }
-    const moss = rgba(12, 22, 8, 255);
     var m: i32 = 0;
     while (m < 3) : (m += 1) {
         const mf: f32 = @floatFromInt(m);
         const a = seed * 1.9 + (mf - 1) * 0.55;
         const hgt = 0.25 + 0.35 * @abs(sinf(seed + mf * 1.3));
-        b.addSphere(v3(base.x + cosf(a) * trunk_r * 0.85, base.y + hgt, base.z + sinf(a) * trunk_r * 0.85), 0.13 + 0.05 * @abs(sinf(seed * 2 + mf)), 4, 4, moss);
+        b.addSphere(v3(base.x + cosf(a) * trunk_r * 0.85, base.y + hgt, base.z + sinf(a) * trunk_r * 0.85), 0.13 + 0.05 * @abs(sinf(seed * 2 + mf)), 4, 4, MOSS);
     }
     // Lichen rosettes speckle the mid-trunk (dim sage — output gamma lifts it).
     const lichen = rgba(44, 50, 38, 255);

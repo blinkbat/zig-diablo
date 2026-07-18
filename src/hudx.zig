@@ -21,9 +21,15 @@ const v3 = mathx.v3;
 // HUD + world overlays + scene screens. 2D only — drawn after endMode3D, so it
 // never touches the torch lighting.
 
-// Height (px) of the bottom HUD band (orbs, belt, XP bar). Single source of truth;
-// game.zig reads it to ignore world clicks that land on the HUD.
-pub const bottomBandHeight: i32 = 140;
+// The bottom band's geometry (orbs, belt, XP bar). bottomBandHeight is DERIVED from
+// the orb seat so game.zig's world-click gate tracks the real layout — growing the
+// orbs can't open a sliver of walkable HUD.
+const ORB_PX_R: i32 = 56; // drawn orb radius (px; ORB_R is the 3D mesh)
+const ORB_PX_MARGIN: i32 = 22; // orb bottom edge to screen bottom
+pub const bottomBandHeight: i32 = ORB_PX_R * 2 + ORB_PX_MARGIN + 6;
+
+// Dark puck seated under a slot-badge glyph — pool chips and bar slots share it.
+const BADGE_SEAT = rgba(10, 8, 7, 210);
 
 fn sw() i32 {
     return rl.getScreenWidth();
@@ -1078,7 +1084,7 @@ fn drawPoolChip(cell: rl.Rectangle, s: playermod.Skill, boundSlot: ?usize, focus
     if (boundSlot) |bs| {
         const bcx = cellX + cellW - 15;
         const bcy = cellY + 14;
-        rl.drawCircleV(.{ .x = fi(bcx), .y = fi(bcy) }, 12, rgba(10, 8, 7, 210)); // seat under the badge
+        rl.drawCircleV(.{ .x = fi(bcx), .y = fi(bcy) }, 12, BADGE_SEAT);
         slotGlyph(bs, bcx, bcy, 9);
     }
 
@@ -1193,6 +1199,11 @@ const orbVS =
     \\    gl_Position = mvp*vec4(vertexPosition, 1.0);
     \\}
 ;
+// The orb camera seat: shared by the render camera below and the shader's view vector
+// (spliced into orbFS at comptime), so nudging the angle can't leave stale speculars.
+const ORB_CAM_Y = 0.9;
+const ORB_CAM_Z = 4.3;
+
 const orbFS =
     \\#version 330
     \\in vec3 fragPosition;
@@ -1205,7 +1216,8 @@ const orbFS =
     \\void main() {
     \\    vec3 N = normalize(fragNormal);
     \\    vec3 L = normalize(vec3(-0.45, 0.8, 0.65));
-    \\    vec3 V = normalize(vec3(0.0, 0.9, 4.3) - fragPosition);
+    \\
+++ std.fmt.comptimePrint("    vec3 V = normalize(vec3(0.0, {d}, {d}) - fragPosition);\n", .{ ORB_CAM_Y, ORB_CAM_Z }) ++
     \\    if (mode == 0) {
     \\        // The fill line laps gently around the glass wall on two beats.
     \\        float ang = atan(fragPosition.x, fragPosition.z);
@@ -1287,7 +1299,7 @@ fn setOrbLiquid(c: rl.Color) void {
 
 fn renderOrbScene(rt: rl.RenderTexture2D, frac: f32, full: rl.Color, empty: rl.Color, t: f32, phase: f32) void {
     const cam = rl.Camera3D{
-        .position = v3(0, 0.9, 4.3), // must match hardcoded V in orbFS
+        .position = v3(0, ORB_CAM_Y, ORB_CAM_Z), // one seat with orbFS's view vector
         .target = v3(0, 0, 0),
         .up = v3(0, 1, 0),
         .fovy = 26.0,
@@ -1659,7 +1671,7 @@ fn drawSkillSlot(x: i32, y: i32, size: i32, slot: ?usize, skill: ?playermod.Skil
         const pad = gr + 4;
         const bcx = x + size - pad;
         const bcy = y + size - pad;
-        rl.drawCircleV(.{ .x = fi(bcx), .y = fi(bcy) }, fi(gr) + 3, rgba(10, 8, 7, 210)); // seat under the badge
+        rl.drawCircleV(.{ .x = fi(bcx), .y = fi(bcy) }, fi(gr) + 3, BADGE_SEAT);
         slotGlyph(i, bcx, bcy, gr);
     }
 }
@@ -1674,6 +1686,7 @@ fn textCenteredIn(s: [:0]const u8, x: i32, w: i32, y: i32, size: i32, col: rl.Co
 // otherwise-stateless HUD has to remember one frame.
 var slotPrevCd = [_]f32{0} ** playermod.SKILL_SLOTS;
 var slotBloom = [_]f32{0} ** playermod.SKILL_SLOTS;
+var slotPrevSkill = [_]?playermod.Skill{null} ** playermod.SKILL_SLOTS;
 
 // Long-recharge skills only: a "ready again" flash on spammable basics would strobe.
 fn bloomWorthy(s: playermod.Skill) bool {
@@ -1709,11 +1722,16 @@ fn drawSkillBar(g: *const Game, cx: i32, y: i32) void {
     while (i < playermod.SKILL_SLOTS) : (i += 1) {
         if (g.p.bar.slots[i]) |s| {
             const cd = skillCooldownFrac(&g.p, s);
+            // The bloom celebrates a cooldown FINISHING — key it to the same skill, or
+            // rebinding a ready skill over a cooling one reads as a false completion.
+            if (slotPrevSkill[i] != s) slotPrevCd[i] = cd;
             if (bloomWorthy(s) and slotPrevCd[i] > 0.001 and cd <= 0.001) slotBloom[i] = 1;
             slotPrevCd[i] = cd;
+            slotPrevSkill[i] = s;
         } else {
             slotPrevCd[i] = 0;
             slotBloom[i] = 0;
+            slotPrevSkill[i] = null;
         }
         drawSkillSlot(x, y, size, i, g.p.bar.slots[i], &g.p, 1.5);
         if (slotBloom[i] > 0) {
@@ -1754,8 +1772,8 @@ fn drawHUD(g: *Game) void {
     // a bound panel (flasks, dodge, gold, XP), keeping combat vitals in one gaze.
     const hudW: i32 = @min(W - 24, 840);
     const hudX = @divTrunc(W - hudW, 2);
-    const orbR: i32 = 56;
-    const orbY = H - orbR - 22;
+    const orbR = ORB_PX_R;
+    const orbY = H - orbR - ORB_PX_MARGIN;
     const healthCX = hudX + orbR + 4;
     const manaCX = hudX + hudW - orbR - 4;
 
@@ -1825,7 +1843,7 @@ fn drawHUD(g: *Game) void {
         forgedRect(tx, 78, tw, 36, withAlpha(theme.trimColor, mathx.u8f(fi(a) * 0.5)));
         finial(tx, 96, 4, mathx.u8f(fi(a) * 0.85));
         finial(tx + tw, 96, 4, mathx.u8f(fi(a) * 0.85));
-        centered(g.toast.text(), 84, 22, withAlpha(rgba(255, 245, 210, 255), a));
+        centered(g.toast.text(), 84, 22, withAlpha(theme.toastText, a));
     }
 
     // Area-name banner: glowing title flanked by fading gold rules.

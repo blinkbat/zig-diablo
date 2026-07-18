@@ -117,25 +117,28 @@ pub fn chip(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, active: bool, usedW:
     return button(ctx, rect(x, y, w, 24), label, 15, active);
 }
 
-// [-] value [+] stepper for a float. Returns true when the value changed.
-pub fn stepperF(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *f32, step: f32, min: f32, max: f32) bool {
+// [-] value [+] stepper row, one geometry + clamp-guard for both value types so the
+// float and int rows stacked in a panel can't drift apart. Reports a change only when
+// the CLAMPED value moved: +/- at a bound must not bank a no-op undo step or raise
+// the dirty flag (spurious "unsaved" confirm).
+fn stepper(comptime T: type, ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *T, step: T, min: T, max: T) bool {
+    const clamp = comptime if (T == f32) mathx.clampF else mathx.clampI;
     hudx.text(label, x, y + 3, 15, withAlpha(theme.labelColor, 230));
     const bx = x + 92;
     var changed = false;
-    // Report a change only when the CLAMPED value moved: +/- at a bound must not
-    // bank a no-op undo step or raise the dirty flag (spurious "unsaved" confirm).
     if (button(ctx, rect(bx, y, 22, 22), "-", 16, false)) {
-        const nv = mathx.clampF(v.* - step, min, max);
+        const nv = clamp(v.* - step, min, max);
         if (nv != v.*) {
             v.* = nv;
             changed = true;
         }
     }
     var buf: [24]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, "{d:.1}", .{v.*}) catch "";
+    const fmt = comptime if (T == f32) "{d:.1}" else "{d}";
+    const s = std.fmt.bufPrintZ(&buf, fmt, .{v.*}) catch "";
     hudx.text(s, bx + 30 + @divTrunc(34 - hudx.textW(s, 16), 2), y + 3, 16, theme.valueColor);
     if (button(ctx, rect(bx + 96, y, 22, 22), "+", 16, false)) {
-        const nv = mathx.clampF(v.* + step, min, max);
+        const nv = clamp(v.* + step, min, max);
         if (nv != v.*) {
             v.* = nv;
             changed = true;
@@ -144,30 +147,13 @@ pub fn stepperF(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *f32, step: f
     return changed;
 }
 
-// [-] value [+] stepper for an integer.
+// Returns true when the value changed.
+pub fn stepperF(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *f32, step: f32, min: f32, max: f32) bool {
+    return stepper(f32, ctx, x, y, label, v, step, min, max);
+}
+
 pub fn stepperI(ctx: *Ctx, x: i32, y: i32, label: [:0]const u8, v: *i32, min: i32, max: i32) bool {
-    hudx.text(label, x, y + 3, 15, withAlpha(theme.labelColor, 230));
-    const bx = x + 92;
-    var changed = false;
-    // Like stepperF: a press that clamps to no change is not a change.
-    if (button(ctx, rect(bx, y, 22, 22), "-", 16, false)) {
-        const nv = mathx.clampI(v.* - 1, min, max);
-        if (nv != v.*) {
-            v.* = nv;
-            changed = true;
-        }
-    }
-    var buf: [16]u8 = undefined;
-    const s = std.fmt.bufPrintZ(&buf, "{d}", .{v.*}) catch "";
-    hudx.text(s, bx + 30 + @divTrunc(34 - hudx.textW(s, 16), 2), y + 3, 16, theme.valueColor);
-    if (button(ctx, rect(bx + 96, y, 22, 22), "+", 16, false)) {
-        const nv = mathx.clampI(v.* + 1, min, max);
-        if (nv != v.*) {
-            v.* = nv;
-            changed = true;
-        }
-    }
-    return changed;
+    return stepper(i32, ctx, x, y, label, v, 1, min, max);
 }
 
 // A color swatch (palette presets). Returns clicked.

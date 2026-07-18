@@ -32,9 +32,6 @@ pub const DamageType = enum(u3) {
     pub fn idx(t: DamageType) usize {
         return @intFromEnum(t);
     }
-    pub fn isElemental(t: DamageType) bool {
-        return t != .physical;
-    }
     pub fn label(t: DamageType) [:0]const u8 {
         return switch (t) {
             .physical => "Physical",
@@ -64,20 +61,6 @@ pub const Damage = struct {
     }
     pub fn set(d: *Damage, t: DamageType, v: f32) void {
         d.amt[t.idx()] = v;
-    }
-    pub fn addType(d: *Damage, t: DamageType, v: f32) void {
-        d.amt[t.idx()] += v;
-    }
-    pub fn total(d: Damage) f32 {
-        var s: f32 = 0;
-        for (d.amt) |v| s += v;
-        return s;
-    }
-    /// Scale every component by `k` (crit, buffs, etc.).
-    pub fn scaled(d: Damage, k: f32) Damage {
-        var out = d;
-        for (&out.amt) |*v| v.* *= k;
-        return out;
     }
 };
 
@@ -233,7 +216,7 @@ pub const Derived = struct {
     manaRegen: f32 = 0,
 
     meleeMult: f32 = 1, // multiply base melee damage
-    rangedMult: f32 = 1, // RESERVED: no hero ranged attack yet (dexterity's ranged half)
+    rangedMult: f32 = 1, // dexterity's ranged half: scales the Throwing Knife
     spellMult: f32 = 1, // multiply spell (firebolt) damage
     castSpeedMult: f32 = 1, // >1 = faster: divide attack/cast cooldowns by this
     cdrFrac: f32 = 0, // 0..CDR_CAP: multiply skill cooldowns by (1 - cdrFrac)
