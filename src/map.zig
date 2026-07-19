@@ -17,7 +17,7 @@ const lerpColor = mathx.lerpColor;
 // half a map). A line beginning with `#` is a comment (whole-line only — a `#` after
 // a payload is NOT stripped and will fail the trailing-data check).
 //
-//   version: 3
+//   version: 4
 //   name: The Blood Moor
 //   boss: Bishibosh
 //   size: 38 30                          (arena half-extents: width depth;
@@ -45,6 +45,13 @@ pub const MAX_PACKS = 64;
 pub const MAX_REGIONS = 24; // named rectangles (StarEdit "Locations") triggers key off
 pub const MAX_NPCS = 24; // placed townsfolk the conversation triggers address
 pub const MAX_MAPS = 32;
+
+// trigger.Runtime sizes its per-NPC/per-region flag arrays to RT_MAX_*; these caps must
+// not exceed them or near_npc/talked_to would index out of bounds (trigger.zig:40 note).
+comptime {
+    std.debug.assert(MAX_NPCS <= trigger.RT_MAX_NPCS);
+    std.debug.assert(MAX_REGIONS <= trigger.RT_MAX_REGIONS);
+}
 // Load-time clamps (see sanitize). Deliberately WIDER than the editor's steppers so
 // hand-edited/legacy maps stay welcome; the editor curates a tighter authoring range.
 pub const HALF_MIN = 12;
@@ -655,8 +662,9 @@ pub fn parseBuf(data: []const u8) LoadError!Map {
             return fail(lineNo, line, "trailing data");
         }
     }
-    // Legacy maps (no fm: lines) fill the whole grid with the base material.
-    if (floorCursor == 0) @memset(m.floorGrid[0..], @intFromEnum(m.floorBase));
+    // Fill any grid cells the fm: runs didn't cover (legacy maps have none; a hand-edited
+    // map may cover only part) with the base material, else the tail keeps the grass default.
+    if (floorCursor < m.floorGrid.len) @memset(m.floorGrid[floorCursor..], @intFromEnum(m.floorBase));
     if (!sawVersion) {
         std.debug.print("map load error: no 'version:' header\n", .{});
         return LoadError.BadHeader;

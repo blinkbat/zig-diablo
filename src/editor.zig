@@ -595,6 +595,17 @@ fn markDirty(g: *Game) void {
     apply(g);
 }
 
+// The pack/NPC/region edit modals all mutate g.map live and share this Done teardown: bank
+// an undo frame from the pre-modal snapshot ONLY if the edited record actually changed.
+fn bankEdit(g: *Game, before: *const mapmod.Map, changed: bool) void {
+    if (!changed) return;
+    const now = g.map;
+    g.map = before.*;
+    pushUndoFrom(&g.map);
+    g.map = now;
+    g.ed.dirty = true;
+}
+
 // Ground point under the mouse (terrain-aware, same picking as play).
 fn mousePoint(g: *Game) ?rl.Vector3 {
     const ray = rl.getScreenToWorldRay(rl.getMousePosition(), g.rig.cam);
@@ -771,7 +782,8 @@ fn placeNpc(g: *Game, p_in: rl.Vector3) bool {
 
 // Seed the modal text field with an existing name so an edit starts from it, not empty.
 fn seedField(ed: *Editor, s: []const u8) void {
-    const n = @min(s.len, ed.field_buf.len);
+    // Reserve the last byte: ui.textField NUL-terminates at buf[field_len].
+    const n = @min(s.len, ed.field_buf.len - 1);
     @memcpy(ed.field_buf[0..n], s[0..n]);
     ed.field_len = n;
 }
@@ -1327,8 +1339,13 @@ pub fn update(g: *Game, dt: f32) void {
     if (ed.modal != .none) {
         releaseGrab(g); // a modal opened mid pack-drag must not leave the grab armed
         if (rl.isKeyPressed(.escape)) {
-            // Esc = cancel: the pack modal edits live state, so restore it.
-            if (ed.modal == .pack_edit) g.map = packEditBefore;
+            // Esc = cancel: pack/NPC modals edit live state, so restore the snapshot.
+            switch (ed.modal) {
+                .pack_edit => g.map = packEditBefore,
+                .npc_edit => g.map = npcEditBefore,
+                .region_edit => g.map = regionEditBefore,
+                else => {},
+            }
             ed.modal = .none;
             // Clear pending, or a stale action fires on the NEXT successful save.
             ed.pending = .none;
@@ -2688,13 +2705,7 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
             }
             const done = ui.button(ctx, ui.rect(bx + 286, by + 172, 90, 30), "Done", 17, false) or rl.isKeyPressed(.enter);
             if (done and ed.modal == .pack_edit) {
-                if (!std.meta.eql(g.map.packs[ed.packEditIdx], packEditBefore.packs[ed.packEditIdx])) {
-                    const now = g.map;
-                    g.map = packEditBefore;
-                    pushUndoFrom(&g.map);
-                    g.map = now;
-                    ed.dirty = true;
-                }
+                bankEdit(g, &packEditBefore, !std.meta.eql(g.map.packs[ed.packEditIdx], packEditBefore.packs[ed.packEditIdx]));
                 ed.modal = .none;
             }
         },
@@ -2734,13 +2745,7 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
             const doneN = ui.button(ctx, ui.rect(bx + 336, by + 250, 100, 30), "Done", 17, false) or rl.isKeyPressed(.enter);
             if (doneN and ed.modal == .npc_edit) {
                 if (ed.field_len > 0) npc.name.set(ed.field_buf[0..ed.field_len]);
-                if (!std.meta.eql(g.map.npcs[ed.npcEditIdx], npcEditBefore.npcs[ed.npcEditIdx])) {
-                    const now = g.map;
-                    g.map = npcEditBefore;
-                    pushUndoFrom(&g.map);
-                    g.map = now;
-                    ed.dirty = true;
-                }
+                bankEdit(g, &npcEditBefore, !std.meta.eql(g.map.npcs[ed.npcEditIdx], npcEditBefore.npcs[ed.npcEditIdx]));
                 ed.modal = .none;
             }
         },
@@ -2769,13 +2774,7 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
             const doneR = ui.button(ctx, ui.rect(bx + 316, by + 178, 100, 30), "Done", 17, false) or rl.isKeyPressed(.enter);
             if (doneR and ed.modal == .region_edit) {
                 if (ed.field_len > 0) rg.name.set(ed.field_buf[0..ed.field_len]);
-                if (!std.meta.eql(g.map.regions[ed.regionEditIdx], regionEditBefore.regions[ed.regionEditIdx])) {
-                    const now = g.map;
-                    g.map = regionEditBefore;
-                    pushUndoFrom(&g.map);
-                    g.map = now;
-                    ed.dirty = true;
-                }
+                bankEdit(g, &regionEditBefore, !std.meta.eql(g.map.regions[ed.regionEditIdx], regionEditBefore.regions[ed.regionEditIdx]));
                 ed.modal = .none;
             }
         },

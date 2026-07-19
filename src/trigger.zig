@@ -174,11 +174,26 @@ pub const Store = struct {
     }
 
     // Swap-remove trigger i (mirrors map.swapRemove; runtime fired[] must be reset by the
-    // caller, since a swap moves a different trigger into slot i).
+    // caller, since a swap moves a different trigger into slot i). run_trigger refs are
+    // position-based, so they are remapped after the swap: refs to the removed trigger go
+    // out of range ("no trigger"), refs to the moved trigger follow it to slot i.
     pub fn removeTrigger(s: *Store, i: usize) void {
         std.debug.assert(i < s.trigger_count);
-        s.trigger_count -= 1;
-        s.triggers[i] = s.triggers[s.trigger_count];
+        const moved = s.trigger_count - 1;
+        s.trigger_count = moved;
+        s.triggers[i] = s.triggers[moved];
+        for (s.triggers[0..s.trigger_count]) |*t| {
+            for (t.acts[0..t.act_count]) |*a| switch (a.*) {
+                .run_trigger => |*id| {
+                    if (id.* == i) {
+                        id.* = @intCast(s.trigger_count); // removed → out of range
+                    } else if (id.* == moved) {
+                        id.* = @intCast(i); // moved into slot i
+                    }
+                },
+                else => {},
+            };
+        }
     }
 
     pub fn stringText(s: *const Store, id: u16) []const u8 {

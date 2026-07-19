@@ -498,6 +498,13 @@ const ACT_TYPES = [_]struct { tag: std.meta.Tag(trig.Act), label: [:0]const u8 }
     .{ .tag = .preserve, .label = "Preserve trigger" },
 };
 
+// The pickers are hand-maintained; pin their length to the union so a new Cond/Act variant
+// is a compile error here (not a variant silently missing from the Add menus).
+comptime {
+    std.debug.assert(COND_TYPES.len == @typeInfo(std.meta.Tag(trig.Cond)).@"enum".fields.len);
+    std.debug.assert(ACT_TYPES.len == @typeInfo(std.meta.Tag(trig.Act)).@"enum".fields.len);
+}
+
 fn drawTypePicker(g: *Game, ctx: *ui.Ctx) void {
     const isCond = typePick == .cond;
     const n: i32 = if (isCond) COND_TYPES.len else ACT_TYPES.len;
@@ -538,18 +545,20 @@ fn addAct(g: *Game, tag: std.meta.Tag(trig.Act)) void {
     const t = &store.triggers[g.ed.trigSel];
     if (t.act_count >= trig.MAX_TRIG_ACTS) return;
     const a: trig.Act = switch (tag) {
-        .say => .{ .say = .{ .npc = 0, .text = store.addString("New line.") orelse 0 } },
-        .choice => .{ .choice = store.addString("Choice") orelse 0 },
+        // orelse return on a full string pool: appending an action that aliases string 0
+        // would corrupt that slot when the user later edits this action's text.
+        .say => .{ .say = .{ .npc = 0, .text = store.addString("New line.") orelse return } },
+        .choice => .{ .choice = store.addString("Choice") orelse return },
         .end_choice => .end_choice,
         .end_dialogue => .end_dialogue,
-        .message => .{ .message = store.addString("Message.") orelse 0 },
+        .message => .{ .message = store.addString("Message.") orelse return },
         .set_switch => .{ .set_switch = .{ .s = ensureSwitch(g), .mode = .on } },
         .set_counter => .{ .set_counter = .{ .c = ensureCounter(g), .mode = .set, .n = 1 } },
         .grant_skill => .{ .grant_skill = .firebolt },
         .spawn => .{ .spawn = .{ .kind = .fallen, .count = 3, .region = 0 } },
         .teleport => .{ .teleport = 0 },
         .center_cam => .{ .center_cam = 0 },
-        .set_objective => .{ .set_objective = store.addString("Objective.") orelse 0 },
+        .set_objective => .{ .set_objective = store.addString("Objective.") orelse return },
         .run_trigger => .{ .run_trigger = 0 },
         .preserve => .preserve,
     };

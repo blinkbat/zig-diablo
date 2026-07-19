@@ -725,6 +725,8 @@ pub const Game = struct {
 // values/flags live in g.trig (a trigger.Runtime), reset by resetArena.
 
 pub const TALK_RANGE: f32 = 2.6; // how close the hero must be to talk to an NPC
+const TALK_RANGE_SQ: f32 = TALK_RANGE * TALK_RANGE; // squared, for the distance tests below
+const PORTAL_REACH: f32 = 2.4; // how close the hero must be to step through an area portal
 const TRIGGER_CADENCE: f32 = 0.2; // seconds between passive trigger-loop evaluations
 const MSG_BANNER_DUR: f32 = 2.6; // how long a `message` action holds on screen
 const MAX_TRIGGER_CHAIN: u32 = 32; // run_trigger recursion guard
@@ -775,7 +777,7 @@ fn condTrue(g: *Game, c: trigmod.Cond) bool {
 
 fn npcInTalkRange(g: *Game, id: u16) bool {
     if (id >= g.map.npc_count) return false;
-    return dist2XZ(g.p.Pos, g.map.npcs[id].pos()) <= TALK_RANGE * TALK_RANGE;
+    return dist2XZ(g.p.Pos, g.map.npcs[id].pos()) <= TALK_RANGE_SQ;
 }
 
 fn elapsedHolds(elapsed: f32, op: trigmod.Op, secs: f32) bool {
@@ -882,8 +884,8 @@ fn applyImmediate(g: *Game, a: trigmod.Act) void {
         .set_counter => |x| {
             if (x.c < r.counters.len) r.counters[x.c] = switch (x.mode) {
                 .set => x.n,
-                .add => r.counters[x.c] + x.n,
-                .sub => r.counters[x.c] - x.n,
+                .add => r.counters[x.c] +% x.n, // authored i32s: wrap, don't panic
+                .sub => r.counters[x.c] -% x.n,
             };
         },
         .grant_skill => |sk| {
@@ -959,7 +961,7 @@ fn updateDialogue(g: *Game) void {
 fn tryInteract(g: *Game) void {
     if (!input.interactPressed()) return;
     var best: ?u16 = null;
-    var bestD2: f32 = TALK_RANGE * TALK_RANGE;
+    var bestD2: f32 = TALK_RANGE_SQ;
     for (g.map.npcList(), 0..) |npc, idx| {
         const d2 = dist2XZ(g.p.Pos, npc.pos());
         if (d2 <= bestD2) {
@@ -2307,7 +2309,7 @@ fn updatePortal(g: *Game) void {
     // Lingering gas or a last arrow can kill the same frame the hero reaches the ring —
     // death must win over the portal. Same-ground gate like melee/loot: a hero on a
     // ledge above the ring must not fall through the cliff into the vortex.
-    if (g.w.PortalOpen and g.p.alive() and distXZ(g.p.Pos, g.w.PortalPos) < 2.4 and
+    if (g.w.PortalOpen and g.p.alive() and distXZ(g.p.Pos, g.w.PortalPos) < PORTAL_REACH and
         sameGroundY(g.p.Pos.y, g.w.groundY(g.w.PortalPos.x, g.w.PortalPos.z)))
     {
         if (g.playtest) {
@@ -2570,6 +2572,13 @@ fn drawHeroFX(p: *const Player, t: f32) void {
     groundRing(v3(base.x, 0.045, base.z), playermod.radius + 0.15, rgba(150, 190, 255, 90));
 }
 
+// Rampart stone profile, all derived from world.MASONRY — frame-invariant, so computed
+// once at comptime instead of re-lerping four colors every frame in drawWalls.
+const WALL_CAP = lerpColor(world.MASONRY, rgba(170, 168, 160, 255), 0.3);
+const WALL_PLINTH = lerpColor(world.MASONRY, rl.Color.black, 0.35);
+const WALL_PIER = lerpColor(world.MASONRY, rl.Color.black, 0.18);
+const WALL_PIER_CAP = lerpColor(WALL_CAP, rl.Color.white, 0.06);
+
 pub fn drawWalls(w: *const world.World) void {
     const hw = w.HalfW;
     const hd = w.HalfD;
@@ -2586,16 +2595,16 @@ pub fn drawWalls(w: *const world.World) void {
         v3(t, wallH, hd * 2 + t), v3(t, wallH, hd * 2 + t),
     };
     // Stone profile per rampart: a paler capstone overhanging the top, a darker plinth at the foot.
-    const cap = lerpColor(col, rgba(170, 168, 160, 255), 0.3);
-    const plinth = lerpColor(col, rl.Color.black, 0.35);
+    const cap = WALL_CAP;
+    const plinth = WALL_PLINTH;
     for (segs, sizes) |seg, size| {
         rl.drawCubeV(seg, size, col);
         rl.drawCubeV(v3(seg.x, wallH + 0.14, seg.z), v3(size.x + 0.35, 0.28, size.z + 0.35), cap);
         rl.drawCubeV(v3(seg.x, 0.3, seg.z), v3(size.x + 0.22, 0.6, size.z + 0.22), plinth);
     }
     // Buttress piers every few strides give the ramparts a masonry rhythm instead of one slab.
-    const pier = lerpColor(col, rl.Color.black, 0.18);
-    const pierCap = lerpColor(cap, rl.Color.white, 0.06);
+    const pier = WALL_PIER;
+    const pierCap = WALL_PIER_CAP;
     var px: f32 = -hw;
     while (px <= hw + 0.1) : (px += 9.0) {
         for ([_]f32{ -hd, hd }) |edge| {
@@ -3345,21 +3354,22 @@ pub fn drawPortal(w: *const world.World, t: f32) void {
     }
 }
 
+// Per-area firefly swarm color (one per campaign map, areaIndex-keyed): moor green, plains
+// wisps, stony amber, dark-wood green, catacomb violet. Frame-invariant — module const.
+const FIREFLY_COLS = [_]rl.Color{
+    rgba(180, 220, 100, 255),
+    rgba(170, 205, 255, 255),
+    rgba(205, 210, 120, 255),
+    rgba(150, 235, 110, 255),
+    rgba(165, 150, 255, 255),
+};
+
 // Fireflies: tiny blinking lights adrift OUTSIDE the torch disc. Pure function of
 // time+index (no state), each wandering a slow lissajous around a fixed seat, so the
 // unexplored black reads as living night.
 fn drawFireflies(g: *const Game, t: f32) void {
-    // Per-area swarm color (one per campaign map, areaIndex-keyed): moor green, plains
-    // wisps, stony amber, dark-wood green, catacomb violet.
-    const cols = [_]rl.Color{
-        rgba(180, 220, 100, 255),
-        rgba(170, 205, 255, 255),
-        rgba(205, 210, 120, 255),
-        rgba(150, 235, 110, 255),
-        rgba(165, 150, 255, 255),
-    };
     const DARK_WOOD_AREA = 3; // campaign-order index of the map whose swarm teems (keyed to maps/*.map order)
-    const col = cols[g.areaIndex % cols.len];
+    const col = FIREFLY_COLS[g.areaIndex % FIREFLY_COLS.len];
     const n: usize = if (g.areaIndex == DARK_WOOD_AREA) 26 else 16;
     const halfW = g.w.HalfW - 4;
     const halfD = g.w.HalfD - 4;

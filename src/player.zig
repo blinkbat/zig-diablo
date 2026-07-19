@@ -236,6 +236,7 @@ pub const SkillBar = struct {
     /// it's first removed from any other slot — assigning Firebolt to a new button pulls
     /// it off its old one rather than leaving a phantom copy behind.
     pub fn assign(b: *SkillBar, slot: usize, s: ?Skill) void {
+        if (slot >= b.slots.len) return;
         if (s) |sk| {
             for (&b.slots) |*e| {
                 if (e.* == sk) e.* = null;
