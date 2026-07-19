@@ -227,6 +227,12 @@ pub fn cancel() bool {
 pub fn startPressed() bool {
     return padPressed(.middle_right);
 }
+/// Interact / talk to the nearest NPC. Keyboard T (mnemonic "talk"); on the pad, D-pad Up.
+/// Both are free in play — the six skill slots own the face buttons, bumpers, Q/E/R/F, and
+/// the mouse — so this can't shadow a combat input.
+pub fn interactPressed() bool {
+    return rl.isKeyPressed(.t) or padPressed(.left_face_up);
+}
 /// Restart from the death screen.
 pub fn restartPressed(altHeld: bool) bool {
     return rl.isKeyPressed(.r) or confirm(altHeld);

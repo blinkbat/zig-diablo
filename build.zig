@@ -34,4 +34,21 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Build and run zig-diablo");
     run_step.dependOn(&run_cmd.step);
+
+    // `zig build test` — run every `test { ... }` block reachable from src/main.zig
+    // (e.g. input.zig nav math, trigger.zig serialization round-trip). Same raylib wiring
+    // as the exe so files that import raylib still compile under the test runner.
+    const unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    unit_tests.linkLibrary(raylib_artifact);
+    unit_tests.root_module.addImport("raylib", raylib);
+    unit_tests.root_module.addImport("raygui", raygui);
+    const run_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
 }

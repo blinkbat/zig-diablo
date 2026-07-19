@@ -4,6 +4,7 @@ const mathx = @import("mathx.zig");
 const world = @import("world.zig");
 const monster = @import("monster.zig");
 const torchlight = @import("torchlight.zig");
+const trigger = @import("trigger.zig");
 
 const v3 = mathx.v3;
 const rgba = mathx.rgba;
@@ -39,8 +40,10 @@ const lerpColor = mathx.lerpColor;
 // + a position hash (same look every load); the GROUND look is entirely the floor
 // materials, painted procedurally in the scene shader.
 
-pub const FORMAT_VERSION = 3; // v3: floor materials replace ground/accent; v1/v2 still load
+pub const FORMAT_VERSION = 4; // v4: paintable floor grid (floorbase/fm) replaces the floor set; v1-v3 still load
 pub const MAX_PACKS = 64;
+pub const MAX_REGIONS = 24; // named rectangles (StarEdit "Locations") triggers key off
+pub const MAX_NPCS = 24; // placed townsfolk the conversation triggers address
 pub const MAX_MAPS = 32;
 // Load-time clamps (see sanitize). Deliberately WIDER than the editor's steppers so
 // hand-edited/legacy maps stay welcome; the editor curates a tighter authoring range.
@@ -76,6 +79,50 @@ pub const Pack = struct {
     }
 };
 
+pub const REGION_NAME_CAP = 28;
+pub const NPC_NAME_CAP = 28;
+
+// A named rectangle on the ground plane — StarEdit's "Location". Triggers test whether the
+// hero is inside one, and actions spawn/teleport/center relative to one.
+pub const Region = struct {
+    name: StrBuf(REGION_NAME_CAP) = .{},
+    minX: f32 = 0,
+    minZ: f32 = 0,
+    maxX: f32 = 0,
+    maxZ: f32 = 0,
+
+    pub fn cx(r: Region) f32 {
+        return (r.minX + r.maxX) / 2;
+    }
+    pub fn cz(r: Region) f32 {
+        return (r.minZ + r.maxZ) / 2;
+    }
+    pub fn center(r: Region) rl.Vector3 {
+        return v3(r.cx(), 0, r.cz());
+    }
+    pub fn contains(r: Region, x: f32, z: f32) bool {
+        return world.inRect(r.minX, r.maxX, r.minZ, r.maxZ, x, z);
+    }
+};
+
+// Portrait/body archetype for a townsperson; drives the drawn body tint and the dialogue
+// portrait. Extend freely (add to the editor's NPC brush list to place a new kind).
+pub const NpcKind = enum(u8) { villager, elder, merchant, guard, blacksmith, wizard };
+
+// A placed, non-combat townsperson. Not a Monster: it never fights, and the player TALKS to
+// it (an interact fires the trigger(s) whose conditions name this NPC).
+pub const Npc = struct {
+    name: StrBuf(NPC_NAME_CAP) = .{},
+    kind: NpcKind = .villager,
+    x: f32 = 0,
+    z: f32 = 0,
+    facing: f32 = 0, // heading in degrees (0 = -Z, matching the hero's default facing)
+
+    pub fn pos(n: Npc) rl.Vector3 {
+        return v3(n.x, 0, n.z);
+    }
+};
+
 pub const MAP_NAME_CAP = 48; // display-name cap; independent of monster.NAME_CAP (boss name)
 
 // Fresh-map arena half-extents; the anchor defaults below derive from this + the
@@ -88,7 +135,11 @@ pub const Map = struct {
     boss: StrBuf(monster.NAME_CAP) = .{}, // copied into Monster.name; caps must match
     halfW: f32 = DEFAULT_HALF,
     halfD: f32 = DEFAULT_HALF,
-    floor: world.FloorSet = DEFAULT_FLOOR,
+    // Ground: a per-cell material grid painted in the editor (replaces the old 3-material
+    // "theme" blend). floorBase fills fresh/erased cells and drives the decor-tint & minimap
+    // tone. Row-major [z*FLOOR_RES + x] over the arena. See world.FLOOR_RES.
+    floorGrid: [world.FLOOR_RES * world.FLOOR_RES]u8 = [_]u8{@intFromEnum(world.FloorMat.grass)} ** (world.FLOOR_RES * world.FLOOR_RES),
+    floorBase: world.FloorMat = .grass,
     light: [3]f32 = torchlight.DEFAULT_LIGHT,
     spawn: rl.Vector3 = v3(0, 0, DEFAULT_HALF - SPAWN_INSET),
     portal: rl.Vector3 = v3(0, 0, -(DEFAULT_HALF - PORTAL_INSET)),
@@ -103,9 +154,22 @@ pub const Map = struct {
     decor_count: usize = 0,
     packs: [MAX_PACKS]Pack = undefined,
     pack_count: usize = 0,
+    regions: [MAX_REGIONS]Region = undefined,
+    region_count: usize = 0,
+    npcs: [MAX_NPCS]Npc = undefined,
+    npc_count: usize = 0,
+    // Authored town/quest logic (triggers, switches, counters, dialogue strings). Embedded
+    // by value — all fixed arrays — so the editor's whole-Map undo + live-preview cover it.
+    trig: trigger.Store = .{},
 
     pub fn packList(self: *const Map) []const Pack {
         return self.packs[0..self.pack_count];
+    }
+    pub fn regionList(self: *const Map) []const Region {
+        return self.regions[0..self.region_count];
+    }
+    pub fn npcList(self: *const Map) []const Npc {
+        return self.npcs[0..self.npc_count];
     }
 
     // Swap-remove helpers, one idiom for the editor's many delete sites. See swapRemove
@@ -124,6 +188,46 @@ pub const Map = struct {
     }
     pub fn removeRamp(self: *Map, i: usize) void {
         swapRemove(self.ramps[0..], &self.ramp_count, i);
+    }
+    pub fn removeRegion(self: *Map, i: usize) void {
+        swapRemove(self.regions[0..], &self.region_count, i);
+    }
+    pub fn removeNpc(self: *Map, i: usize) void {
+        swapRemove(self.npcs[0..], &self.npc_count, i);
+    }
+
+    // Fill the whole floor grid with one material (New Map / clear).
+    pub fn floorFill(self: *Map, mat: world.FloorMat) void {
+        @memset(self.floorGrid[0..], @intFromEnum(mat));
+    }
+
+    // Paint every floor cell within `radius` world-units of (x,z) to `mat`. Returns whether any
+    // cell changed, so the editor banks undo + re-uploads only on a real edit.
+    pub fn floorPaint(self: *Map, x: f32, z: f32, radius: f32, mat: world.FloorMat) bool {
+        const id = @intFromEnum(mat);
+        const resf: f32 = world.FLOOR_RES;
+        const cellW = (2 * self.halfW) / resf;
+        const cellD = (2 * self.halfD) / resf;
+        const r2 = radius * radius;
+        var changed = false;
+        var czi: usize = 0;
+        while (czi < world.FLOOR_RES) : (czi += 1) {
+            const cz = -self.halfD + (@as(f32, @floatFromInt(czi)) + 0.5) * cellD;
+            if (@abs(cz - z) > radius) continue;
+            var cxi: usize = 0;
+            while (cxi < world.FLOOR_RES) : (cxi += 1) {
+                const cx = -self.halfW + (@as(f32, @floatFromInt(cxi)) + 0.5) * cellW;
+                const dx = cx - x;
+                const dz = cz - z;
+                if (dx * dx + dz * dz > r2) continue;
+                const idx = czi * world.FLOOR_RES + cxi;
+                if (self.floorGrid[idx] != id) {
+                    self.floorGrid[idx] = id;
+                    changed = true;
+                }
+            }
+        }
+        return changed;
     }
 };
 
@@ -179,7 +283,7 @@ fn obstacleTint(m: *const Map, kind: world.ObstacleKind, x: f32, z: f32) rl.Colo
 }
 
 fn decorTint(m: *const Map, kind: world.DecorKind, x: f32, z: f32) rl.Color {
-    const groundTone = world.FloorMat.base(m.floor[0]);
+    const groundTone = world.FloorMat.base(m.floorBase);
     return switch (kind) {
         .pebble => lerpColor(rgba(96, 92, 84, 255), rgba(66, 62, 56, 255), hash01(x, z, 2)),
         .tuft => lerpColor(groundTone, rgba(105, 140, 70, 255), 0.4 + hash01(x, z, 3) * 0.3),
@@ -201,7 +305,6 @@ pub fn toWorld(m: *const Map, isLast: bool) world.World {
     var w = world.World{
         .HalfW = m.halfW,
         .HalfD = m.halfD,
-        .Floor = m.floor,
         .PortalPos = v3(m.portal.x, 0, m.portal.z),
         .IsLast = isLast,
     };
@@ -236,7 +339,9 @@ const K = struct {
     const boss = "boss";
     const size = "size";
     const half = "half"; // legacy v1 square arena, read-only
-    const floor = "floor";
+    const floor = "floor"; // legacy v1-v3 3-material set; now read as floorBase (rest discarded)
+    const floorbase = "floorbase"; // fill material + decor/minimap tone
+    const fm = "fm"; // one RLE run of the paintable floor grid: <material> <count>
     const ground = "ground"; // legacy v1/v2 palette, read-and-discarded
     const accent = "accent"; // legacy v1/v2 palette, read-and-discarded
     const light = "light";
@@ -248,6 +353,10 @@ const K = struct {
     const ob = "ob";
     const decor = "decor";
     const pack = "pack";
+    const region = "region";
+    const npc = "npc";
+    // Trigger-layer keys (str/switch/counter/trig/tcond/tact) are owned + spelled by
+    // trigger.zig; map.load delegates them via trigger.parseLine.
 };
 
 pub fn save(m: *const Map, path: []const u8) !void {
@@ -261,12 +370,29 @@ pub fn save(m: *const Map, path: []const u8) !void {
 
     const f = try std.fs.cwd().createFile(path, .{});
     defer f.close();
-    const w = f.writer();
+    try writeMap(f.writer(), m);
+}
+
+// Serialize a map to any writer — shared by save() (to a file) and the round-trip test (to
+// a buffer), so the on-disk format and what the test exercises can never drift apart.
+pub fn writeMap(w: anytype, m: *const Map) !void {
     try w.print(K.version ++ ": {d}\n", .{FORMAT_VERSION});
     try w.print(K.name ++ ": {s}\n", .{m.name.slice()});
     try w.print(K.boss ++ ": {s}\n", .{m.boss.slice()});
     try w.print(K.size ++ ": {d:.1} {d:.1}\n", .{ m.halfW, m.halfD });
-    try w.print(K.floor ++ ": {s} {s} {s}\n", .{ @tagName(m.floor[0]), @tagName(m.floor[1]), @tagName(m.floor[2]) });
+    try w.print(K.floorbase ++ ": {s}\n", .{@tagName(m.floorBase)});
+    // Paintable floor grid, RLE by run of equal cells (a fresh all-grass map is one line).
+    {
+        var i: usize = 0;
+        while (i < m.floorGrid.len) {
+            const v = m.floorGrid[i];
+            var run: usize = 1;
+            while (i + run < m.floorGrid.len and m.floorGrid[i + run] == v) run += 1;
+            const mat: world.FloorMat = @enumFromInt(@min(v, world.FloorMat.count - 1));
+            try w.print(K.fm ++ ": {s} {d}\n", .{ @tagName(mat), run });
+            i += run;
+        }
+    }
     try w.print(K.light ++ ": {d:.2} {d:.2} {d:.2}\n", .{ m.light[0], m.light[1], m.light[2] });
     try w.print(K.spawn ++ ": {d:.1} {d:.1}\n", .{ m.spawn.x, m.spawn.z });
     try w.print(K.portal ++ ": {d:.1} {d:.1}\n", .{ m.portal.x, m.portal.z });
@@ -286,6 +412,14 @@ pub fn save(m: *const Map, path: []const u8) !void {
     for (m.packs[0..m.pack_count]) |p| {
         try w.print(K.pack ++ ": {s} {d} {d:.1} {d:.1}\n", .{ @tagName(p.kind), p.count, p.x, p.z });
     }
+    for (m.regions[0..m.region_count]) |r| {
+        try w.print(K.region ++ ": {d:.1} {d:.1} {d:.1} {d:.1} {s}\n", .{ r.minX, r.minZ, r.maxX, r.maxZ, r.name.slice() });
+    }
+    for (m.npcs[0..m.npc_count]) |n| {
+        try w.print(K.npc ++ ": {s} {d:.1} {d:.1} {d:.1} {s}\n", .{ @tagName(n.kind), n.x, n.z, n.facing, n.name.slice() });
+    }
+    // Trigger layer writes its own str/switch/counter/trig/tcond/tact lines last.
+    try trigger.saveInto(w, &m.trig);
 }
 
 // ---- Loading ----
@@ -311,6 +445,11 @@ fn nextF32(it: *std.mem.TokenIterator(u8, .scalar)) !f32 {
 fn nextU8(it: *std.mem.TokenIterator(u8, .scalar)) !u8 {
     const tok = it.next() orelse return LoadError.BadLine;
     return std.fmt.parseInt(u8, tok, 10) catch LoadError.BadLine;
+}
+
+fn nextUsize(it: *std.mem.TokenIterator(u8, .scalar)) !usize {
+    const tok = it.next() orelse return LoadError.BadLine;
+    return std.fmt.parseInt(usize, tok, 10) catch LoadError.BadLine;
 }
 
 fn nextEnum(comptime T: type, it: *std.mem.TokenIterator(u8, .scalar)) !T {
@@ -341,12 +480,48 @@ fn isFreeText(key: []const u8) bool {
     return std.mem.eql(u8, key, K.name) or std.mem.eql(u8, key, K.boss);
 }
 
+// Region/Npc lines: a few fixed tokens then a free-text NAME tail (read via it.rest()).
+// Returns .not_mine WITHOUT touching `it` for other keys, so map.load's own chain still
+// sees a pristine iterator. Reuses trigger.ParseResult (same three-way shape).
+fn parseTownLine(m: *Map, key: []const u8, it: *std.mem.TokenIterator(u8, .scalar)) trigger.ParseResult {
+    if (std.mem.eql(u8, key, K.region)) {
+        if (m.region_count >= MAX_REGIONS) return .bad;
+        var r = Region{};
+        r.minX = nextF32(it) catch return .bad;
+        r.minZ = nextF32(it) catch return .bad;
+        r.maxX = nextF32(it) catch return .bad;
+        r.maxZ = nextF32(it) catch return .bad;
+        r.name.set(std.mem.trimLeft(u8, it.rest(), " "));
+        m.regions[m.region_count] = r;
+        m.region_count += 1;
+        return .handled;
+    } else if (std.mem.eql(u8, key, K.npc)) {
+        if (m.npc_count >= MAX_NPCS) return .bad;
+        var n = Npc{};
+        n.kind = nextEnum(NpcKind, it) catch return .bad;
+        n.x = nextF32(it) catch return .bad;
+        n.z = nextF32(it) catch return .bad;
+        n.facing = nextF32(it) catch return .bad;
+        n.name.set(std.mem.trimLeft(u8, it.rest(), " "));
+        m.npcs[m.npc_count] = n;
+        m.npc_count += 1;
+        return .handled;
+    }
+    return .not_mine;
+}
+
 pub fn load(path: []const u8) LoadError!Map {
     const data = std.fs.cwd().readFileAlloc(alloc, path, 1 << 20) catch return LoadError.ReadFailed;
     defer alloc.free(data);
+    return parseBuf(data);
+}
 
+// Parse a map from an in-memory buffer — the body of load(), split out so it round-trips
+// against writeMap() in a unit test without touching disk.
+pub fn parseBuf(data: []const u8) LoadError!Map {
     var m = Map{};
     var sawVersion = false;
+    var floorCursor: usize = 0; // fill position for the fm: RLE runs
     var lines = std.mem.splitScalar(u8, data, '\n');
     var lineNo: usize = 0;
     while (lines.next()) |raw| {
@@ -357,6 +532,21 @@ pub fn load(path: []const u8) LoadError!Map {
         const key = std.mem.trim(u8, line[0..colon], " ");
         const rest = std.mem.trim(u8, line[colon + 1 ..], " ");
         var it = std.mem.tokenizeScalar(u8, rest, ' ');
+
+        // Town data (region/npc) and the trigger layer own a set of keys with free-text
+        // tails; they validate + consume the line themselves, so a `.handled` line skips
+        // the tokenized if/else AND the trailing-data check below. On `.not_mine` neither
+        // touched `it`, so the chain proceeds unaffected.
+        switch (parseTownLine(&m, key, &it)) {
+            .handled => continue,
+            .bad => return fail(lineNo, line, "bad region/npc line"),
+            .not_mine => {},
+        }
+        switch (trigger.parseLine(&m.trig, key, &it)) {
+            .handled => continue,
+            .bad => return fail(lineNo, line, "bad trigger line"),
+            .not_mine => {},
+        }
 
         if (std.mem.eql(u8, key, K.version)) {
             const ver = nextF32(&it) catch return fail(lineNo, line, "bad version");
@@ -379,7 +569,20 @@ pub fn load(path: []const u8) LoadError!Map {
             m.halfW = nextF32(&it) catch return fail(lineNo, line, "bad half");
             m.halfD = m.halfW;
         } else if (std.mem.eql(u8, key, K.floor)) {
-            for (&m.floor) |*fm| fm.* = nextEnum(world.FloorMat, &it) catch return fail(lineNo, line, "bad floor material");
+            // Legacy v1-v3 3-material set: keep the PRIMARY as the base fill, discard the rest.
+            m.floorBase = nextEnum(world.FloorMat, &it) catch return fail(lineNo, line, "bad floor material");
+            _ = nextEnum(world.FloorMat, &it) catch return fail(lineNo, line, "bad floor material");
+            _ = nextEnum(world.FloorMat, &it) catch return fail(lineNo, line, "bad floor material");
+        } else if (std.mem.eql(u8, key, K.floorbase)) {
+            m.floorBase = nextEnum(world.FloorMat, &it) catch return fail(lineNo, line, "bad floorbase");
+        } else if (std.mem.eql(u8, key, K.fm)) {
+            const mat = nextEnum(world.FloorMat, &it) catch return fail(lineNo, line, "bad floor tile");
+            const cnt = nextUsize(&it) catch return fail(lineNo, line, "bad floor run");
+            var k: usize = 0;
+            while (k < cnt and floorCursor < m.floorGrid.len) : (k += 1) {
+                m.floorGrid[floorCursor] = @intFromEnum(mat);
+                floorCursor += 1;
+            }
         } else if (std.mem.eql(u8, key, K.ground) or std.mem.eql(u8, key, K.accent)) {
             // Legacy v1/v2 palette: parse (so trailing-data checks still bite) and
             // discard — the floor materials own the ground look now.
@@ -452,8 +655,10 @@ pub fn load(path: []const u8) LoadError!Map {
             return fail(lineNo, line, "trailing data");
         }
     }
+    // Legacy maps (no fm: lines) fill the whole grid with the base material.
+    if (floorCursor == 0) @memset(m.floorGrid[0..], @intFromEnum(m.floorBase));
     if (!sawVersion) {
-        std.debug.print("map load error: {s} has no 'version:' header\n", .{path});
+        std.debug.print("map load error: no 'version:' header\n", .{});
         return LoadError.BadHeader;
     }
     sanitize(&m);
@@ -511,6 +716,27 @@ fn sanitize(m: *Map) void {
         p.x = std.math.clamp(p.x, -hw, hw);
         p.z = std.math.clamp(p.z, -hd, hd);
     }
+    for (m.regions[0..m.region_count]) |*r| {
+        if (r.minX > r.maxX) std.mem.swap(f32, &r.minX, &r.maxX);
+        if (r.minZ > r.maxZ) std.mem.swap(f32, &r.minZ, &r.maxZ);
+        r.minX = std.math.clamp(r.minX, -hw, hw);
+        r.maxX = std.math.clamp(r.maxX, -hw, hw);
+        r.minZ = std.math.clamp(r.minZ, -hd, hd);
+        r.maxZ = std.math.clamp(r.maxZ, -hd, hd);
+        if (r.name.len == 0) r.name.set("Region");
+    }
+    for (m.npcs[0..m.npc_count]) |*n| {
+        n.x = std.math.clamp(n.x, -hw, hw);
+        n.z = std.math.clamp(n.z, -hd, hd);
+        if (n.name.len == 0) n.name.set("Stranger");
+    }
+    // A hand-edited fm: run could name an out-of-range id; collapse it to the base material.
+    for (m.floorGrid[0..]) |*c| {
+        if (c.* >= world.FloorMat.count) c.* = @intFromEnum(m.floorBase);
+    }
+    // Collapse any hand-edited trigger ref that points past the pools it names, so a bogus
+    // index can't read out of bounds when the trigger runtime dereferences it.
+    trigger.sanitize(&m.trig, m.region_count, m.npc_count);
 }
 
 /// The campaign: every maps/*.map, lexicographically ordered (name files 01_xxx.map,
@@ -547,4 +773,47 @@ pub fn listCampaign(paths: *[MAX_MAPS][PATH_CAP]u8, lens: *[MAX_MAPS]usize) usiz
         }
     }
     return n;
+}
+
+test "map writeMap→parseBuf round-trips town data (region, npc, conversation trigger)" {
+    const t = std.testing;
+    var m = Map{};
+    m.name.set("Test Town");
+    m.boss.set("None");
+    m.regions[0] = .{ .minX = -4, .minZ = 26, .maxX = 4, .maxZ = 29 };
+    m.regions[0].name.set("Town Gate");
+    m.region_count = 1;
+    m.npcs[0] = .{ .kind = .elder, .x = 0, .z = 24, .facing = 180 };
+    m.npcs[0].name.set("Old Marius");
+    m.npc_count = 1;
+
+    const greet = m.trig.addString("Winter's been cruel, friend.").?;
+    const learn = m.trig.addString("Teach me firebolt.").?;
+    _ = m.trig.addSwitch("MetElder").?;
+    const tr = m.trig.addTrigger("Greet the elder").?;
+    tr.conds[0] = .{ .on_talk = 0 };
+    tr.cond_count = 1;
+    tr.acts[0] = .{ .say = .{ .npc = 0, .text = greet } };
+    tr.acts[1] = .{ .choice = learn };
+    tr.acts[2] = .{ .grant_skill = .firebolt };
+    tr.acts[3] = .end_choice;
+    tr.acts[4] = .end_dialogue;
+    tr.act_count = 5;
+
+    var buf: [8192]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeMap(fbs.writer(), &m);
+    const m2 = try parseBuf(fbs.getWritten());
+
+    try t.expectEqual(@as(usize, 1), m2.region_count);
+    try t.expectEqualStrings("Town Gate", m2.regions[0].name.slice());
+    try t.expectEqual(@as(usize, 1), m2.npc_count);
+    try t.expect(m2.npcs[0].kind == .elder);
+    try t.expectEqualStrings("Old Marius", m2.npcs[0].name.slice());
+    try t.expectEqual(@as(usize, 1), m2.trig.trigger_count);
+    try t.expectEqualStrings("Greet the elder", m2.trig.triggers[0].name.slice());
+    try t.expectEqual(@as(usize, 5), m2.trig.triggers[0].act_count);
+    try t.expect(m2.trig.triggers[0].conds[0] == .on_talk);
+    try t.expect(m2.trig.triggers[0].acts[2].grant_skill == .firebolt);
+    try t.expectEqualStrings("Winter's been cruel, friend.", m2.trig.stringText(greet));
 }

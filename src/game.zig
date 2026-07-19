@@ -18,6 +18,7 @@ const hudx = @import("hudx.zig");
 const theme = @import("theme.zig");
 const rumble = @import("rumble.zig");
 const particles = @import("particles.zig");
+const trigmod = @import("trigger.zig");
 
 const Monster = monster.Monster;
 const Projectile = projectile.Projectile;
@@ -272,8 +273,15 @@ fn updateSkillsTab(g: *Game, altHeld: bool) void {
                 const s = playermod.Skill.all[@intCast(g.skillPoolSel)];
                 const slot: usize = @intCast(g.skillSel);
                 // Toggle: the skill already on this button clears it; anything else binds
-                // (assign pulls it off its old button, keeping each skill unique).
-                g.p.bar.assign(slot, if (g.p.bar.slots[slot] == s) null else s);
+                // (assign pulls it off its old button, keeping each skill unique). You can
+                // only bind a skill you OWN — an unowned one is locked until acquired.
+                if (g.p.bar.slots[slot] == s) {
+                    g.p.bar.assign(slot, null);
+                } else if (g.p.owns(s)) {
+                    g.p.bar.assign(slot, s);
+                } else {
+                    g.setToast("{s} is locked — acquire it first", .{s.label()});
+                }
             }
         },
     }
@@ -350,7 +358,7 @@ const MELEE_LUNGE = 0.35;
 const MONSTER_HIT_FRAC = 0.55;
 const MONSTER_HIT_PAD = 0.7;
 fn meleeReach(atkRange: f32, targetRadius: f32) f32 {
-    return atkRange + targetRadius + MELEE_LUNGE;
+    return baseReach(atkRange, targetRadius) + MELEE_LUNGE; // base reach plus the lunge, one formula
 }
 
 // Red a monster's BODY flushes toward through windup and swing (the ground rings,
@@ -437,6 +445,10 @@ pub const Game = struct {
     mapCount: usize = 0,
     areaIndex: usize = 0,
     lastArea: usize,
+    // Town/quest trigger runtime for the CURRENT area: switch/counter values, fired flags,
+    // per-NPC talk flags, and the live dialogue box. Authored logic is in map.trig; this is
+    // the per-run state, reset by resetArena. See triggerTick / updateDialogue.
+    trig: trigmod.Runtime = .{},
     ed: editor.Editor = .{},
     playtest: bool = false, // playing FROM the editor: all exits lead back to it
 
@@ -526,9 +538,10 @@ pub const Game = struct {
         g.p = playermod.newPlayer(g.map.spawn);
         g.loadout = playermod.SkillBar.load(SKILLBAR_PATH); // persisted bindings (or defaults)
         g.p.bar = g.loadout;
+        g.p.retainOwned(); // never bind a persisted skill the fresh hero doesn't own yet
         g.areaIndex = 0;
         g.torch.setLightColor(g.map.light);
-        g.torch.setFloorSet(g.map.floor);
+        g.torch.uploadFloorMats(&g.map.floorGrid, g.map.halfW, g.map.halfD);
         g.spawnPacks();
         teleportHero(&g, g.p.Pos);
         g.setBanner(AREA_BANNER_DUR, "{s}", .{g.map.name.slice()});
@@ -573,6 +586,7 @@ pub const Game = struct {
         g.canResume = true; // a live run now exists to return to
         g.p = playermod.newPlayer(mathx.zero3);
         g.p.bar = g.loadout; // carry the persisted loadout into the new hero
+        g.p.retainOwned(); // …but only for skills it already owns (just melee at run start)
         g.kills = 0;
         g.elapsed = 0;
         g.enterArea(0);
@@ -586,7 +600,7 @@ pub const Game = struct {
         g.map = g.loadMapAt(g.areaIndex);
         g.w = mapmod.toWorld(&g.map, g.areaIndex == g.lastArea);
         g.torch.setLightColor(g.map.light); // each floor gets its own night
-        g.torch.setFloorSet(g.map.floor); // ...and its own ground materials
+        g.torch.uploadFloorMats(&g.map.floorGrid, g.map.halfW, g.map.halfD); // ...and its own ground materials
         g.sceneMesh.rebuild(&g.w);
         resetArena(g); // dynamic bodies, FX pools, fog, presentation timers, packs
         g.p.resetCombatState(); // no roll/stun/swing carries across the portal
@@ -704,6 +718,263 @@ pub const Game = struct {
 // ---- Simulation ----
 
 // updatePlaying advances the whole simulation by dt while in the playing scene.
+// ── Town/quest trigger runtime ──────────────────────────────────────────────────
+// A trigger = { conditions[], actions[] }: all conditions must hold, then actions run
+// top→bottom (StarEdit semantics). Conversations ARE triggers — say/choice/end_* actions
+// drive the dialogue box. Authored data lives in g.map.trig (a trigger.Store); the live
+// values/flags live in g.trig (a trigger.Runtime), reset by resetArena.
+
+pub const TALK_RANGE: f32 = 2.6; // how close the hero must be to talk to an NPC
+const TRIGGER_CADENCE: f32 = 0.2; // seconds between passive trigger-loop evaluations
+const MSG_BANNER_DUR: f32 = 2.6; // how long a `message` action holds on screen
+const MAX_TRIGGER_CHAIN: u32 = 32; // run_trigger recursion guard
+
+fn triggerTick(g: *Game, dt: f32) void {
+    g.trig.elapsed += dt;
+    g.trig.evalTimer -= dt;
+    if (g.trig.evalTimer > 0) return;
+    g.trig.evalTimer = TRIGGER_CADENCE;
+    triggerEvalPass(g);
+}
+
+// Evaluate every armed trigger once, firing those whose conditions all hold. Stops early if a
+// fired trigger opened a conversation (the dialogue then owns the flow until it closes).
+fn triggerEvalPass(g: *Game) void {
+    const store = &g.map.trig;
+    var i: usize = 0;
+    while (i < store.trigger_count) : (i += 1) {
+        if (g.trig.dialogue.active) return;
+        if (g.trig.fired[i]) continue;
+        if (allCondsHold(g, &store.triggers[i])) startTrigger(g, @intCast(i));
+    }
+}
+
+fn allCondsHold(g: *Game, t: *const trigmod.Trigger) bool {
+    for (t.condList()) |c| {
+        if (!condTrue(g, c)) return false;
+    }
+    return true;
+}
+
+fn condTrue(g: *Game, c: trigmod.Cond) bool {
+    const r = &g.trig;
+    return switch (c) {
+        .always => true,
+        .never => false,
+        .switch_on => |id| id < r.switches.len and r.switches[id],
+        .switch_off => |id| !(id < r.switches.len and r.switches[id]),
+        .counter => |x| x.c < r.counters.len and x.op.holds(r.counters[x.c], x.n),
+        .in_region => |id| id < g.map.region_count and g.map.regions[id].contains(g.p.Pos.x, g.p.Pos.z),
+        .near_npc => |id| npcInTalkRange(g, id),
+        .talked_to => |id| id < r.talked.len and r.talked[id],
+        .on_talk => |id| r.interactNpc != null and r.interactNpc.? == id,
+        .player_level => |x| x.op.holds(g.p.Level, x.n),
+        .elapsed => |x| elapsedHolds(r.elapsed, x.op, x.secs),
+    };
+}
+
+fn npcInTalkRange(g: *Game, id: u16) bool {
+    if (id >= g.map.npc_count) return false;
+    return dist2XZ(g.p.Pos, g.map.npcs[id].pos()) <= TALK_RANGE * TALK_RANGE;
+}
+
+fn elapsedHolds(elapsed: f32, op: trigmod.Op, secs: f32) bool {
+    return switch (op) {
+        .at_least => elapsed >= secs,
+        .at_most => elapsed <= secs,
+        // "exactly" on a float is a window the width of one eval cadence.
+        .exactly => @abs(elapsed - secs) <= TRIGGER_CADENCE,
+    };
+}
+
+// Fire trigger tid: mark it spent (a `preserve` action re-arms it), then run its script.
+fn startTrigger(g: *Game, tid: u16) void {
+    g.trig.fired[tid] = true;
+    executeFrom(g, tid, 0, 0);
+}
+
+// Run trigger tid's actions from index `start`, stopping when the script ends or a say/choice
+// opens the dialogue box (which resumes on player input). `depth` guards run_trigger chains.
+fn executeFrom(g: *Game, tid: u16, start: usize, depth: u32) void {
+    if (depth > MAX_TRIGGER_CHAIN) return;
+    const store = &g.map.trig;
+    if (tid >= store.trigger_count) return;
+    const t = &store.triggers[tid];
+    var i = start;
+    while (i < t.act_count) {
+        const a = t.acts[i];
+        switch (a) {
+            .say => |x| {
+                openSay(g, tid, x);
+                g.trig.dialogue.cursor = i + 1;
+                g.trig.dialogue.wait = .advance;
+                return;
+            },
+            .choice => {
+                gatherChoices(g, tid, i);
+                return;
+            },
+            .end_choice, .end_dialogue => {
+                closeDialogue(g);
+                return;
+            },
+            .preserve => {
+                g.trig.fired[tid] = false; // re-arm for the next pass
+                i += 1;
+            },
+            .run_trigger => |nid| {
+                executeFrom(g, nid, 0, depth + 1);
+                return;
+            },
+            else => {
+                applyImmediate(g, a);
+                i += 1;
+            },
+        }
+    }
+    // Ran off the end without an explicit end_dialogue: close the box if this trigger owned it.
+    if (g.trig.dialogue.active and g.trig.dialogue.trigger == tid) closeDialogue(g);
+}
+
+fn openSay(g: *Game, tid: u16, x: trigmod.Act.Say) void {
+    const d = &g.trig.dialogue;
+    d.active = true;
+    d.trigger = tid;
+    d.npc = x.npc;
+    d.text.set(g.map.trig.stringText(x.text));
+    d.choice_count = 0; // a fresh line clears the previous prompt's choices
+    d.sel = 0;
+}
+
+// Collect the run of sibling choices starting at groupStart into the box as buttons; each
+// button remembers the act index of its branch body, run when picked.
+fn gatherChoices(g: *Game, tid: u16, groupStart: usize) void {
+    const d = &g.trig.dialogue;
+    const t = &g.map.trig.triggers[tid];
+    const acts = t.actList();
+    d.active = true;
+    d.trigger = tid;
+    d.choice_count = 0;
+    d.sel = 0;
+    var i = groupStart;
+    while (i < t.act_count and acts[i] == .choice and d.choice_count < trigmod.MAX_ACTIVE_CHOICES) {
+        var ch = trigmod.Dialogue.Choice{ .jump = i + 1 };
+        ch.label.set(g.map.trig.stringText(acts[i].choice));
+        d.choices[d.choice_count] = ch;
+        d.choice_count += 1;
+        i = trigmod.branchEnd(acts, i);
+    }
+    d.wait = .choose;
+}
+
+// The immediate (non-dialogue) actions — everything executeFrom doesn't handle inline.
+fn applyImmediate(g: *Game, a: trigmod.Act) void {
+    const r = &g.trig;
+    switch (a) {
+        .message => |id| g.setBanner(MSG_BANNER_DUR, "{s}", .{g.map.trig.stringText(id)}),
+        .set_switch => |x| {
+            if (x.s < r.switches.len) r.switches[x.s] = switch (x.mode) {
+                .on => true,
+                .off => false,
+                .toggle => !r.switches[x.s],
+            };
+        },
+        .set_counter => |x| {
+            if (x.c < r.counters.len) r.counters[x.c] = switch (x.mode) {
+                .set => x.n,
+                .add => r.counters[x.c] + x.n,
+                .sub => r.counters[x.c] - x.n,
+            };
+        },
+        .grant_skill => |sk| {
+            if (g.p.learn(sk)) g.setToast("Learned {s}!", .{sk.label()});
+        },
+        .spawn => |x| spawnAtRegion(g, x),
+        .teleport => |id| {
+            if (id < g.map.region_count) teleportHero(g, g.map.regions[id].center());
+        },
+        .center_cam => |id| {
+            if (id < g.map.region_count) g.rig.snap(g.map.regions[id].center());
+        },
+        .set_objective => |id| {
+            r.objective.set(g.map.trig.stringText(id));
+            r.hasObjective = true;
+        },
+        // Flow/dialogue acts are handled by executeFrom and never reach here.
+        .say, .choice, .end_choice, .end_dialogue, .preserve, .run_trigger => {},
+    }
+}
+
+fn spawnAtRegion(g: *Game, x: trigmod.Act.Spawn) void {
+    if (x.region >= g.map.region_count) return;
+    const center = g.map.regions[x.region].center();
+    const tier: i32 = @intCast(g.areaIndex);
+    const count = std.math.clamp(x.count, 1, 32);
+    var n: i32 = 0;
+    while (n < count) : (n += 1) {
+        g.spawn(monster.makeMonster(x.kind, tier, &g.rng, g.randomOpenTileNear(center, 4)));
+    }
+}
+
+fn closeDialogue(g: *Game) void {
+    const d = &g.trig.dialogue;
+    d.active = false;
+    d.wait = .none;
+    d.choice_count = 0;
+    input.swallowHeldSlots(); // the confirm that closed the box must not fire a skill next frame
+}
+
+// While a conversation is open the world is frozen; this drives the box from player input.
+fn updateDialogue(g: *Game) void {
+    const d = &g.trig.dialogue;
+    switch (d.wait) {
+        .advance => {
+            if (input.confirm(false) or input.interactPressed()) {
+                executeFrom(g, d.trigger, d.cursor, 0);
+            } else if (input.cancel()) {
+                closeDialogue(g);
+            }
+        },
+        .choose => {
+            if (d.choice_count == 0) {
+                closeDialogue(g);
+                return;
+            }
+            if (input.navUp()) d.sel = if (d.sel == 0) d.choice_count - 1 else d.sel - 1;
+            if (input.navDown()) d.sel = (d.sel + 1) % d.choice_count;
+            if (input.confirm(false)) {
+                const jump = d.choices[d.sel].jump;
+                d.wait = .none;
+                executeFrom(g, d.trigger, jump, 0);
+            } else if (input.cancel()) {
+                closeDialogue(g);
+            }
+        },
+        .none => closeDialogue(g),
+    }
+}
+
+// Press-to-talk: if interact is pressed near an NPC, mark it talked-to and run an immediate
+// eval pass with that NPC's on_talk edge set, so its conversation trigger fires now.
+fn tryInteract(g: *Game) void {
+    if (!input.interactPressed()) return;
+    var best: ?u16 = null;
+    var bestD2: f32 = TALK_RANGE * TALK_RANGE;
+    for (g.map.npcList(), 0..) |npc, idx| {
+        const d2 = dist2XZ(g.p.Pos, npc.pos());
+        if (d2 <= bestD2) {
+            bestD2 = d2;
+            best = @intCast(idx);
+        }
+    }
+    if (best) |id| {
+        if (id < g.trig.talked.len) g.trig.talked[id] = true;
+        g.trig.interactNpc = id;
+        triggerEvalPass(g);
+        g.trig.interactNpc = null;
+    }
+}
+
 fn updatePlaying(g: *Game, dt_in: f32) void {
     // Clamp dt so a hitch can't tunnel entities through walls.
     var dt = dt_in;
@@ -712,9 +983,17 @@ fn updatePlaying(g: *Game, dt_in: f32) void {
     if (rl.isKeyPressed(.p)) g.paused = !g.paused;
     if (g.paused) return;
 
+    // A conversation freezes the world and owns all input until it closes.
+    if (g.trig.dialogue.active) {
+        updateDialogue(g);
+        g.rig.follow(g.p.Pos, dt);
+        return;
+    }
+
     updateAim(g);
     handleInput(g);
     handleGamepad(g);
+    tryInteract(g); // press-to-talk may open a conversation (world freezes from next frame)
     updateTargeting(g); // after manual picks (hover/stick/click); fills the nearest default
     updateTimers(g, dt);
 
@@ -733,6 +1012,10 @@ fn updatePlaying(g: *Game, dt_in: f32) void {
     updatePortal(g);
     updateAmbientFX(g, dt);
     g.parts.update(dt, &g.w);
+
+    // Town/quest triggers: evaluate on a cadence AFTER movement, so region/proximity
+    // conditions read the hero's settled position this frame.
+    triggerTick(g, dt);
 
     g.rig.follow(g.p.Pos, dt);
 
@@ -2054,6 +2337,7 @@ fn resetArena(g: *Game) void {
     g.fog.reset(g.w.HalfW, g.w.HalfD); // fresh layout: forget the old exploration
     g.fog.sync(); // upload now: a restart from dead/victory draws a frame without
     // updatePlaying, else it'd show the new area against the old fog mask.
+    g.trig.reset(); // fresh area: clear switch/counter values, fired flags, any open dialogue
     g.spawnPacks();
     g.setToast("", .{});
 }
@@ -2075,6 +2359,7 @@ pub fn startPlaytest(g: *Game) void {
     g.resetCharScreen();
     g.p = playermod.newPlayer(g.map.spawn);
     g.p.bar = g.loadout;
+    g.p.retainOwned(); // playtest starts like a fresh run: only owned skills stay bound
     g.w.PortalOpen = false;
     resetArena(g);
     teleportHero(g, g.p.Pos);
@@ -3288,6 +3573,48 @@ pub fn beginSceneFrame(g: *Game, cam: rl.Camera3D, lp: tl.LightParams, fp: tl.Fi
 }
 
 // drawWorld renders one frame of the 3D scene through the frozen torch pipeline.
+// ── NPC rendering (town) ─────────────────────────────────────────────────────────
+// NPCs are drawn lit in the main scene pass, culled to the torch disc like monsters. They
+// carry no combat state — a simple robed humanoid, tinted by kind, with a gentle idle bob.
+fn drawNpcs(g: *Game, lightGround: rl.Vector3, radius: f32) void {
+    for (g.map.npcList()) |npc| {
+        if (dist2XZ(npc.pos(), lightGround) > radius * radius) continue;
+        drawNpcBody(g, npc);
+    }
+}
+
+fn npcColor(k: mapmod.NpcKind) rl.Color {
+    return switch (k) {
+        .villager => rgba(122, 112, 92, 255),
+        .elder => rgba(150, 142, 168, 255),
+        .merchant => rgba(156, 124, 72, 255),
+        .guard => rgba(92, 104, 126, 255),
+        .blacksmith => rgba(98, 82, 74, 255),
+        .wizard => rgba(74, 92, 152, 255),
+    };
+}
+
+pub fn drawNpcBody(g: *Game, npc: mapmod.Npc) void {
+    // Flush the batch so a mid-body overflow can't upload a stale matrix to the scene shader
+    // (the monster-body lighting hazard). We draw at absolute coords, so identity is correct.
+    rl.gl.rlDrawRenderBatchActive();
+    const gy = g.w.groundY(npc.x, npc.z);
+    const bob = 0.03 * sinf(g.elapsed * 1.6 + npc.x * 0.7 + npc.z * 0.5);
+    const base = npcColor(npc.kind);
+    const dark = lerpColor(base, rl.Color.black, 0.4);
+    const rad: f32 = 0.42;
+    const bodyH: f32 = 1.5;
+    const fr = mathx.radians(npc.facing);
+    const f = v3(-sinf(fr), 0, -cosf(fr)); // 0° faces -Z, matching the hero's default
+    // Ground shadow puck.
+    rl.drawCylinderEx(v3(npc.x, gy + 0.012, npc.z), v3(npc.x, gy + 0.02, npc.z), rad * 1.15, rad * 1.15, 16, mathx.withAlpha(rl.Color.black, 95));
+    // Robe/torso (a capsule) + head; a small nub marks facing for the top-down camera.
+    rl.drawCapsule(v3(npc.x, gy + 0.34 + bob, npc.z), v3(npc.x, gy + bodyH + bob, npc.z), rad, 10, 4, base);
+    const hy = gy + bodyH + 0.26 + bob;
+    sphere(v3(npc.x, hy, npc.z), 0.25, lerpColor(base, rgba(224, 196, 166, 255), 0.55));
+    sphere(v3(npc.x + f.x * 0.2, hy, npc.z + f.z * 0.2), 0.07, dark);
+}
+
 fn drawWorld(g: *Game) void {
     var cam = g.rig.cam;
     if (g.shake > 0) {
@@ -3332,6 +3659,7 @@ fn drawWorld(g: *Game) void {
     // --- main pass ---
     beginSceneFrame(g, cam, lp, fp);
     drawMonstersLit(ms, lightGround, lp.radius, fp, g.p.targetMonster);
+    drawNpcs(g, lightGround, lp.radius);
     if (drawHero) drawHeroBody(&g.p);
     g.torch.endScene();
     if (drawHero) drawHeroFX(&g.p, t);
@@ -3423,10 +3751,10 @@ pub fn run(shot: bool) void {
                 // Character screen (Select / C) freezes the world; it has Stats + Skills
                 // pages. K is a keyboard shortcut straight to the Skills page. Both close
                 // paths route through closeCharScreen so the loadout persists.
-                if (input.sheetTogglePressed()) {
+                if (input.sheetTogglePressed() and !g.trig.dialogue.active) {
                     if (g.sheetOpen) g.closeCharScreen() else g.sheetOpen = true;
                 }
-                if (input.skillsShortcutPressed()) {
+                if (input.skillsShortcutPressed() and !g.trig.dialogue.active) {
                     if (g.sheetOpen and g.charTab == .skills) g.closeCharScreen() else {
                         g.sheetOpen = true;
                         g.charTab = .skills;
@@ -3436,8 +3764,9 @@ pub fn run(shot: bool) void {
                     updateCharScreen(&g, altHeld);
                     g.rig.follow(g.p.Pos, dt); // keep the camera live behind the screen
                 } else {
-                    // Exit to menu is Escape/Start ONLY — never pad B (dodge in play).
-                    if (rl.isKeyPressed(.escape) or input.startPressed()) {
+                    // Exit to menu is Escape/Start ONLY — never pad B (dodge in play). A live
+                    // conversation swallows Escape/Start (it closes the box instead — updateDialogue).
+                    if ((rl.isKeyPressed(.escape) or input.startPressed()) and !g.trig.dialogue.active) {
                         if (g.playtest) endPlaytest(&g) else {
                             g.scene = .menu;
                             g.hoverMonster = -1; // no hover ring pulsing in the menu backdrop

@@ -222,18 +222,13 @@ pub const SKILL_SLOTS = 6;
 pub const SkillBar = struct {
     slots: [SKILL_SLOTS]?Skill = [_]?Skill{null} ** SKILL_SLOTS,
 
-    /// The out-of-the-box loadout, mapped to the pad's six action buttons:
-    /// A empty, X melee, Y empty, B dodge, L1 health potion, R1 mana potion. You start
-    /// with just the basic melee attack plus survival (dodge + potions); every offensive
-    /// skill — firebolt and the five extras — starts unbound, assigned on the loadout
-    /// screen. Used by a fresh hero and as the fallback when no saved bindings exist (or a
-    /// stale format migrates).
+    /// The out-of-the-box loadout: X = melee, every other button empty. A fresh hero OWNS
+    /// only melee (see Player.owned); dodge, potions, and the offensive skills are all
+    /// acquired in-run via grant_skill and bound on the loadout screen once owned. Used by a
+    /// fresh hero and as the fallback when no saved bindings exist (or a stale format migrates).
     pub fn default() SkillBar {
         var b = SkillBar{};
-        b.assign(1, .melee);
-        b.assign(3, .dodge);
-        b.assign(4, .health_potion);
-        b.assign(5, .mana_potion);
+        b.assign(1, .melee); // the only skill a fresh hero owns; the rest are acquired in-run
         return b;
     }
 
@@ -267,9 +262,10 @@ pub const SkillBar = struct {
     // FORMAT 2 added the potions to the bar. FORMAT 3 remapped the slots to the six pad
     // action buttons (A/X/Y/B/L1/R1) — a FORMAT-2 file's five slots meant different
     // buttons, so it migrates to default() rather than binding skills to the wrong keys.
-    // FORMAT 4 stripped firebolt from the starting bar (melee + survival only), so older
+    // FORMAT 4 stripped firebolt from the starting bar (melee + survival only). FORMAT 5
+    // empties everything but melee (dodge/potions are now ACQUIRED, not granted), so older
     // saves migrate to the new default. A file from any older format is likewise reset.
-    pub const FORMAT = 4;
+    pub const FORMAT = 5;
 
     pub fn save(b: *const SkillBar, path: []const u8) !void {
         const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
@@ -349,6 +345,11 @@ pub const Player = struct {
 
     // Reassignable loadout (defaults set in newPlayer). Persists across areas.
     bar: SkillBar = .{},
+    // Skills the hero has ACQUIRED and may bind/use. Starts as just {melee}; every other
+    // skill is learned in-run via a trigger's grant_skill action (see learn/owns). Per-run
+    // (reset by newPlayer), but persists across areas within a run. The loadout screen only
+    // lets you bind what's owned, so an unowned skill can never reach the bar.
+    owned: std.EnumSet(Skill) = std.EnumSet(Skill).initEmpty(),
 
     HP: f32 = 0,
     MaxHP: f32 = 0,
@@ -420,6 +421,27 @@ pub const Player = struct {
     /// Light-stunned: can't attack, cast, or steer until it wears off.
     pub fn stunned(p: *const Player) bool {
         return p.stunTimer > 0;
+    }
+
+    /// Whether the hero has acquired this skill (and so may bind/use it).
+    pub fn owns(p: *const Player, s: Skill) bool {
+        return p.owned.contains(s);
+    }
+    /// Acquire a skill (grant_skill action / trainers). Returns true if it was NEW, so the
+    /// caller can announce it; a repeat grant is a silent no-op.
+    pub fn learn(p: *Player, s: Skill) bool {
+        if (p.owned.contains(s)) return false;
+        p.owned.insert(s);
+        return true;
+    }
+    /// Drop any bound skill the hero doesn't currently own — e.g. a persisted binding for a
+    /// skill not yet re-acquired this run. Keeps the active bar honest after a loadout apply.
+    pub fn retainOwned(p: *Player) void {
+        for (&p.bar.slots) |*e| {
+            if (e.*) |s| {
+                if (!p.owned.contains(s)) e.* = null;
+            }
+        }
     }
 
     /// Recompute every derived combat number from current attributes + skill ranks.
@@ -641,7 +663,11 @@ pub fn newPlayer(pos: rl.Vector3) Player {
         .atkRange = BASE_ATK_RANGE,
         .def = .{ .armor = BASE_ARMOR },
     };
-    // Default loadout (the game applies any persisted bindings over this after spawn).
+    // Start owning only the basic attack; every other skill is acquired in-run (a trigger's
+    // grant_skill action). newPlayer is the one reset point for the owned set.
+    p.owned.insert(.melee);
+    // Default loadout (the game applies any persisted bindings over this after spawn, then
+    // drops any binding for a skill not yet owned — see Player.retainOwned).
     p.bar = SkillBar.default();
     // Derive stats from the starting attributes, then top off.
     p.recompute();

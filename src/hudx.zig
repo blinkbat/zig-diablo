@@ -654,7 +654,10 @@ pub fn draw(g: *Game) void {
         .playing => {
             vignette();
             drawHUD(g);
+            drawNpcTags(g);
+            drawObjective(g);
             if (g.sheetOpen) drawCharScreen(g);
+            if (g.trig.dialogue.active) drawDialogue(g);
             if (g.paused) drawPauseOverlay();
         },
         .dead => {
@@ -667,6 +670,134 @@ pub fn draw(g: *Game) void {
             drawVictory(g);
         },
         .editor => {}, // editor draws its own overlay (editor.drawOverlay)
+    }
+}
+
+// ── Town: NPC nameplates, quest objective, and the conversation box ───────────────
+
+fn drawNpcTags(g: *Game) void {
+    if (g.trig.dialogue.active) return; // the box owns the screen while talking
+    const cam = g.rig.cam;
+    const talk2 = gamemod.TALK_RANGE * gamemod.TALK_RANGE;
+    const show2: f32 = 12.0 * 12.0; // a name shows within ~12 units of the hero
+    for (g.map.npcList()) |npc| {
+        const d2 = mathx.dist2XZ(npc.pos(), g.p.Pos);
+        if (d2 > show2) continue;
+        const wp = v3(npc.x, g.w.groundY(npc.x, npc.z) + 2.05, npc.z);
+        const sp = rl.getWorldToScreen(wp, cam);
+        const sx: i32 = @intFromFloat(sp.x);
+        const sy: i32 = @intFromFloat(sp.y);
+        var nmBuf: [48]u8 = undefined;
+        const nm = std.fmt.bufPrintZ(&nmBuf, "{s}", .{npc.name.slice()}) catch continue;
+        const w = textW(nm, 15);
+        pill(sx - @divTrunc(w, 2) - 10, sy - 3, w + 20, 22, withAlpha(theme.ink, 175));
+        text(nm, sx - @divTrunc(w, 2), sy, 15, rgba(228, 216, 196, 235));
+        if (d2 <= talk2) {
+            const prompt = "T / D-Pad Up : Talk";
+            const pw = textW(prompt, 13);
+            text(prompt, sx - @divTrunc(pw, 2), sy + 22, 13, withAlpha(theme.highlightColor, 240));
+        }
+    }
+}
+
+fn drawObjective(g: *Game) void {
+    if (!g.trig.hasObjective) return;
+    var buf: [128]u8 = undefined;
+    const s = std.fmt.bufPrintZ(&buf, "Objective: {s}", .{g.trig.objective.slice()}) catch return;
+    const w = textW(s, 15);
+    const x = @divTrunc(sw(), 2) - @divTrunc(w, 2);
+    const y: i32 = 74;
+    pill(x - 14, y - 4, w + 28, 24, withAlpha(theme.ink, 185));
+    text(s, x, y, 15, withAlpha(theme.goldColor, 245));
+}
+
+// Word-wrap s into lines fitting maxW at `size`; returns the y just past the last line.
+fn drawWrapped(s: []const u8, x: i32, y: i32, maxW: i32, size: i32, lineH: i32, col: rl.Color) i32 {
+    const CAP = 198;
+    var buf: [CAP + 2]u8 = undefined;
+    var ll: usize = 0;
+    var cy = y;
+    var it = std.mem.tokenizeScalar(u8, s, ' ');
+    while (it.next()) |word| {
+        const sep: usize = if (ll > 0) 1 else 0;
+        if (ll + sep + word.len > CAP) {
+            if (ll > 0) {
+                buf[ll] = 0;
+                text(buf[0..ll :0], x, cy, size, col);
+                cy += lineH;
+                ll = 0;
+            }
+            if (word.len > CAP) continue; // pathological single word: skip
+        }
+        var cl = ll;
+        if (ll > 0) {
+            buf[cl] = ' ';
+            cl += 1;
+        }
+        @memcpy(buf[cl .. cl + word.len], word);
+        cl += word.len;
+        buf[cl] = 0;
+        if (ll > 0 and textW(buf[0..cl :0], size) > maxW) {
+            buf[ll] = 0; // flush the line before this word, then start fresh with the word
+            text(buf[0..ll :0], x, cy, size, col);
+            cy += lineH;
+            @memcpy(buf[0..word.len], word);
+            ll = word.len;
+        } else {
+            ll = cl;
+        }
+    }
+    if (ll > 0) {
+        buf[ll] = 0;
+        text(buf[0..ll :0], x, cy, size, col);
+        cy += lineH;
+    }
+    return cy;
+}
+
+fn drawDialogue(g: *Game) void {
+    const d = &g.trig.dialogue;
+    const W = sw();
+    const H = sh();
+    const bw: i32 = @min(760, W - 80);
+    const bh: i32 = 210;
+    const bx = @divTrunc(W - bw, 2);
+    const by = H - bh - 44;
+
+    woodPanel(bx, by, bw, bh, 240);
+    ironFrame(bx, by, bw, bh);
+
+    // Speaker plate (the talking NPC's name, hung on the top edge).
+    if (d.npc < g.map.npc_count) {
+        var nmBuf: [48]u8 = undefined;
+        const speaker = std.fmt.bufPrintZ(&nmBuf, "{s}", .{g.map.npcs[d.npc].name.slice()}) catch "";
+        if (speaker.len > 0) {
+            const pw = textW(speaker, 18) + 30;
+            pill(bx + 24, by - 16, pw, 30, withAlpha(theme.ink, 240));
+            text(speaker, bx + 39, by - 12, 18, theme.titleColor);
+        }
+    }
+
+    // Body line, wrapped.
+    const afterText = drawWrapped(d.text.slice(), bx + 30, by + 26, bw - 60, 19, 26, rgba(232, 220, 198, 255));
+
+    if (d.wait == .choose and d.choice_count > 0) {
+        var cy = @max(afterText + 10, by + 92);
+        var i: usize = 0;
+        while (i < d.choice_count) : (i += 1) {
+            const sel = (i == d.sel);
+            if (sel) {
+                rl.drawRectangleRounded(.{ .x = fi(bx + 22), .y = fi(cy - 4), .width = fi(bw - 44), .height = 27 }, 0.3, 6, withAlpha(theme.highlightColor, 45));
+                text(">", bx + 32, cy, 18, theme.highlightColor);
+            }
+            var cbuf: [160]u8 = undefined;
+            const label = std.fmt.bufPrintZ(&cbuf, "{s}", .{d.choices[i].label.slice()}) catch "";
+            text(label, bx + 54, cy, 18, if (sel) theme.highlightColor else rgba(212, 200, 178, 235));
+            cy += 32;
+        }
+    } else {
+        const hints = [_]Hint{.{ .glyph = .{ .face = .a }, .label = "Continue" }};
+        hintRow(&hints, by + bh - 28, 15, withAlpha(theme.labelColor, 235));
     }
 }
 
@@ -1013,14 +1144,21 @@ fn drawSkillsTab(g: *Game, px: i32, py: i32, pw: i32, ph: i32) void {
                 g.skillZone = .pool;
                 g.skillPoolSel = ji;
                 const slot: usize = @intCast(g.skillSel);
-                p.bar.assign(slot, if (p.bar.slots[slot] == s) null else s); // toggle onto chosen button
+                // Toggle onto the chosen button — but only a skill you OWN can be bound.
+                if (p.bar.slots[slot] == s) {
+                    p.bar.assign(slot, null);
+                } else if (p.owns(s)) {
+                    p.bar.assign(slot, s);
+                } else {
+                    g.setToast("{s} is locked — acquire it first", .{s.label()});
+                }
             }
             if (rl.isMouseButtonPressed(.right)) {
                 if (boundSlot) |bs| p.bar.assign(bs, null); // unbind from wherever it sits
             }
         }
         const focused = g.skillZone == .pool and g.skillPoolSel == ji;
-        drawPoolChip(cell, s, boundSlot, focused);
+        drawPoolChip(cell, s, boundSlot, focused, p.owns(s));
     }
 
     // ── Blurb: what the focused thing does, in one friendly line ──
@@ -1065,7 +1203,7 @@ fn drawSkillsTab(g: *Game, px: i32, py: i32, pw: i32, ph: i32) void {
 // and — when the skill is bound — the badge of the button it lives on (top-right) over a
 // warmer seat, so "already on the bar" and "which button" both read at a glance. The
 // focused chip gets a gold frame.
-fn drawPoolChip(cell: rl.Rectangle, s: playermod.Skill, boundSlot: ?usize, focused: bool) void {
+fn drawPoolChip(cell: rl.Rectangle, s: playermod.Skill, boundSlot: ?usize, focused: bool, owned: bool) void {
     const bound = boundSlot != null;
     rl.drawRectangleRounded(cell, 0.16, 6, if (bound) rgba(30, 24, 18, 222) else rgba(15, 12, 12, 200));
 
@@ -1087,6 +1225,16 @@ fn drawPoolChip(cell: rl.Rectangle, s: playermod.Skill, boundSlot: ?usize, focus
         const bcy = cellY + 14;
         rl.drawCircleV(.{ .x = fi(bcx), .y = fi(bcy) }, 12, BADGE_SEAT);
         slotGlyph(bs, bcx, bcy, 9);
+    }
+
+    // Locked (not yet acquired): mute the cell and stamp a small padlock, so it reads as
+    // "earn this to bind it" rather than a bindable option.
+    if (!owned) {
+        rl.drawRectangleRounded(cell, 0.16, 6, withAlpha(rgba(8, 6, 6, 255), 155));
+        const lx = cellX + 15;
+        const ly = cellY + 16;
+        rl.drawCircleLines(lx, ly - 4, 4, rgba(214, 184, 126, 235)); // shackle
+        rl.drawRectangleRounded(.{ .x = fi(lx - 5), .y = fi(ly - 2), .width = 10, .height = 9 }, 0.3, 4, rgba(214, 184, 126, 235)); // body
     }
 
     if (focused) {

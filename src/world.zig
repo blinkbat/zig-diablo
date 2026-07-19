@@ -18,6 +18,8 @@ pub const FloorMat = enum(u8) {
     mud,
     bone,
 
+    pub const count = @typeInfo(FloorMat).@"enum".fields.len;
+
     pub fn base(m: FloorMat) rl.Color {
         return switch (m) {
             .dirt => rl.Color.init(60, 50, 37, 255),
@@ -45,6 +47,12 @@ pub const FloorMat = enum(u8) {
 
 // primary / secondary / tertiary — repeat a name to narrow an area's variety.
 pub const FloorSet = [3]FloorMat;
+
+// Paintable floor: the ground is a grid of per-cell FloorMat ids (no per-map "theme" blend).
+// FLOOR_RES x FLOOR_RES cells span the arena; the scene shader nearest-samples it (torchlight
+// matMap). The u8 grid (16 KB at 128) uploads in one updateTexture and rides the map's
+// by-value undo. Painted in the editor's Ground layer like decor/props.
+pub const FLOOR_RES = 128;
 
 // Masonry tone for arena walls, ledge bodies, and ramp skirts — one stone for every
 // built structure now that the per-map accent palette is gone.

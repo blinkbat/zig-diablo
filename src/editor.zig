@@ -10,6 +10,7 @@ const theme = @import("theme.zig");
 const tl = @import("torchlight.zig");
 const ui = @import("ui.zig");
 const cameramod = @import("camera.zig");
+const trigedit = @import("trigedit.zig");
 
 const Game = gamemod.Game;
 const v3 = mathx.v3;
@@ -34,6 +35,7 @@ const lerpColor = mathx.lerpColor;
 
 pub const Layer = enum(u8) {
     floor,
+    ground,
     decor,
     props,
     entities,
@@ -44,6 +46,7 @@ pub const Layer = enum(u8) {
     fn label(l: Layer) [:0]const u8 {
         return switch (l) {
             .floor => "Floor",
+            .ground => "Ground",
             .decor => "Decor",
             .props => "Props",
             .entities => "Entities",
@@ -52,14 +55,18 @@ pub const Layer = enum(u8) {
 };
 
 // Brush tables (last entry of every layer is its scoped eraser).
-const floorBrushes = [_][:0]const u8{ "Ledge", "Ramp", "Erase" };
+const floorBrushes = [_][:0]const u8{ "Ledge", "Ramp", "Region", "Erase" };
+// Ground-material paint brushes: one per world.FloorMat (order-pinned to the enum) + an
+// eraser that repaints the map's base material. Painted like decor/props (drag to sweep).
+const groundBrushes = [_][:0]const u8{ "dirt", "grass", "stone", "cobble", "mud", "bone", "Erase" };
 const decorBrushes = [_][:0]const u8{ "pebble", "tuft", "shroom", "bone", "bigshroom", "Erase" };
 const propBrushes = [_][:0]const u8{ "rock", "tree", "gravestone", "Erase" };
-const entityBrushes = [_][:0]const u8{ "pib pack", "zombie pack", "skeleton pack", "brute pack", "Boss", "Spawn", "Portal", "Erase" };
+const entityBrushes = [_][:0]const u8{ "pib pack", "zombie pack", "skeleton pack", "brute pack", "Boss", "Spawn", "Portal", "NPC", "Erase" };
 
 fn brushesFor(l: Layer) []const [:0]const u8 {
     return switch (l) {
         .floor => &floorBrushes,
+        .ground => &groundBrushes,
         .decor => &decorBrushes,
         .props => &propBrushes,
         .entities => &entityBrushes,
@@ -69,6 +76,7 @@ fn brushesFor(l: Layer) []const [:0]const u8 {
 // Hover blurbs (ui.buttonTip) for the layer strip and every brush.
 const layerTips = [_][:0]const u8{
     "Terrain shaping: ledges + ramps (Tab cycles layers)",
+    "Paint the floor material per tile (drag to sweep)",
     "Ground dressing: paint or scatter, never blocks",
     "Blocking scenery: rocks, trees, gravestones",
     "Foe packs, the boss, player spawn, the portal",
@@ -76,7 +84,17 @@ const layerTips = [_][:0]const u8{
 const floorTips = [_][:0]const u8{
     "Drag a rectangle; [ ] sets its height",
     "Drag a rectangle; R (or chips) sets the rise",
-    "Click a ledge or ramp to remove it",
+    "Drag a rectangle to mark a named zone (triggers key off it)",
+    "Click a ledge, ramp, or region to remove it",
+};
+const groundTips = [_][:0]const u8{
+    "Paint dirt (drag to sweep; [ ] sets radius)",
+    "Paint grass (drag to sweep)",
+    "Paint stone (drag to sweep)",
+    "Paint cobble (drag to sweep)",
+    "Paint mud (drag to sweep)",
+    "Paint bone ground (drag to sweep)",
+    "Repaint the base material ([ ] sets radius)",
 };
 const decorTips = [_][:0]const u8{
     "Paint pebbles (drag to sweep)",
@@ -100,12 +118,14 @@ const entityTips = [_][:0]const u8{
     "Move the area champion's post",
     "Move where the hero enters",
     "Move the area exit",
-    "Click-erase PACKS only ([ ] sets radius)",
+    "Place a townsperson; click one to edit it",
+    "Click-erase packs + NPCs ([ ] sets radius)",
 };
 
 fn brushTipsFor(l: Layer) []const [:0]const u8 {
     return switch (l) {
         .floor => &floorTips,
+        .ground => &groundTips,
         .decor => &decorTips,
         .props => &propTips,
         .entities => &entityTips,
@@ -115,6 +135,7 @@ fn brushTipsFor(l: Layer) []const [:0]const u8 {
 comptime {
     std.debug.assert(layerTips.len == Layer.N); // indexed by layer ordinal
     std.debug.assert(floorTips.len == floorBrushes.len);
+    std.debug.assert(groundTips.len == groundBrushes.len);
     std.debug.assert(decorTips.len == decorBrushes.len);
     std.debug.assert(propTips.len == propBrushes.len);
     std.debug.assert(entityTips.len == entityBrushes.len);
@@ -124,6 +145,7 @@ comptime {
 // lists: pin lengths so adding a kind can't silently skew the index mapping.
 comptime {
     std.debug.assert(floorBrushes.len == @typeInfo(FloorBrush).@"enum".fields.len);
+    std.debug.assert(groundBrushes.len == world.FloorMat.count + 1); // 6 materials + eraser
     std.debug.assert(decorBrushes.len == @typeInfo(world.DecorKind).@"enum".fields.len + 1);
     std.debug.assert(propBrushes.len == @typeInfo(world.ObstacleKind).@"enum".fields.len + 1);
     // packs (one per MonsterKind) + non-pack EntityBrush variants (all but .pack).
@@ -137,6 +159,11 @@ comptime {
     }
     for (0..@typeInfo(world.ObstacleKind).@"enum".fields.len) |i| {
         std.debug.assert(std.mem.eql(u8, propBrushes[i], @tagName(@as(world.ObstacleKind, @enumFromInt(i)))));
+    }
+    // Ground brushes: the first N labels ARE the FloorMat tag names in order (groundMat
+    // decodes by ordinal into the same ids the grid stores).
+    for (0..world.FloorMat.count) |i| {
+        std.debug.assert(std.mem.eql(u8, groundBrushes[i], @tagName(@as(world.FloorMat, @enumFromInt(i)))));
     }
     // Entity brushes: the tail labels ("Boss"/"Spawn"/"Portal"/"Erase") ARE EntityBrush's
     // non-pack tag names (case aside), and each pack label contains its MonsterKind tag
@@ -153,7 +180,7 @@ comptime {
 }
 
 // Floor-layer brush index (positional, matching floorBrushes).
-const FloorBrush = enum { ledge, ramp, erase };
+const FloorBrush = enum { ledge, ramp, region, erase };
 
 // Entities-layer brush index.
 const EntityBrush = enum {
@@ -161,6 +188,7 @@ const EntityBrush = enum {
     boss,
     spawn,
     portal,
+    npc,
     erase,
 
     // The anchor this brush places, if any — so placement routes through the Anchor
@@ -191,6 +219,7 @@ const ERASE_SWEEP = rgba(255, 90, 70, 200);
 // brighter than the committed box + its center puck + the ledge-drag preview.
 const SEL_LIVE = rgba(255, 235, 160, 230);
 const SEL_BOX = rgba(255, 220, 120, 255);
+const REGION_COL = rgba(110, 205, 235, 220); // named-zone wireframe (StarEdit "location" cyan)
 
 // Map-name / filename field capacity: the typed-name buffer and every slug buffer it
 // feeds share this, so a longer name can't silently truncate when slugged to a path.
@@ -245,6 +274,7 @@ const Anchor = enum {
 
 // Pack ring radius doubles as the grab pickup radius (clickable == visible).
 const PACK_GRAB_R = 1.6;
+const NPC_PICK_R = 1.0; // click within this of an NPC to edit it (else a click stamps a new one)
 
 // Right-drag pan deadzone (px): a right-click only becomes a pan past this move, so a
 // click-in-place opens the context menu instead. The crawler-editor "4 px threshold".
@@ -256,7 +286,7 @@ const RIGHT_DRAG_PX = 4;
 const EDITOR_SUN_H = 38.0;
 const EDITOR_SUN_R = 110.0;
 
-pub const Modal = enum { none, save_as, new_map, open_map, rename, confirm, pack_edit };
+pub const Modal = enum { none, save_as, new_map, open_map, rename, confirm, pack_edit, npc_edit, region_edit };
 pub const Pending = enum { none, open, new, exit };
 
 // ---- Marquee selection + clipboard (Shift+drag selects, drag inside moves,
@@ -305,17 +335,6 @@ var clipPackN: usize = 0;
 var clipHas = false;
 var selBankPending = false; // selection-move undo banks on first movement only
 
-// Area-style presets applied in one click: the floor-material set and torch light
-// together (the ground look is materials now, not a color pair).
-const Preset = struct { name: [:0]const u8, floor: world.FloorSet, light: [3]f32 };
-const presets = [_]Preset{
-    .{ .name = "Moor", .floor = mapmod.DEFAULT_FLOOR, .light = .{ 1.04, 0.94, 0.80 } },
-    .{ .name = "Plains", .floor = .{ .grass, .stone, .dirt }, .light = .{ 0.90, 0.97, 1.08 } },
-    .{ .name = "Stony", .floor = .{ .dirt, .stone, .cobble }, .light = .{ 1.00, 0.96, 0.87 } },
-    .{ .name = "Wood", .floor = .{ .mud, .grass, .dirt }, .light = .{ 0.88, 1.00, 0.88 } },
-    .{ .name = "Crypt", .floor = .{ .stone, .cobble, .bone }, .light = .{ 0.93, 0.87, 1.08 } },
-};
-
 // ---- Undo/redo: eager whole-map snapshots, cap 50 ----
 // Map is a flat ~34 KB value, so by-value history is trivial and aliasing-immune.
 // Paint strokes bank ONE step (pre-stroke state) only if the stroke changed
@@ -326,6 +345,8 @@ var undoLen: usize = 0;
 var redoStack: [UNDO_CAP]mapmod.Map = undefined;
 var redoLen: usize = 0;
 var packEditBefore: mapmod.Map = undefined; // snapshot banked when the pack modal opens
+var npcEditBefore: mapmod.Map = undefined; // snapshot banked when the NPC modal opens
+var regionEditBefore: mapmod.Map = undefined; // snapshot banked when the region modal opens
 var strokeBefore: mapmod.Map = undefined; // snapshot banked when a paint stroke starts
 
 fn clearHistory() void {
@@ -424,6 +445,12 @@ pub const Editor = struct {
     grabIdx: ?usize = null,
     grabStart: rl.Vector3 = mathx.zero3,
     packEditIdx: usize = 0,
+    npcEditIdx: usize = 0,
+    regionEditIdx: usize = 0,
+    // Classic Trigedit (the StarEdit-style trigger editor) — a full-screen surface over the
+    // editor. trigOpen routes input there; trigSel is the highlighted trigger.
+    trigOpen: bool = false,
+    trigSel: usize = 0,
 
     recovT: f32 = 0, // seconds since the last crash-recovery autosave while dirty
 
@@ -480,6 +507,10 @@ pub const Editor = struct {
 
     fn decorKind(ed: *const Editor) world.DecorKind {
         return @enumFromInt(@min(ed.brush(), lastVariant(world.DecorKind)));
+    }
+
+    fn groundMat(ed: *const Editor) world.FloorMat {
+        return @enumFromInt(@min(ed.brush(), lastVariant(world.FloorMat)));
     }
 
     fn propKind(ed: *const Editor) world.ObstacleKind {
@@ -551,7 +582,7 @@ pub fn apply(g: *Game) void {
     g.fog.revealAll(g.w.HalfW, g.w.HalfD);
     g.fog.sync();
     g.torch.setLightColor(g.map.light);
-    g.torch.setFloorSet(g.map.floor);
+    g.torch.uploadFloorMats(&g.map.floorGrid, g.map.halfW, g.map.halfD);
     g.monsterCount = 0;
     g.projs.count = 0;
     g.lootList.clearRetainingCapacity();
@@ -646,7 +677,7 @@ fn toolPoint(ed: *const Editor, p: rl.Vector3) rl.Vector3 {
     if (freePlace() or ed.isEraseBrush()) return p;
     return switch (ed.layer) {
         .floor => snapLine(p),
-        .decor => p,
+        .decor, .ground => p,
         .props, .entities => snapCenter(p),
     };
 }
@@ -723,6 +754,28 @@ fn placePack(g: *Game, p_in: rl.Vector3) bool {
     return true;
 }
 
+fn placeNpc(g: *Game, p_in: rl.Vector3) bool {
+    const ed = &g.ed;
+    const m = &g.map;
+    if (m.npc_count >= mapmod.MAX_NPCS) {
+        ed.status("NPC limit reached", .{});
+        return false;
+    }
+    const p = clampContent(m, p_in);
+    m.npcs[m.npc_count] = .{ .kind = .villager, .x = p.x, .z = p.z, .facing = 0 };
+    var buf: [12]u8 = undefined;
+    m.npcs[m.npc_count].name.set(std.fmt.bufPrint(&buf, "NPC {d}", .{m.npc_count + 1}) catch "NPC");
+    m.npc_count += 1;
+    return true;
+}
+
+// Seed the modal text field with an existing name so an edit starts from it, not empty.
+fn seedField(ed: *Editor, s: []const u8) void {
+    const n = @min(s.len, ed.field_buf.len);
+    @memcpy(ed.field_buf[0..n], s[0..n]);
+    ed.field_len = n;
+}
+
 fn mirrorOf(p: rl.Vector3) rl.Vector3 {
     return v3(-p.x, p.y, p.z);
 }
@@ -765,8 +818,16 @@ fn eraseWithin(g: *Game, p: rl.Vector3, r: f32) bool {
                     changed = true;
                 }
             }
+            var j: usize = m.npc_count;
+            while (j > 0) {
+                j -= 1;
+                if (distXZ(m.npcs[j].pos(), p) < r) {
+                    m.removeNpc(j);
+                    changed = true;
+                }
+            }
         },
-        .floor => {},
+        .floor, .ground => {},
     }
     if (changed) markDirty(g);
     return changed;
@@ -952,6 +1013,13 @@ fn eraseFeatureAt(g: *Game, p: rl.Vector3) bool {
             return true;
         }
     }
+    for (m.regions[0..m.region_count], 0..) |rg, i| {
+        if (rg.contains(p.x, p.z)) {
+            m.removeRegion(i);
+            markDirty(g);
+            return true;
+        }
+    }
     return false;
 }
 
@@ -985,6 +1053,25 @@ fn finishDrag(g: *Game, a: rl.Vector3, b: rl.Vector3) bool {
             }
             m.ramps[m.ramp_count] = .{ .minX = minX, .maxX = maxX, .minZ = minZ, .maxZ = maxZ, .h = ed.featureH, .rise = ed.rise };
             m.ramp_count += 1;
+        },
+        .region => {
+            if (m.region_count >= mapmod.MAX_REGIONS) {
+                ed.status("region limit reached", .{});
+                return false;
+            }
+            var rg = mapmod.Region{ .minX = minX, .maxX = maxX, .minZ = minZ, .maxZ = maxZ };
+            var buf: [12]u8 = undefined;
+            rg.name.set(std.fmt.bufPrint(&buf, "Region {d}", .{m.region_count + 1}) catch "Region");
+            m.regions[m.region_count] = rg;
+            ed.regionEditIdx = m.region_count;
+            m.region_count += 1;
+            markDirty(g);
+            // Open the rename modal so the zone gets a meaningful name right away. The caller
+            // banks the creation as one undo step; renaming banks its own.
+            seedField(ed, rg.name.slice());
+            regionEditBefore = m.*;
+            ed.modal = .region_edit;
+            return true;
         },
         .erase => return false,
     }
@@ -1033,6 +1120,15 @@ fn paintStep(g: *Game, raw: rl.Vector3) void {
         .entities => {
             if (ed.entityBrush() == .erase) {
                 if (eraseWithin(g, raw, ed.brushR)) ed.strokeChanged = true;
+            }
+        },
+        .ground => {
+            // Paint the floor-material grid within the brush radius; erase repaints the base.
+            const mat = if (ed.isEraseBrush()) g.map.floorBase else ed.groundMat();
+            if (g.map.floorPaint(raw.x, raw.z, ed.brushR, mat)) {
+                ed.strokeChanged = true;
+                g.torch.uploadFloorMats(&g.map.floorGrid, g.map.halfW, g.map.halfD);
+                ed.dirty = true; // texture-only edit: no mesh rebuild needed
             }
         },
         .floor => {},
@@ -1240,9 +1336,20 @@ pub fn update(g: *Game, dt: f32) void {
         return;
     }
 
+    // The Classic Trigedit surface owns all input while open (like a modal).
+    if (ed.trigOpen) {
+        trigedit.update(g);
+        return;
+    }
+
     const ctrl = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
     const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
     const alt = freePlace();
+    // T opens the trigger editor (Ctrl+T left free). Guarded by !ctrl so Ctrl+ combos pass.
+    if (rl.isKeyPressed(.t) and !ctrl) {
+        ed.trigOpen = true;
+        return;
+    }
 
     // Camera: WASD pans (not while Ctrl-chording, or Ctrl+S would lurch south);
     // RIGHT-DRAG grabs the ground and drags it (right button never deletes); wheel zooms.
@@ -1468,7 +1575,7 @@ pub fn update(g: *Game, dt: f32) void {
         // (the doUndo/doRedo gesture guards) until the next stroke overwrites strokeBefore. Close
         // the stroke here the moment the active tool can no longer own it.
         const ownsStroke = switch (ed.layer) {
-            .decor, .props => true,
+            .decor, .props, .ground => true,
             .entities => ed.entityBrush() == .erase,
             else => false,
         };
@@ -1494,7 +1601,7 @@ pub fn update(g: *Game, dt: f32) void {
                     }
                 }
             },
-            .decor, .props => {
+            .decor, .props, .ground => {
                 if (rl.isMouseButtonPressed(.left)) beginStroke(g);
                 pumpStroke(g, p);
             },
@@ -1547,6 +1654,30 @@ pub fn update(g: *Game, dt: f32) void {
                         // ctx-menu "Move X here" path, so a click on the anchor's current
                         // spot banks no undo frame and raises no false dirty flag.
                         if (ed.entityBrush().anchor()) |a| setAnchorIfMoved(g, a.posPtr(&g.map), ap);
+                    }
+                },
+                .npc => {
+                    if (rl.isMouseButtonPressed(.left)) {
+                        // Click an existing NPC to edit it; otherwise stamp a new one.
+                        var hit: ?usize = null;
+                        for (g.map.npcs[0..g.map.npc_count], 0..) |npc, i| {
+                            if (distXZ(npc.pos(), p) < NPC_PICK_R) {
+                                hit = i;
+                                break;
+                            }
+                        }
+                        if (hit) |i| {
+                            npcEditBefore = g.map;
+                            ed.npcEditIdx = i;
+                            seedField(ed, g.map.npcs[i].name.slice());
+                            ed.modal = .npc_edit;
+                        } else {
+                            const before = g.map;
+                            if (placeNpc(g, tp)) {
+                                markDirty(g);
+                                pushUndoFrom(&before);
+                            }
+                        }
                     }
                 },
                 .erase => {
@@ -1672,6 +1803,8 @@ fn drawEncounterPreviews(g: *Game) void {
     var boss = monster.makeBoss(0, g.map.boss.slice(), &rng, g.w.snapY(g.map.bossPos));
     boss.Facing = v3(0, 0, 1);
     gamemod.drawMonsterBody(&boss, false);
+    // Townsfolk, drawn with their real bodies so the town reads at author time.
+    for (g.map.npcList()) |npc| gamemod.drawNpcBody(g, npc);
 }
 
 // rl.drawGrid only draws square grids, so clip GRID-spaced lines to the arena rect
@@ -1705,6 +1838,17 @@ fn drawMarkers(g: *Game) void {
         rl.drawCylinderEx(v3(c.x, c.y + 0.01, c.z), v3(c.x, c.y + 0.03, c.z), PACK_GRAB_R + 0.3, PACK_GRAB_R + 0.3, 20, withAlpha(theme.ink, 120));
         gamemod.groundRing(v3(c.x, c.y + 0.06, c.z), PACK_GRAB_R, col);
         gamemod.groundRing(v3(c.x, c.y + 0.06, c.z), PACK_GRAB_R - 0.15, withAlpha(col, 150));
+    }
+
+    // NPCs: a pale pick ring on the ground (the body itself is drawn in the scene pass).
+    for (m.npcList()) |npc| {
+        const c = g.w.snapY(npc.pos());
+        gamemod.groundRing(v3(c.x, c.y + 0.06, c.z), NPC_PICK_R, rgba(214, 202, 180, 235));
+    }
+
+    // Regions: a low wireframe box so named zones read on the ground at author time.
+    for (m.regionList()) |rg| {
+        drawRectBox(rg.minX, rg.maxX, rg.minZ, rg.maxZ, 0.4, REGION_COL);
     }
 
     // Marquee: the live drag rect, then the committed one.
@@ -1786,7 +1930,7 @@ fn drawCursorAids(g: *Game) void {
                         gamemod.groundRing(v3(c.x, c.y + 0.1, c.z), PACK_GRAB_R + 0.2, ERASE_RING);
                     }
                 },
-                .floor => {},
+                .floor, .ground => {},
             }
         }
         return;
@@ -1839,6 +1983,14 @@ pub fn drawOverlay(g: *Game) void {
     var ctx = ui.Ctx.begin();
     const W = rl.getScreenWidth();
     const H = rl.getScreenHeight();
+
+    // Classic Trigedit takes over the whole overlay while open.
+    if (ed.trigOpen) {
+        trigedit.draw(g, &ctx);
+        ui.drawTip(&ctx);
+        ed.uiHot = ctx.anyHot;
+        return;
+    }
 
     // A modal owns the pointer WHOLESALE, but immediate-mode chrome under it hit-tests
     // as it draws this same frame: silence the mouse for those widgets or Undo/
@@ -1945,6 +2097,8 @@ fn drawTopbar(g: *Game, ctx: *ui.Ctx, W: i32) void {
     x += 68;
     if (ui.buttonTip(ctx, ui.rect(x, 7, 62, 26), "Redo", 17, false, "Redo (Ctrl+Y)")) doRedo(g);
     x += 74;
+    if (ui.buttonTip(ctx, ui.rect(x, 7, 84, 26), "Triggers", 17, false, "Open the trigger editor (T)")) ed.trigOpen = true;
+    x += 90;
 
     var nameBuf: [72]u8 = undefined;
     const nm = std.fmt.bufPrintZ(&nameBuf, "{s}{s}", .{ g.map.name.slice(), if (ed.dirty) " *" else "" }) catch "";
@@ -2037,23 +2191,23 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
         markDirty(g);
     }
     y += STEP_ROW_H;
-    hudx.text("floor", px + 10, y + 3, 15, withAlpha(theme.labelColor, 230));
+    // Base material: fills fresh maps + the Ground eraser + the decor/minimap tone. Paint
+    // per-tile on the Ground layer; this is just the default underneath.
+    hudx.text("base", px + 10, y + 3, 15, withAlpha(theme.labelColor, 230));
     var sx = px + 76;
-    for (presets) |p| {
-        ui.tipFor(ctx, ui.rect(sx, y, 24, 22), p.name);
-        const active = std.meta.eql(g.map.floor, p.floor);
-        // Swatch halves show the primary/secondary materials' base tones.
-        if (ui.swatch(ctx, sx, y, 24, 22, world.FloorMat.base(p.floor[0]), world.FloorMat.base(p.floor[1]), active)) {
-            // Re-clicking the live preset is a no-op: no undo frame, no dirty flag.
-            if (!active or !std.meta.eql(g.map.light, p.light)) {
+    inline for (@typeInfo(world.FloorMat).@"enum".fields) |f| {
+        const mat: world.FloorMat = @enumFromInt(f.value);
+        ui.tipFor(ctx, ui.rect(sx, y, 22, 22), f.name);
+        const active = g.map.floorBase == mat;
+        if (ui.swatch(ctx, sx, y, 22, 22, world.FloorMat.base(mat), lerpColor(world.FloorMat.base(mat), rl.Color.black, 0.4), active)) {
+            if (!active) {
                 bankUndo(g);
-                g.map.floor = p.floor;
-                g.map.light = p.light;
+                g.map.floorBase = mat;
                 markDirty(g);
-                ed.status("floor: {s}", .{p.name});
+                ed.status("base material: {s}", .{f.name});
             }
         }
-        sx += 28;
+        sx += 24;
     }
     y += 30;
     var counts: [64]u8 = undefined;
@@ -2092,9 +2246,9 @@ fn drawProperties(g: *Game, ctx: *ui.Ctx, W: i32) void {
                 }
             }
         },
-        .decor, .props => {
+        .decor, .props, .ground => {
             ui.claimedPanel(ctx, ui.rect(px, y, PANEL_W, 62), "BRUSH");
-            ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Brush radius: decor spread + erase sweep ([ ])");
+            ui.tipFor(ctx, ui.rect(px + 8, y + 26, PANEL_W - 16, 26), "Brush radius: paint spread + erase sweep ([ ])");
             _ = ui.stepperF(ctx, px + 10, y + 28, "radius", &ed.brushR, BRUSH_R_STEP, BRUSH_R_MIN, BRUSH_R_MAX);
         },
     }
@@ -2183,7 +2337,7 @@ fn drawMinimap(g: *Game, ctx: *ui.Ctx, W: i32, H: i32) void {
     const ox = @as(f32, @floatFromInt(mx)) + (mmf - halfW * 2 * scale) / 2;
     const oy = @as(f32, @floatFromInt(my)) + (mmf - halfD * 2 * scale) / 2;
 
-    const mmGround = world.FloorMat.base(g.map.floor[0]); // minimap keys off the primary floor material
+    const mmGround = world.FloorMat.base(g.map.floorBase); // minimap ground tone = base material
     rl.drawRectangle(@intFromFloat(ox), @intFromFloat(oy), @intFromFloat(halfW * 2 * scale), @intFromFloat(halfD * 2 * scale), lerpColor(mmGround, rl.Color.black, 0.45));
     for (g.map.ledges[0..g.map.ledge_count]) |l| {
         rl.drawRectangle(
@@ -2537,6 +2691,87 @@ fn drawModal(g: *Game, ctx: *ui.Ctx) void {
                 if (!std.meta.eql(g.map.packs[ed.packEditIdx], packEditBefore.packs[ed.packEditIdx])) {
                     const now = g.map;
                     g.map = packEditBefore;
+                    pushUndoFrom(&g.map);
+                    g.map = now;
+                    ed.dirty = true;
+                }
+                ed.modal = .none;
+            }
+        },
+        .npc_edit => {
+            const mb = ui.beginModal(ctx, 460, 300, "NPC");
+            if (ed.npcEditIdx >= g.map.npc_count) {
+                ed.modal = .none;
+                return;
+            }
+            const npc = &g.map.npcs[ed.npcEditIdx];
+            const bx = mb.x;
+            const by = mb.y;
+            hudx.text("name (triggers address this NPC)", bx + 24, by + 44, 16, withAlpha(theme.labelColor, 230));
+            ui.textField(ctx, ui.rect(bx + 24, by + 64, 412, 30), &ed.field_buf, &ed.field_len, true, g.elapsed);
+            hudx.text("kind", bx + 24, by + 104, 16, withAlpha(theme.labelColor, 230));
+            var cx = bx + 24;
+            var cyy = by + 124;
+            var used: i32 = 0;
+            inline for (@typeInfo(mapmod.NpcKind).@"enum".fields) |f| {
+                if (cx > bx + 360) {
+                    cx = bx + 24;
+                    cyy += 30;
+                }
+                const k: mapmod.NpcKind = @enumFromInt(f.value);
+                if (ui.chip(ctx, cx, cyy, f.name, npc.kind == k, &used)) npc.kind = k;
+                cx += used;
+            }
+            var facing = @as(i32, @intFromFloat(npc.facing));
+            if (ui.stepperI(ctx, bx + 24, by + 200, "facing", &facing, 0, 359)) npc.facing = @floatFromInt(facing);
+            if (ui.button(ctx, ui.rect(bx + 24, by + 250, 100, 30), "Delete", 17, false)) {
+                g.map = npcEditBefore; // drop any live chip edits first
+                pushUndoFrom(&g.map);
+                g.map.removeNpc(ed.npcEditIdx);
+                markDirty(g);
+                ed.modal = .none;
+            }
+            const doneN = ui.button(ctx, ui.rect(bx + 336, by + 250, 100, 30), "Done", 17, false) or rl.isKeyPressed(.enter);
+            if (doneN and ed.modal == .npc_edit) {
+                if (ed.field_len > 0) npc.name.set(ed.field_buf[0..ed.field_len]);
+                if (!std.meta.eql(g.map.npcs[ed.npcEditIdx], npcEditBefore.npcs[ed.npcEditIdx])) {
+                    const now = g.map;
+                    g.map = npcEditBefore;
+                    pushUndoFrom(&g.map);
+                    g.map = now;
+                    ed.dirty = true;
+                }
+                ed.modal = .none;
+            }
+        },
+        .region_edit => {
+            const mb = ui.beginModal(ctx, 440, 232, "Region");
+            if (ed.regionEditIdx >= g.map.region_count) {
+                ed.modal = .none;
+                return;
+            }
+            const rg = &g.map.regions[ed.regionEditIdx];
+            const bx = mb.x;
+            const by = mb.y;
+            hudx.text("name (triggers reference this zone)", bx + 24, by + 44, 16, withAlpha(theme.labelColor, 230));
+            ui.textField(ctx, ui.rect(bx + 24, by + 64, 392, 30), &ed.field_buf, &ed.field_len, true, g.elapsed);
+            var buf: [72]u8 = undefined;
+            const dims = std.fmt.bufPrintZ(&buf, "x [{d:.1} .. {d:.1}]    z [{d:.1} .. {d:.1}]", .{ rg.minX, rg.maxX, rg.minZ, rg.maxZ }) catch "";
+            hudx.text(dims, bx + 24, by + 108, 15, rgba(180, 170, 152, 220));
+            hudx.text("(drag a new box on the Floor layer to re-place)", bx + 24, by + 132, 14, withAlpha(theme.labelColor, 180));
+            if (ui.button(ctx, ui.rect(bx + 24, by + 178, 100, 30), "Delete", 17, false)) {
+                g.map = regionEditBefore;
+                pushUndoFrom(&g.map);
+                g.map.removeRegion(ed.regionEditIdx);
+                markDirty(g);
+                ed.modal = .none;
+            }
+            const doneR = ui.button(ctx, ui.rect(bx + 316, by + 178, 100, 30), "Done", 17, false) or rl.isKeyPressed(.enter);
+            if (doneR and ed.modal == .region_edit) {
+                if (ed.field_len > 0) rg.name.set(ed.field_buf[0..ed.field_len]);
+                if (!std.meta.eql(g.map.regions[ed.regionEditIdx], regionEditBefore.regions[ed.regionEditIdx])) {
+                    const now = g.map;
+                    g.map = regionEditBefore;
                     pushUndoFrom(&g.map);
                     g.map = now;
                     ed.dirty = true;

@@ -36,6 +36,7 @@ pub const FIRE_SHADOWMAP_RESOLUTION = 1024;
 const SLOT_SHADOW: i32 = 10;
 const SLOT_FIRE: i32 = 11;
 const SLOT_FOG: i32 = 12;
+const SLOT_MAT: i32 = 13; // paintable floor-material grid (nearest-sampled)
 
 const depthVS =
     \\#version 330
@@ -92,7 +93,8 @@ const sceneFS =
     \\uniform vec3 fireColor;
     \\uniform float fireRadius;
     \\uniform float fireIntensity;
-    \\uniform ivec3 floorMats;
+    \\uniform sampler2D matMap;   // paintable per-cell floor materials (nearest-sampled)
+    \\uniform vec2 matHalf;       // arena half-extents the material grid spans
     \\out vec4 finalColor;
     \\// Cheap hash / value noise over world XZ: mottles the flat vertex colors into
     \\// dirt, stone grain, and moss so broad surfaces don't read as untextured plastic.
@@ -165,19 +167,15 @@ const sceneFS =
     \\    float crack = (1.0 - smoothstep(0.0, 0.07, ridge))*smoothstep(0.45, 0.8, vnoise(p*0.13 + 5.1));
     \\    return c*(1.0 - 0.52*crack);
     \\}
-    \\// The area's three materials blended across the ground by two low-frequency
-    \\// fields, each border roughened by a mid-frequency octave so transitions read as
-    \\// ragged terrain edges, not contour lines. Pure function of world XZ: the same
-    \\// patches every load, no stored data.
+    \\// The ground albedo: the painted per-cell material grid (matMap), nearest-sampled so
+    \\// each cell shows exactly one material's look (matAlbedo). Replaces the old 3-material
+    \\// theme blend — which material where is now authored, not a position hash.
     \\vec3 floorAlbedo(vec2 p) {
-    \\    float n1 = vnoise(p*0.050) + (vnoise(p*0.55 + 2.2) - 0.5)*0.26;
-    \\    float w1 = smoothstep(0.50, 0.64, n1);
-    \\    float n2 = vnoise(p*0.031 + 40.0) + (vnoise(p*0.63 + 11.0) - 0.5)*0.22;
-    \\    float w2 = smoothstep(0.66, 0.78, n2);
-    \\    vec3 c = mix(matAlbedo(floorMats.x, p), matAlbedo(floorMats.y, p), w1);
-    \\    c = mix(c, matAlbedo(floorMats.z, p), w2);
-    \\    // DAMP BLOTCHES: one very low octave sinks whole stretches toward wet-dark
-    \\    // so the midfield never reads as a single carpet (darken-only).
+    \\    vec2 uv = clamp((p + matHalf) / (2.0*matHalf), 0.0, 1.0); // world XZ -> [0,1]
+    \\    int id = int(texture(matMap, uv).r*255.0 + 0.5);          // nearest cell's material id
+    \\    vec3 c = matAlbedo(id, p);
+    \\    // DAMP BLOTCHES: one very low octave sinks whole stretches toward wet-dark so a
+    \\    // broad painted expanse never reads as a single flat carpet (darken-only).
     \\    return c*(0.72 + 0.28*vnoise(p*0.045 + 9.7));
     \\}
     \\// Fraction of this fragment in shadow (0 = lit, 1 = shadowed), from a wide 5x5
@@ -384,7 +382,8 @@ pub const Torch = struct {
     loc_lightVP: i32,
     loc_lightRadius: i32,
     loc_lightColor: i32,
-    loc_floorMats: i32,
+    loc_matHalf: i32,
+    matTex: rl.Texture2D = undefined,
     loc_fogHalf: i32,
     loc_fireVP: i32,
     loc_firePos: i32,
@@ -421,10 +420,17 @@ pub const Torch = struct {
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "fireMapResolution"), &fres, .int);
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "fireMap"), &SLOT_FIRE, .int);
         rl.setShaderValue(scene, rl.getShaderLocation(scene, "fogMap"), &SLOT_FOG, .int);
-        // Seed the floor set (dirt/grass/stone) so the shader is valid before the
-        // first area applies its own via setFloorSet.
-        const fm = [3]i32{ 0, 1, 2 };
-        rl.setShaderValue(scene, rl.getShaderLocation(scene, "floorMats"), &fm, .ivec3);
+        // Paintable floor material grid: a FLOOR_RES^2 grayscale texture (one texel per cell,
+        // POINT/nearest so ids never interpolate), sampler pinned to SLOT_MAT. Contents come
+        // from map.floorGrid via uploadFloorMats; a black seed keeps the shader valid until the
+        // first upload (which happens right after Torch.init, in Game.init).
+        var matImg = rl.genImageColor(world.FLOOR_RES, world.FLOOR_RES, rl.Color.black);
+        rl.imageFormat(&matImg, .uncompressed_grayscale);
+        const matTex = rl.loadTextureFromImage(matImg) catch @panic("floor material texture");
+        rl.unloadImage(matImg);
+        rl.setTextureFilter(matTex, .point);
+        rl.setTextureWrap(matTex, .clamp);
+        rl.setShaderValue(scene, rl.getShaderLocation(scene, "matMap"), &SLOT_MAT, .int);
 
         return .{
             .shadowMap = shadowMap,
@@ -435,7 +441,8 @@ pub const Torch = struct {
             .loc_lightVP = rl.getShaderLocation(scene, "lightVP"),
             .loc_lightRadius = rl.getShaderLocation(scene, "lightRadius"),
             .loc_lightColor = loc_lightColor,
-            .loc_floorMats = rl.getShaderLocation(scene, "floorMats"),
+            .loc_matHalf = rl.getShaderLocation(scene, "matHalf"),
+            .matTex = matTex,
             .loc_fogHalf = rl.getShaderLocation(scene, "fogHalf"),
             .loc_fireVP = rl.getShaderLocation(scene, "fireVP"),
             .loc_firePos = rl.getShaderLocation(scene, "firePos"),
@@ -450,6 +457,7 @@ pub const Torch = struct {
     }
 
     pub fn deinit(self: *Torch) void {
+        rl.unloadTexture(self.matTex);
         rl.unloadShader(self.depthShader);
         rl.unloadShader(self.scene);
         rl.unloadRenderTexture(self.shadowMap);
@@ -552,11 +560,13 @@ pub const Torch = struct {
         rl.setShaderValue(self.scene, self.loc_lightColor, &lc, .vec4);
     }
 
-    // The area's floor-material set (see world.FloorMat / the shader's matAlbedo).
-    // Once per area transition, like setLightColor.
-    pub fn setFloorSet(self: *Torch, fs: world.FloorSet) void {
-        const m = [3]i32{ @intFromEnum(fs[0]), @intFromEnum(fs[1]), @intFromEnum(fs[2]) };
-        rl.setShaderValue(self.scene, self.loc_floorMats, &m, .ivec3);
+    // Upload the map's painted floor grid to the GPU + the arena extents the shader maps
+    // against. Called whenever the floor changes: area transition, and every editor paint
+    // stroke. `grid` is FLOOR_RES*FLOOR_RES material ids, row-major.
+    pub fn uploadFloorMats(self: *Torch, grid: *const [world.FLOOR_RES * world.FLOOR_RES]u8, halfW: f32, halfD: f32) void {
+        rl.updateTexture(self.matTex, grid);
+        const h = [2]f32{ halfW, halfD };
+        rl.setShaderValue(self.scene, self.loc_matHalf, &h, .vec2);
     }
 
     // Fog-of-war uniforms. Stash the map's GPU id for beginScene to bind on SLOT_FOG,
@@ -576,6 +586,8 @@ pub const Torch = struct {
         rl.gl.rlEnableTexture(@intCast(self.fireMap.depth.id));
         rl.gl.rlActiveTextureSlot(SLOT_FOG);
         rl.gl.rlEnableTexture(self.fogTexId);
+        rl.gl.rlActiveTextureSlot(SLOT_MAT);
+        rl.gl.rlEnableTexture(@intCast(self.matTex.id));
     }
 
     pub fn endScene(self: *Torch) void {
